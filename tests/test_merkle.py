@@ -1,7 +1,7 @@
 import hashlib
 import unittest
 
-from auditchain import AuditLog, verify_inclusion
+from auditchain import AuditLog, verify_consistency, verify_inclusion
 
 LEAF = b"auditchain/merkle-leaf/v1"
 NODE = b"auditchain/merkle-node/v1"
@@ -212,6 +212,158 @@ class VerifyInclusionTest(unittest.TestCase):
         )
         # Proof generated under sha3-256 must not verify under sha256.
         self.assertFalse(verify_inclusion(entry.entry_hash, 1, 3, root, proof))
+
+
+class ConsistencyProofTest(unittest.TestCase):
+    def setUp(self):
+        self.log = AuditLog()
+        for record in ("a", "b", "c", "d", "e"):
+            self.log.append(record)
+
+    def test_proof_is_immutable_tuple(self):
+        proof = self.log.consistency_proof(2)
+        self.assertIsInstance(proof, tuple)
+        self.assertTrue(all(isinstance(digest, bytes) for digest in proof))
+
+    def test_equal_and_empty_sizes_have_empty_proof(self):
+        self.assertEqual(self.log.consistency_proof(0), ())
+        self.assertEqual(self.log.consistency_proof(3, 3), ())
+        self.assertEqual(self.log.consistency_proof(5), ())
+
+    def test_size_validation(self):
+        with self.assertRaises(TypeError):
+            self.log.consistency_proof("3")
+        with self.assertRaises(TypeError):
+            self.log.consistency_proof(3, 1.5)
+        with self.assertRaises(ValueError):
+            self.log.consistency_proof(-1)
+        with self.assertRaises(ValueError):
+            self.log.consistency_proof(len(self.log) + 1)
+        with self.assertRaises(ValueError):
+            self.log.consistency_proof(4, 3)
+        with self.assertRaises(ValueError):
+            self.log.consistency_proof(3, len(self.log) + 1)
+
+    def test_appends_do_not_change_prefix_proofs(self):
+        before = {
+            (old, new): self.log.consistency_proof(old, new)
+            for old in range(len(self.log) + 1)
+            for new in range(old, len(self.log) + 1)
+        }
+        self.log.append("f")
+        self.log.append("g")
+        for (old, new), proof in before.items():
+            self.assertEqual(self.log.consistency_proof(old, new), proof)
+
+    def test_every_size_pair_verifies(self):
+        roots = [self.log.merkle_root(size) for size in range(len(self.log) + 1)]
+        for old in range(len(self.log) + 1):
+            for new in range(old, len(self.log) + 1):
+                proof = self.log.consistency_proof(old, new)
+                self.assertTrue(
+                    verify_consistency(old, roots[old], new, roots[new], proof),
+                    (old, new),
+                )
+
+
+class VerifyConsistencyTest(unittest.TestCase):
+    def setUp(self):
+        self.log = AuditLog()
+        for record in ("a", "b", "c", "d", "e"):
+            self.log.append(record)
+        self.roots = [self.log.merkle_root(size) for size in range(len(self.log) + 1)]
+
+    def test_wrong_old_root_returns_false(self):
+        proof = self.log.consistency_proof(3, 5)
+        self.assertFalse(verify_consistency(3, b"\x00" * 32, 5, self.roots[5], proof))
+
+    def test_wrong_new_root_returns_false(self):
+        proof = self.log.consistency_proof(3, 5)
+        self.assertFalse(verify_consistency(3, self.roots[3], 5, b"\x00" * 32, proof))
+
+    def test_swapped_roots_return_false(self):
+        proof = self.log.consistency_proof(3, 5)
+        self.assertFalse(verify_consistency(3, self.roots[5], 5, self.roots[3], proof))
+
+    def test_equal_sizes_require_empty_proof_and_equal_roots(self):
+        self.assertTrue(verify_consistency(3, self.roots[3], 3, self.roots[3], ()))
+        self.assertFalse(verify_consistency(3, self.roots[3], 3, self.roots[4], ()))
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 3, self.roots[3], self.log.consistency_proof(3, 5))
+
+    def test_zero_old_size_requires_canonical_empty_root(self):
+        empty_root = self.log.merkle_root(0)
+        self.assertTrue(verify_consistency(0, empty_root, 5, self.roots[5], ()))
+        self.assertFalse(verify_consistency(0, b"\x00" * 32, 5, self.roots[5], ()))
+        with self.assertRaises(ValueError):
+            verify_consistency(0, empty_root, 5, self.roots[5], self.log.consistency_proof(1, 5))
+
+    def test_zero_to_zero_still_needs_equal_roots(self):
+        empty_root = self.log.merkle_root(0)
+        self.assertTrue(verify_consistency(0, empty_root, 0, empty_root, ()))
+        self.assertFalse(verify_consistency(0, empty_root, 0, b"\x01" * 32, ()))
+
+    def test_unknown_hash_algorithm(self):
+        proof = self.log.consistency_proof(3, 5)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], proof, hash_name="not-a-hash")
+        with self.assertRaises(TypeError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], proof, hash_name=None)
+
+    def test_type_errors(self):
+        proof = self.log.consistency_proof(3, 5)
+        with self.assertRaises(TypeError):
+            verify_consistency("3", self.roots[3], 5, self.roots[5], proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(3, self.roots[3], "5", self.roots[5], proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(3, "not-bytes", 5, self.roots[5], proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(3, self.roots[3], 5, "not-bytes", proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], list(proof))
+        with self.assertRaises(TypeError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], (b"\x00" * 32, "nope"))
+
+    def test_negative_and_reversed_sizes(self):
+        proof = self.log.consistency_proof(3, 5)
+        with self.assertRaises(ValueError):
+            verify_consistency(-1, self.roots[3], 5, self.roots[5], proof)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], -5, self.roots[5], proof)
+        with self.assertRaises(ValueError):
+            verify_consistency(5, self.roots[5], 3, self.roots[3], ())
+
+    def test_digest_length_checked(self):
+        proof = self.log.consistency_proof(3, 5)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, b"\x00" * 31, 5, self.roots[5], proof)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 5, b"\x00" * 33, proof)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], (b"\x00" * 16,) * len(proof))
+
+    def test_proof_node_count_checked(self):
+        proof = self.log.consistency_proof(3, 5)
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], proof[:-1])
+        with self.assertRaises(ValueError):
+            verify_consistency(3, self.roots[3], 5, self.roots[5], proof + (b"\x00" * 32,))
+
+    def test_alternate_hash_algorithm(self):
+        log = AuditLog(hash_name="sha3-256")
+        for record in ("a", "b", "c", "d"):
+            log.append(record)
+        proof = log.consistency_proof(2, 4)
+        self.assertTrue(
+            verify_consistency(
+                2, log.merkle_root(2), 4, log.merkle_root(4), proof, hash_name="sha3-256"
+            )
+        )
+        # Proof generated under sha3-256 must not verify under sha256.
+        self.assertFalse(
+            verify_consistency(2, log.merkle_root(2), 4, log.merkle_root(4), proof)
+        )
 
 
 if __name__ == "__main__":

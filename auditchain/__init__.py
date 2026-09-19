@@ -1,6 +1,6 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / entry_digest / verify_inclusion.
+Public API: Entry / AuditLog / entry_digest / verify_inclusion / verify_consistency.
 """
 
 from __future__ import annotations
@@ -10,7 +10,14 @@ import hmac
 from dataclasses import dataclass
 from typing import Any, Iterator, Sequence
 
-__all__ = ["AuditLog", "Entry", "GENESIS_HASH", "entry_digest", "verify_inclusion"]
+__all__ = [
+    "AuditLog",
+    "Entry",
+    "GENESIS_HASH",
+    "entry_digest",
+    "verify_consistency",
+    "verify_inclusion",
+]
 
 GENESIS_HASH = bytes(32)
 _DOMAIN = b"auditchain/entry/v1"
@@ -79,6 +86,37 @@ def _root_of(leaves: list[bytes], hash_name: str) -> bytes:
     while len(level) > 1:
         level = _next_level(level, hash_name)
     return level[0]
+
+
+def _split_point(n: int) -> int:
+    """Largest power of two strictly smaller than ``n`` (n >= 2)."""
+    k = 1 << (n.bit_length() - 1)
+    return k >> 1 if k == n else k
+
+
+def _subproof(m: int, leaves: list[bytes], complete: bool, hash_name: str) -> list[bytes]:
+    """RFC 6962 section 2.1.2 SUBPROOF over ``leaves`` (length n >= m >= 1).
+
+    ``complete`` marks whether the root of the first ``m`` leaves is already
+    known to the verifier of the enclosing proof.
+    """
+    n = len(leaves)
+    if m == n:
+        return [] if complete else [_root_of(leaves, hash_name)]
+    k = _split_point(n)
+    if m <= k:
+        return _subproof(m, leaves[:k], complete, hash_name) + [_root_of(leaves[k:], hash_name)]
+    return _subproof(m - k, leaves[k:], False, hash_name) + [_root_of(leaves[:k], hash_name)]
+
+
+def _subproof_length(m: int, n: int, complete: bool) -> int:
+    """Node count of ``_subproof`` for sizes only (0 < m <= n)."""
+    if m == n:
+        return 0 if complete else 1
+    k = _split_point(n)
+    if m <= k:
+        return _subproof_length(m, k, complete) + 1
+    return _subproof_length(m - k, n - k, False) + 1
 
 
 @dataclass(frozen=True)
@@ -196,6 +234,26 @@ class AuditLog:
             position //= 2
         return tuple(proof)
 
+    def consistency_proof(self, old_size: int, new_size: int | None = None) -> tuple[bytes, ...]:
+        """Proof that the first ``old_size`` entries are a prefix of the first ``new_size``.
+
+        ``new_size`` defaults to the current log length. The digests follow the
+        RFC 6962 section 2.1.2 SUBPROOF order; appending later entries never
+        changes the proof for an existing pair of prefix sizes.
+        """
+        new_size = self._resolve_size(new_size)
+        if not isinstance(old_size, int):
+            raise TypeError("old_size must be an integer")
+        if not 0 <= old_size <= new_size:
+            raise ValueError(f"old_size must satisfy 0 <= old_size <= {new_size}")
+        if old_size == 0 or old_size == new_size:
+            return ()
+        leaves = [
+            _leaf_hash(entry.entry_hash, self._hash_name)
+            for entry in self._entries[:new_size]
+        ]
+        return tuple(_subproof(old_size, leaves, True, self._hash_name))
+
 
 def _check_digest(value: Any, name: str, digest_size: int) -> bytes:
     if not isinstance(value, (bytes, bytearray)):
@@ -266,3 +324,86 @@ def verify_inclusion(
     if consumed != len(siblings):
         raise ValueError("proof has too many levels")
     return hmac.compare_digest(node, root)
+
+
+def verify_consistency(
+    old_size: int,
+    old_root: bytes,
+    new_size: int,
+    new_root: bytes,
+    proof: tuple[bytes, ...],
+    *,
+    hash_name: str = "sha256",
+) -> bool:
+    """Verify a Merkle consistency proof without holding the log.
+
+    Checks that the snapshot of ``old_size`` entries with ``old_root`` is a
+    prefix of the snapshot of ``new_size`` entries with ``new_root``, following
+    the RFC 6962 section 2.1.2 verification procedure. Equal sizes only accept
+    an empty proof and equal roots; ``old_size == 0`` only accepts an empty
+    proof and the canonical empty-tree old root. Structurally valid inputs
+    that do not match return False; malformed inputs raise TypeError or
+    ValueError.
+    """
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    try:
+        digest_size = hashlib.new(hash_name).digest_size
+    except ValueError as error:
+        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+
+    old_root = _check_digest(old_root, "old_root", digest_size)
+    new_root = _check_digest(new_root, "new_root", digest_size)
+
+    if not isinstance(old_size, int):
+        raise TypeError("old_size must be an integer")
+    if not isinstance(new_size, int):
+        raise TypeError("new_size must be an integer")
+    if old_size < 0 or new_size < 0:
+        raise ValueError("sizes must be non-negative")
+    if old_size > new_size:
+        raise ValueError("old_size must not exceed new_size")
+
+    if not isinstance(proof, tuple):
+        raise TypeError("proof must be a tuple of digests")
+    nodes = [_check_digest(node, "proof element", digest_size) for node in proof]
+
+    if old_size == new_size:
+        if nodes:
+            raise ValueError("proof must be empty when sizes are equal")
+        return hmac.compare_digest(old_root, new_root)
+    if old_size == 0:
+        if nodes:
+            raise ValueError("proof must be empty when old_size is 0")
+        return hmac.compare_digest(old_root, _root_of([], hash_name))
+
+    expected = _subproof_length(old_size, new_size, True)
+    if len(nodes) != expected:
+        raise ValueError(f"proof must have {expected} nodes for these sizes")
+
+    path = list(nodes)
+    if old_size & (old_size - 1) == 0:
+        # An exact-power-of-two old root is its own first proof node.
+        path.insert(0, old_root)
+    fn = old_size - 1
+    sn = new_size - 1
+    while fn & 1:
+        fn >>= 1
+        sn >>= 1
+    fr = sr = path[0]
+    for node in path[1:]:
+        if sn == 0:
+            raise ValueError("proof has too many nodes")
+        if fn & 1 or fn == sn:
+            fr = _node_hash(node, fr, hash_name)
+            sr = _node_hash(node, sr, hash_name)
+            while fn and not fn & 1:
+                fn >>= 1
+                sn >>= 1
+        else:
+            sr = _node_hash(sr, node, hash_name)
+        fn >>= 1
+        sn >>= 1
+    if sn != 0:
+        raise ValueError("proof has too few nodes")
+    return hmac.compare_digest(fr, old_root) and hmac.compare_digest(sr, new_root)

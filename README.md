@@ -42,6 +42,26 @@ log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证�
   （空快照 `size=0` 是内容无关常量，始终可用）
 - 裁剪依据是检查点链摘要与一棵覆盖已封存前缀的 Merkle frontier；不引入任何第三方依赖
 
+### 前向安全认证
+
+```python
+from auditchain import AuditLog, verify_auth
+
+log = AuditLog(key=b"secret seed")   # 可选的非空 bytes 密钥；不传则与无密钥日志完全一致
+verifier = log.export_verifier()     # 只能在首次密钥演进前调用一次
+entry = log.append("agent started")
+tag = log.auth(0)                    # 签发 AuthTag(stage, tag)，随后密钥立即单向演进
+log.rotate_key()                     # 只演进密钥，不追加条目、不签发标签
+verify_auth(entry, tag, verifier)    # True：核对条目摘要后演进至 tag.stage 验证 HMAC
+```
+
+- 标签计算：`tag = HMAC(K, b"auditchain/auth/v1" + stage 的 8 字节大端编码 + entry_hash, hash_name)`
+- 密钥演进：每次 `auth()` 或 `rotate_key()` 后以 `H(b"auditchain/key-evolve/v1" + K)` 替换 `K`，
+  `stage` 加一，旧密钥不保留——当前密钥泄露不会暴露更早签发的标签
+- `Verifier(key, hash_name)` 持有初始密钥，验证时按 `tag.stage` 重新演进，无需日志保存旧密钥
+- 裁剪会同步删除已释放条目的标签，不影响保留段标签的验证与后续密钥演进
+- 无密钥日志禁用认证接口（`auth` / `rotate_key` / `export_verifier` 抛 `ValueError`）
+
 ## 命令行演示
 
 ```bash
@@ -54,9 +74,15 @@ python3 -m auditchain
 - `PruneReceipt(hash_name, size, merkle_root, chain_hash)` — 不可变的前缀封存回执
   - `merkle_root` 为该前缀的 Merkle 根，`chain_hash` 为末条摘要（空前缀为 `GENESIS_HASH`）
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
-    是返回 `True`，否则 `False`；入参不是 `Entry` 抛 `TypeError`
+    是返回 `True`，否则 `False`；空回执（`size == 0`、`chain_hash == GENESIS_HASH`）匹配日志首条
+    （`index == 0` 且 `previous_hash == GENESIS_HASH`）；入参不是 `Entry` 抛 `TypeError`
+- `AuthTag(stage, tag)` — 不可变的前向安全认证标签：`stage` 为签发时的密钥演进阶段（非负整数），
+  `tag` 为该阶段密钥下条目摘要的 HMAC；类型非法抛 `TypeError`，负阶段抛 `ValueError`
+- `Verifier(key, hash_name)` — 不可变的验证器，持有日志初始认证密钥与哈希算法；
+  空密钥或未知算法抛 `ValueError`
 - `GENESIS_HASH` — 全零的起始前驱摘要
-- `AuditLog(*, hash_name="sha256")`
+- `AuditLog(*, hash_name="sha256", key=None)` — `key` 为可选的非空 `bytes`/`bytearray` 认证密钥；
+  类型非法抛 `TypeError`，空密钥抛 `ValueError`，不传则禁用认证接口
   - `append(payload)` — 接受 `bytes` 或 `str`（UTF-8 编码），返回新条目
   - `entries()` / `entry(index)` / `__len__()` / `__iter__()` / `head` 属性
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
@@ -72,7 +98,15 @@ python3 -m auditchain
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
     回执不匹配或无有效回执抛 `ValueError`
+  - `auth(index)` — 为保留段中 `index` 处条目签发 `AuthTag` 并立即演进密钥（旧密钥不保存）；
+    无密钥日志抛 `ValueError`，负索引抛 `ValueError`，未保留索引抛 `IndexError`
+  - `rotate_key()` — 只演进密钥（`stage` 加一），不追加条目也不签发标签；无密钥日志抛 `ValueError`
+  - `export_verifier()` — 导出持有初始密钥的 `Verifier`；仅可在首次密钥演进前调用一次，
+    重复或演进后调用抛 `ValueError`
 - `entry_digest(index, previous_hash, payload, *, hash_name)` — 条目摘要计算
+- `verify_auth(entry, tag, verifier)` — 无需持有日志验证认证标签：先用 `entry_digest` 核对
+  `entry_hash`，再把验证器密钥演进至 `tag.stage` 校验 HMAC；匹配返回 `True`，结构合法但内容
+  不符返回 `False`，类型错误抛 `TypeError`，负数、摘要长度、算法或状态错误抛 `ValueError`
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需持有日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
@@ -89,7 +123,7 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 
 线性哈希链加顺序遍历校验，保留段查询是 `O(n)` 的（证明生成随保留长度增长）。
 已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建；条目内容明文存储，
-没有加密、也没有前向安全的密钥演进。
+没有加密；认证密钥只驻留在内存中，日志与密钥均不持久化。
 
 ## 测试
 

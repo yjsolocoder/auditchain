@@ -120,9 +120,10 @@ class ReceiptMatchesTest(unittest.TestCase):
         self.assertFalse(receipt.matches(self.log.entry(1)))
         self.assertFalse(receipt.matches(self.log.entry(3)))
 
-    def test_empty_prefix_receipt_never_matches(self):
+    def test_empty_prefix_receipt_matches_first_entry(self):
         receipt = self.log.seal(0)
-        for index in range(len(self.log)):
+        self.assertTrue(receipt.matches(self.log.entry(0)))
+        for index in range(1, len(self.log)):
             self.assertFalse(receipt.matches(self.log.entry(index)))
 
     def test_wrong_type_raises(self):

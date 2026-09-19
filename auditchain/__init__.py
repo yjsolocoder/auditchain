@@ -1,15 +1,18 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / entry_digest.
+Public API: Entry / AuditLog / entry_digest / verify_inclusion.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional, Tuple
 
-__all__ = ["AuditLog", "Entry", "GENESIS_HASH", "entry_digest"]
+from . import merkle as _merkle
+from .merkle import verify_inclusion
+
+__all__ = ["AuditLog", "Entry", "GENESIS_HASH", "entry_digest", "verify_inclusion"]
 
 GENESIS_HASH = bytes(32)
 _DOMAIN = b"auditchain/entry/v1"
@@ -91,6 +94,31 @@ class AuditLog:
 
     def entries(self) -> list[Entry]:
         return list(self._entries)
+
+    def _resolve_size(self, size: Optional[int]) -> int:
+        if size is None:
+            return len(self._entries)
+        if not isinstance(size, int):
+            raise TypeError("size must be an integer")
+        if not 0 <= size <= len(self._entries):
+            raise ValueError("size must satisfy 0 <= size <= len(log)")
+        return size
+
+    def merkle_root(self, size: Optional[int] = None) -> bytes:
+        """Root of the Merkle tree over the first ``size`` entries."""
+        size = self._resolve_size(size)
+        hashes = [entry.entry_hash for entry in self._entries[:size]]
+        return _merkle.merkle_root(hashes, self._hash_name)
+
+    def inclusion_proof(self, index: int, size: Optional[int] = None) -> Tuple[bytes, ...]:
+        """Sibling digests proving entry ``index`` against merkle_root(size)."""
+        size = self._resolve_size(size)
+        if not isinstance(index, int):
+            raise TypeError("index must be an integer")
+        if not 0 <= index < size:
+            raise ValueError("index must satisfy 0 <= index < size")
+        hashes = [entry.entry_hash for entry in self._entries[:size]]
+        return _merkle.inclusion_proof(hashes, index, self._hash_name)
 
     def entry(self, index: int) -> Entry:
         if not isinstance(index, int):

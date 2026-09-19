@@ -39,10 +39,11 @@ class KeyedLogSetupTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             AuditLog(key=b"")
 
-    def test_bytearray_key_normalized(self):
-        log = AuditLog(key=bytearray(KEY))
-        verifier = log.export_verifier()
-        self.assertIsInstance(verifier.key, bytes)
+    def test_key_rejects_bytearray_and_memoryview(self):
+        with self.assertRaises(TypeError):
+            AuditLog(key=bytearray(KEY))
+        with self.assertRaises(TypeError):
+            AuditLog(key=memoryview(KEY))
 
     def test_unknown_hash_algorithm_rejected_with_key(self):
         with self.assertRaises(ValueError):
@@ -207,6 +208,10 @@ class ExportVerifierTest(unittest.TestCase):
     def test_verifier_validation(self):
         with self.assertRaises(TypeError):
             Verifier("not-bytes", "sha256")
+        with self.assertRaises(TypeError):
+            Verifier(bytearray(KEY), "sha256")
+        with self.assertRaises(TypeError):
+            Verifier(memoryview(KEY), "sha256")
         with self.assertRaises(ValueError):
             Verifier(b"", "sha256")
         with self.assertRaises(TypeError):
@@ -299,14 +304,92 @@ class VerifyAuthTest(unittest.TestCase):
             AuthTag(True, b"\x00" * 32)
         with self.assertRaises(ValueError):
             AuthTag(-1, b"\x00" * 32)
+        with self.assertRaises(ValueError):
+            AuthTag(2**64, b"\x00" * 32)
+        tag = AuthTag(2**64 - 1, b"\x00" * 32)
+        self.assertEqual(tag.stage, 2**64 - 1)
         with self.assertRaises(TypeError):
             AuthTag(0, "not-bytes")
-        tag = AuthTag(0, bytearray(b"\x00" * 32))
-        self.assertIsInstance(tag.tag, bytes)
+        with self.assertRaises(TypeError):
+            AuthTag(0, bytearray(b"\x00" * 32))
+        with self.assertRaises(TypeError):
+            AuthTag(0, memoryview(b"\x00" * 32))
 
     def test_wrong_verifier_key_returns_false(self):
         other = Verifier(key=b"a-completely-different-key", hash_name="sha256")
         self.assertFalse(verify_auth(self.log.entry(0), self.tags[0], other))
+
+    def test_verify_auth_validates_stage_before_use(self):
+        entry = self.log.entry(0)
+        tag = self.tags[0]
+        forged = AuthTag(0, tag.tag)
+        object.__setattr__(forged, "stage", 2**64)
+        with self.assertRaises(ValueError):
+            verify_auth(entry, forged, self.verifier)
+        object.__setattr__(forged, "stage", -1)
+        with self.assertRaises(ValueError):
+            verify_auth(entry, forged, self.verifier)
+        object.__setattr__(forged, "stage", True)
+        with self.assertRaises(TypeError):
+            verify_auth(entry, forged, self.verifier)
+        object.__setattr__(forged, "stage", "0")
+        with self.assertRaises(TypeError):
+            verify_auth(entry, forged, self.verifier)
+
+
+class AuthFailureAtomicityTest(unittest.TestCase):
+    """A failed auth/rotate_key/export_verifier must leave all state intact."""
+
+    def setUp(self):
+        self.log = AuditLog(key=KEY)
+        for record in ("a", "b", "c"):
+            self.log.append(record)
+
+    def snapshot(self):
+        return (
+            self.log.stage,
+            self.log.head,
+            len(self.log),
+            dict(self.log._tags),
+            self.log._key,
+            self.log._verifier_exported,
+        )
+
+    def test_failed_auth_changes_nothing(self):
+        before = self.snapshot()
+        with self.assertRaises(TypeError):
+            self.log.auth("0")
+        with self.assertRaises(IndexError):
+            self.log.auth(7)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_failed_auth_keyless_changes_nothing(self):
+        log = AuditLog()
+        log.append("a")
+        head = log.head
+        with self.assertRaises(ValueError):
+            log.auth(0)
+        self.assertEqual((log.stage, log.head, len(log)), (0, head, 1))
+
+    def test_failed_rotate_keyless_changes_nothing(self):
+        log = AuditLog()
+        log.append("a")
+        head = log.head
+        with self.assertRaises(ValueError):
+            log.rotate_key()
+        self.assertEqual((log.stage, log.head, len(log)), (0, head, 1))
+
+    def test_failed_export_verifier_changes_nothing(self):
+        self.log.export_verifier()
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.log.export_verifier()
+        self.assertEqual(self.snapshot(), before)
+        self.log.auth(0)
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.log.export_verifier()
+        self.assertEqual(self.snapshot(), before)
 
 
 class AlternateHashAuthTest(unittest.TestCase):

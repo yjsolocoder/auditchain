@@ -34,6 +34,10 @@ _EMPTY_DOMAIN = b"auditchain/merkle-empty/v1"
 
 _AUTH_DOMAIN = b"auditchain/auth/v1"
 _EVOLVE_DOMAIN = b"auditchain/key-evolve/v1"
+_FIND_DOMAIN = b"auditchain/find/v1"
+
+# Key-evolution stages are encoded as 8-byte big-endian integers.
+_MAX_STAGE = 1 << 64
 
 
 def _as_bytes(payload: Any) -> bytes:
@@ -71,6 +75,18 @@ def _hash_parts(hash_name: str, *parts: bytes) -> bytes:
 def _evolve_key(key: bytes, hash_name: str) -> bytes:
     """Derive the next-stage key; the predecessor key is discarded."""
     return _hash_parts(hash_name, _EVOLVE_DOMAIN, key)
+
+
+def _find_digest(payload: bytes, hash_name: str) -> bytes:
+    """Locator digest for ``AuditLog.find``; never exposed outside the log."""
+    return _hash_parts(hash_name, _FIND_DOMAIN, payload)
+
+
+def _check_stage(stage: Any, name: str = "stage") -> None:
+    if not isinstance(stage, int) or isinstance(stage, bool):
+        raise TypeError(f"{name} must be an integer")
+    if not 0 <= stage < _MAX_STAGE:
+        raise ValueError(f"{name} must satisfy 0 <= {name} < 2**64")
 
 
 def _auth_tag(stage: int, entry_hash: bytes, key: bytes, hash_name: str) -> bytes:
@@ -209,6 +225,7 @@ class AuthTag:
 
     - ``stage``: key-evolution stage the tag was minted at (0 before the first
       evolution); tags at different stages never verify against one another.
+      Must be a non-bool integer with ``0 <= stage < 2**64``.
     - ``tag``: HMAC digest over the entry hash at that stage.
     """
 
@@ -216,14 +233,9 @@ class AuthTag:
     tag: bytes
 
     def __post_init__(self) -> None:
-        if not isinstance(self.stage, int) or isinstance(self.stage, bool):
-            raise TypeError("stage must be an integer")
-        if self.stage < 0:
-            raise ValueError("stage must be non-negative")
-        if not isinstance(self.tag, (bytes, bytearray)):
-            raise TypeError("tag must be bytes")
+        _check_stage(self.stage)
         if not isinstance(self.tag, bytes):
-            object.__setattr__(self, "tag", bytes(self.tag))
+            raise TypeError("tag must be bytes")
 
 
 @dataclass(frozen=True)
@@ -238,7 +250,7 @@ class Verifier:
     hash_name: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, (bytes, bytearray)):
+        if not isinstance(self.key, bytes):
             raise TypeError("key must be bytes")
         if len(self.key) == 0:
             raise ValueError("key must be non-empty")
@@ -248,8 +260,6 @@ class Verifier:
             hashlib.new(self.hash_name)
         except ValueError as error:
             raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
-        if not isinstance(self.key, bytes):
-            object.__setattr__(self, "key", bytes(self.key))
 
 
 class AuditLog:
@@ -267,11 +277,10 @@ class AuditLog:
         except ValueError as error:
             raise ValueError(f"unknown hash algorithm: {hash_name}") from error
         if key is not None:
-            if not isinstance(key, (bytes, bytearray)):
+            if not isinstance(key, bytes):
                 raise TypeError("key must be bytes")
             if len(key) == 0:
                 raise ValueError("key must be non-empty")
-            key = bytes(key)
         self._hash_name = hash_name
         self._entries: list[Entry] = []
         self._retain_from = 0
@@ -288,6 +297,10 @@ class AuditLog:
         self._verifier_exported = False
         # Tags of retained entries, keyed by absolute index.
         self._tags: dict[int, AuthTag] = {}
+        # Payload locator for ``find``: digest -> ascending absolute indices
+        # of retained entries. Digests only narrow the search; ``find``
+        # always re-compares the stored payload before reporting a hit.
+        self._locator: dict[bytes, list[int]] = {}
 
     @property
     def hash_name(self) -> str:
@@ -319,6 +332,7 @@ class AuditLog:
         )
         self._entries.append(entry)
         self._head = entry.entry_hash
+        self._locator.setdefault(_find_digest(material, self._hash_name), []).append(index)
         return entry
 
     @property
@@ -382,6 +396,48 @@ class AuditLog:
         if not self._retain_from <= index < len(self):
             raise IndexError(f"no retained entry at index {index}")
         return self._entries[index - self._retain_from]
+
+    def find(
+        self, payload: Any, start: int | None = None, stop: int | None = None
+    ) -> tuple[int, ...]:
+        """Absolute indices of retained entries whose payload equals ``payload``.
+
+        ``payload`` must be ``bytes`` or ``str`` (encoded as UTF-8). The
+        search covers the half-open range ``[start, stop)`` of absolute
+        indices, defaulting to ``[retain_from, len(log))``; explicit bounds
+        must satisfy ``retain_from <= start <= stop <= len(log)``. Matches
+        are returned in ascending order; an empty tuple means no match.
+
+        The lookup is served by an incrementally maintained digest index and
+        only reads the log: entries, head, authentication state and Merkle
+        snapshots are untouched. Digests only locate candidates — every hit
+        is confirmed against the stored payload, so a digest collision can
+        never produce a false match.
+        """
+        if isinstance(payload, str):
+            material = payload.encode("utf-8")
+        elif isinstance(payload, bytes):
+            material = payload
+        else:
+            raise TypeError("payload must be bytes or str")
+        if start is None:
+            start = self._retain_from
+        if stop is None:
+            stop = len(self)
+        for name, bound in (("start", start), ("stop", stop)):
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not self._retain_from <= start <= stop <= len(self):
+            raise ValueError(
+                f"range must satisfy {self._retain_from} <= start <= stop <= {len(self)}"
+            )
+        candidates = self._locator.get(_find_digest(material, self._hash_name), ())
+        return tuple(
+            index
+            for index in candidates
+            if start <= index < stop
+            and self._entries[index - self._retain_from].payload == material
+        )
 
     def verify_entry(self, index: int) -> bool:
         """Check that one retained entry links correctly to its predecessor."""
@@ -656,9 +712,18 @@ class AuditLog:
             self._checkpoint_head = expected_chain
             return
         self._frontier = self._occupied_at(retain_from)
+        released_entries = self._entries[: retain_from - self._retain_from]
         del self._entries[: retain_from - self._retain_from]
         for released in range(self._retain_from, retain_from):
             self._tags.pop(released, None)
+        # Released indices are a prefix of the log, hence a prefix of each
+        # ascending locator bucket; drop them from the left.
+        for entry in released_entries:
+            digest = _find_digest(entry.payload, self._hash_name)
+            bucket = self._locator[digest]
+            bucket.pop(0)
+            if not bucket:
+                del self._locator[digest]
         self._retain_from = retain_from
         self._checkpoint_head = expected_chain
 
@@ -836,6 +901,10 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
         raise TypeError("tag must be an AuthTag")
     if not isinstance(verifier, Verifier):
         raise TypeError("verifier must be a Verifier")
+
+    # Validate the stage before it drives key evolution or the 8-byte
+    # big-endian encoding inside the HMAC composition.
+    _check_stage(tag.stage, "tag.stage")
 
     digest_size = hashlib.new(verifier.hash_name).digest_size
     for name in ("previous_hash", "entry_hash", "payload"):

@@ -58,7 +58,38 @@ verify_auth(log.entry(1), tag1, verifier)  # True
   `verify_auth` 会自行把它演进到标签所在 stage
 - 标签为 `HMAC(K, b"auditchain/auth/v1" + stage 的 8 字节大端编码 + entry_hash,
   hash_name)`；密钥演进为 `H(b"auditchain/key-evolve/v1" + K)`
+- 认证边界收紧：`key` 与 `tag` 只接受 `bytes`（`bytearray`、`memoryview` 等抛
+  `TypeError`），空 `key` 抛 `ValueError`，此规则覆盖 `AuditLog`、`AuthTag`、
+  `Verifier`；`stage` 须为非 `bool` 整数且满足 `0 <= stage < 2**64`，类型非法抛
+  `TypeError`、范围非法抛 `ValueError`，`verify_auth` 在使用 stage 前先校验
+- `auth` / `rotate_key` / `export_verifier` 失败（含参数非法）时不改变任何认证
+  或日志状态
 - 裁剪时同步删除已释放前缀的标签，保留段标签与后续演进不受影响
+
+### 按内容查找
+
+`find(payload, start=None, stop=None)` 在保留段内按内容定位条目，返回绝对索引
+的升序元组，无匹配时为 `()`；重复、空值与 Unicode 内容均支持：
+
+```python
+log = AuditLog()
+for record in ("alpha", "beta", "alpha"):
+    log.append(record)
+log.find("alpha")        # (0, 2)：str 按 UTF-8 编码后匹配
+log.find(b"beta")        # (1,)
+log.find("alpha", 1, 3)  # (2,)：半开范围 [start, stop)
+log.find("missing")      # ()
+```
+
+- `payload` 只接受 `bytes` 或 `str`，其余类型（含 `bytearray`、`memoryview`）抛
+  `TypeError`
+- 查询范围默认 `[retain_from, len(log))`；显式边界须为非 `bool` 整数且满足
+  `retain_from <= start <= stop <= len(log)`，类型非法抛 `TypeError`、范围非法抛
+  `ValueError`
+- 索引由 `append` 增量维护，`prune` 成功时同步删除已释放前缀的索引信息，失败则
+  不变；裁剪后追加与重复裁剪均正确
+- 摘要仅用于定位候选，命中后仍与原 payload 逐字节比较，摘要碰撞不会产生误报
+- 查询为只读操作：不改变任何 `Entry`、`head`、认证状态、Merkle 根或证明
 
 裁剪只释放内容、不改变逻辑：
 
@@ -81,17 +112,23 @@ python3 -m auditchain
 ## 公开接口
 
 - `Entry(index, payload, previous_hash, entry_hash)` — 不可变条目
-- `AuthTag(stage, tag)` — 不可变认证标签（演进 stage 与该 stage 下的 HMAC 摘要）
-- `Verifier(key, hash_name)` — 不可变验证材料，由 `export_verifier()` 导出
+- `AuthTag(stage, tag)` — 不可变认证标签（演进 stage 与该 stage 下的 HMAC 摘要）；
+  `stage` 须为非 `bool` 整数且 `0 <= stage < 2**64`，`tag` 只接受 `bytes`
+- `Verifier(key, hash_name)` — 不可变验证材料，由 `export_verifier()` 导出；
+  `key` 只接受非空 `bytes`
 - `PruneReceipt(hash_name, size, merkle_root, chain_hash)` — 不可变的前缀封存回执
   - `merkle_root` 为该前缀的 Merkle 根，`chain_hash` 为末条摘要（空前缀为 `GENESIS_HASH`）
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
     是返回 `True`，否则 `False`；空前缀回执匹配索引为 0、前驱为 `GENESIS_HASH` 的创世条目；
     入参不是 `Entry` 抛 `TypeError`
 - `GENESIS_HASH` — 全零的起始前驱摘要
-- `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
-  省略则为无密钥模式
+- `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证
+  （`bytearray`/`memoryview` 等抛 `TypeError`，空 `key` 抛 `ValueError`），省略则为无密钥模式
   - `append(payload)` — 接受 `bytes` 或 `str`（UTF-8 编码），返回新条目
+  - `find(payload, start=None, stop=None)` — 按内容查找保留段条目，`payload` 只接受
+    `bytes` 或 `str`；返回半开范围 `[start, stop)`（默认 `[retain_from, len(log))`）内
+    绝对索引的升序元组，无匹配为 `()`；边界类型非法抛 `TypeError`、范围非法抛
+    `ValueError`；只读，不改变日志与认证状态
   - `entries()` / `entry(index)` / `__len__()` / `__iter__()` / `head` 属性
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
@@ -120,7 +157,8 @@ python3 -m auditchain
 - `verify_auth(entry, tag, verifier)` — 先用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   再把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，
   结构合法但内容不符（含篡改条目、错误标签、错误 stage、错误密钥）返回 `False`；
-  入参类型错误抛 `TypeError`，负 stage/index、摘要长度不符、未知算法等抛 `ValueError`
+  入参类型错误抛 `TypeError`，stage 越界（含 `>= 2**64`）、负 index、摘要长度不符、
+  未知算法等抛 `ValueError`；stage 在使用前先校验
 
 Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry_hash)`，父节点为
 `H("auditchain/merkle-node/v1" + left + right)`，奇数层末节点原样提升；空树根为
@@ -132,7 +170,8 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 
 ## 限制
 
-线性哈希链加顺序遍历校验，保留段查询是 `O(n)` 的（证明生成随保留长度增长）。
+线性哈希链加顺序遍历校验，保留段查询是 `O(n)` 的（证明生成随保留长度增长）；
+`find` 由 `append` 增量维护的摘要索引加速，定位接近 `O(1)`，命中后逐条比对原 payload。
 已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建；条目内容明文存储，
 没有加密。认证标签提供前向安全：stage-0 密钥需在首次演进前通过
 `export_verifier()` 另行交给验证方，日志自身演进后不保留任何旧密钥。

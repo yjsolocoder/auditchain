@@ -32,6 +32,17 @@ def main() -> int:
     print(f"  recomputing entry #2 with changed payload gives")
     print(f"    {forged.hex()[:32]}…")
     print(f"  which differs from the recorded hash: {forged != log.entry(2).entry_hash}")
+
+    print()
+    print("verifiable prefix pruning:")
+    receipt = log.seal(2)
+    print(f"  sealed prefix of {receipt.size} entries, root={receipt.merkle_root.hex()[:16]}…")
+    log.prune(2, receipt)
+    print(f"  after prune: len={len(log)} (absolute)  retained={[e.index for e in log.entries()]}")
+    print(f"  receipt matches first retained entry: {receipt.matches(log.entry(2))}")
+    entry = log.append("post-prune record")
+    print(f"  appended entry #{entry.index}  head={log.head.hex()[:16]}…  verify={log.verify()}")
+    print(f"  merkle root still matches the unpruned prefix tree: {log.merkle_root(2) == receipt.merkle_root}")
     return 0
 
 

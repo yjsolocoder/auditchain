@@ -120,10 +120,17 @@ class ReceiptMatchesTest(unittest.TestCase):
         self.assertFalse(receipt.matches(self.log.entry(1)))
         self.assertFalse(receipt.matches(self.log.entry(3)))
 
-    def test_empty_prefix_receipt_never_matches(self):
+    def test_empty_prefix_receipt_matches_genesis_entry(self):
         receipt = self.log.seal(0)
-        for index in range(len(self.log)):
+        self.assertTrue(receipt.matches(self.log.entry(0)))
+        for index in range(1, len(self.log)):
             self.assertFalse(receipt.matches(self.log.entry(index)))
+
+    def test_empty_prefix_receipt_requires_genesis_predecessor(self):
+        receipt = self.log.seal(0)
+        genesis = self.log.entry(0)
+        forged = Entry(genesis.index, genesis.payload, b"\x01" * 32, genesis.entry_hash)
+        self.assertFalse(receipt.matches(forged))
 
     def test_wrong_type_raises(self):
         with self.assertRaises(TypeError):

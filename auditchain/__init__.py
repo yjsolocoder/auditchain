@@ -1,7 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / PruneReceipt / entry_digest / verify_inclusion /
-verify_consistency.
+Public API: Entry / AuditLog / PruneReceipt / AuthTag / Verifier /
+entry_digest / verify_inclusion / verify_consistency / verify_auth.
 """
 
 from __future__ import annotations
@@ -13,10 +13,13 @@ from typing import Any, Iterator, Sequence
 
 __all__ = [
     "AuditLog",
+    "AuthTag",
     "Entry",
     "PruneReceipt",
+    "Verifier",
     "GENESIS_HASH",
     "entry_digest",
+    "verify_auth",
     "verify_consistency",
     "verify_inclusion",
 ]
@@ -28,6 +31,9 @@ _INDEX_BYTES = 8
 _LEAF_DOMAIN = b"auditchain/merkle-leaf/v1"
 _NODE_DOMAIN = b"auditchain/merkle-node/v1"
 _EMPTY_DOMAIN = b"auditchain/merkle-empty/v1"
+
+_AUTH_DOMAIN = b"auditchain/auth/v1"
+_EVOLVE_DOMAIN = b"auditchain/key-evolve/v1"
 
 
 def _as_bytes(payload: Any) -> bytes:
@@ -60,6 +66,19 @@ def _hash_parts(hash_name: str, *parts: bytes) -> bytes:
     for part in parts:
         digest.update(part)
     return digest.digest()
+
+
+def _evolve_key(key: bytes, hash_name: str) -> bytes:
+    """Derive the next-stage key; the predecessor key is discarded."""
+    return _hash_parts(hash_name, _EVOLVE_DOMAIN, key)
+
+
+def _auth_tag(stage: int, entry_hash: bytes, key: bytes, hash_name: str) -> bytes:
+    return hmac.new(
+        key,
+        _AUTH_DOMAIN + stage.to_bytes(_INDEX_BYTES, "big") + entry_hash,
+        hash_name,
+    ).digest()
 
 
 def _leaf_hash(entry_hash: bytes, hash_name: str) -> bytes:
@@ -175,13 +194,62 @@ class PruneReceipt:
         """Whether ``entry`` is the first record retained after this prefix.
 
         Its absolute index must equal ``size`` and its predecessor digest must
-        equal ``chain_hash``. A receipt for the empty prefix never matches.
+        equal ``chain_hash``. A receipt for the empty prefix matches the
+        genesis record: an entry at index 0 whose predecessor is
+        ``GENESIS_HASH``.
         """
         if not isinstance(entry, Entry):
             raise TypeError("entry must be an Entry")
-        if self.size == 0:
-            return False
         return entry.index == self.size and entry.previous_hash == self.chain_hash
+
+
+@dataclass(frozen=True)
+class AuthTag:
+    """Immutable forward-secure authentication tag for one entry.
+
+    - ``stage``: key-evolution stage the tag was minted at (0 before the first
+      evolution); tags at different stages never verify against one another.
+    - ``tag``: HMAC digest over the entry hash at that stage.
+    """
+
+    stage: int
+    tag: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, int) or isinstance(self.stage, bool):
+            raise TypeError("stage must be an integer")
+        if self.stage < 0:
+            raise ValueError("stage must be non-negative")
+        if not isinstance(self.tag, (bytes, bytearray)):
+            raise TypeError("tag must be bytes")
+        if not isinstance(self.tag, bytes):
+            object.__setattr__(self, "tag", bytes(self.tag))
+
+
+@dataclass(frozen=True)
+class Verifier:
+    """Immutable verification state exported before the first key evolution.
+
+    Holds the stage-0 key and the hash algorithm; :func:`verify_auth` evolves
+    this key forward to the tag's stage without needing the log.
+    """
+
+    key: bytes
+    hash_name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, (bytes, bytearray)):
+            raise TypeError("key must be bytes")
+        if len(self.key) == 0:
+            raise ValueError("key must be non-empty")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        try:
+            hashlib.new(self.hash_name)
+        except ValueError as error:
+            raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
+        if not isinstance(self.key, bytes):
+            object.__setattr__(self, "key", bytes(self.key))
 
 
 class AuditLog:
@@ -193,11 +261,17 @@ class AuditLog:
     inside a pruned prefix can no longer be produced.
     """
 
-    def __init__(self, *, hash_name: str = "sha256") -> None:
+    def __init__(self, *, key: bytes | None = None, hash_name: str = "sha256") -> None:
         try:
             hashlib.new(hash_name)
         except ValueError as error:
             raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+        if key is not None:
+            if not isinstance(key, (bytes, bytearray)):
+                raise TypeError("key must be bytes")
+            if len(key) == 0:
+                raise ValueError("key must be non-empty")
+            key = bytes(key)
         self._hash_name = hash_name
         self._entries: list[Entry] = []
         self._retain_from = 0
@@ -207,6 +281,13 @@ class AuditLog:
         # Roots of the maximal perfect subtrees covering [0, retain_from),
         # keyed by subtree height (a subtree of height h holds 2**h leaves).
         self._frontier: dict[int, bytes] = {}
+        # Forward-secure authentication state. ``key is None`` is keyless
+        # mode: the authentication interface is disabled.
+        self._key: bytes | None = key
+        self._stage = 0
+        self._verifier_exported = False
+        # Tags of retained entries, keyed by absolute index.
+        self._tags: dict[int, AuthTag] = {}
 
     @property
     def hash_name(self) -> str:
@@ -239,6 +320,58 @@ class AuditLog:
         self._entries.append(entry)
         self._head = entry.entry_hash
         return entry
+
+    @property
+    def stage(self) -> int:
+        """Current key-evolution stage (0 before the first evolution)."""
+        return self._stage
+
+    def _require_key(self) -> bytes:
+        if self._key is None:
+            raise ValueError(
+                "authentication is disabled: construct AuditLog with a non-empty key"
+            )
+        return self._key
+
+    def auth(self, index: int) -> AuthTag:
+        """Mint a forward-secure tag for the retained entry at ``index``.
+
+        The tag is an HMAC over the entry hash at the current stage. Right
+        after minting, the key is replaced by its one-way evolution and the
+        stage advances, so a later compromise cannot forge tags for entries
+        authenticated earlier. The log itself is not modified.
+        """
+        key = self._require_key()
+        entry = self.entry(index)
+        tag = AuthTag(
+            stage=self._stage,
+            tag=_auth_tag(self._stage, entry.entry_hash, key, self._hash_name),
+        )
+        self._tags[index] = tag
+        self._key = _evolve_key(key, self._hash_name)
+        self._stage += 1
+        return tag
+
+    def rotate_key(self) -> None:
+        """Evolve the authentication key once without minting a tag."""
+        key = self._require_key()
+        self._key = _evolve_key(key, self._hash_name)
+        self._stage += 1
+
+    def export_verifier(self) -> Verifier:
+        """Export the stage-0 verification material exactly once.
+
+        Only callable before the first key evolution (no :meth:`auth` or
+        :meth:`rotate_key` yet) and only once. The returned :class:`Verifier`
+        lets anyone verify tags at any later stage without the evolving key.
+        """
+        self._require_key()
+        if self._stage != 0 or self._verifier_exported:
+            raise ValueError(
+                "verifier can only be exported once and before the first key evolution"
+            )
+        self._verifier_exported = True
+        return Verifier(key=self._key, hash_name=self._hash_name)  # type: ignore[arg-type]
 
     def entries(self) -> list[Entry]:
         return list(self._entries)
@@ -524,6 +657,8 @@ class AuditLog:
             return
         self._frontier = self._occupied_at(retain_from)
         del self._entries[: retain_from - self._retain_from]
+        for released in range(self._retain_from, retain_from):
+            self._tags.pop(released, None)
         self._retain_from = retain_from
         self._checkpoint_head = expected_chain
 
@@ -680,3 +815,56 @@ def verify_consistency(
     if sn != 0:
         raise ValueError("proof has too few nodes")
     return hmac.compare_digest(fr, old_root) and hmac.compare_digest(sr, new_root)
+
+
+def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
+    """Verify a forward-secure authentication tag without holding the log.
+
+    First recomputes the entry digest from ``entry``'s fields and checks it
+    against ``entry.entry_hash``; a structurally valid entry whose recorded
+    hash does not match returns False. Then evolves the verifier's stage-0 key
+    forward to ``tag.stage`` and checks the HMAC over the entry hash.
+
+    Structural/type problems raise TypeError; negative values, wrong digest
+    lengths, an unknown hash algorithm or an invalid state raise ValueError.
+    A well-formed entry and tag whose content simply does not authenticate
+    return False.
+    """
+    if not isinstance(entry, Entry):
+        raise TypeError("entry must be an Entry")
+    if not isinstance(tag, AuthTag):
+        raise TypeError("tag must be an AuthTag")
+    if not isinstance(verifier, Verifier):
+        raise TypeError("verifier must be a Verifier")
+
+    digest_size = hashlib.new(verifier.hash_name).digest_size
+    for name in ("previous_hash", "entry_hash", "payload"):
+        value = getattr(entry, name)
+        if not isinstance(value, (bytes, bytearray)):
+            raise TypeError(f"entry.{name} must be bytes")
+    if len(entry.previous_hash) != digest_size:
+        raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+    if len(entry.entry_hash) != digest_size:
+        raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+    if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+        raise TypeError("entry.index must be an integer")
+    if entry.index < 0:
+        raise ValueError("entry.index must be non-negative")
+
+    if len(tag.tag) != digest_size:
+        raise ValueError(f"tag.tag must be {digest_size} bytes")
+
+    recomputed = entry_digest(
+        entry.index,
+        entry.previous_hash,
+        entry.payload,
+        hash_name=verifier.hash_name,
+    )
+    if not hmac.compare_digest(recomputed, entry.entry_hash):
+        return False
+
+    key = verifier.key
+    for _ in range(tag.stage):
+        key = _evolve_key(key, verifier.hash_name)
+    expected = _auth_tag(tag.stage, entry.entry_hash, key, verifier.hash_name)
+    return hmac.compare_digest(expected, tag.tag)

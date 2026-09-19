@@ -32,6 +32,16 @@ def main() -> int:
     print(f"  recomputing entry #2 with changed payload gives")
     print(f"    {forged.hex()[:32]}…")
     print(f"  which differs from the recorded hash: {forged != log.entry(2).entry_hash}")
+
+    print()
+    print("verifiable prefix pruning:")
+    receipt = log.seal(2)
+    print(f"  sealed prefix: size={receipt.size} root={receipt.merkle_root.hex()[:16]}…")
+    print(f"  receipt matches the first retained entry: {receipt.matches(log.entry(2))}")
+    log.prune(2, receipt)
+    log.append("post-prune witness")
+    print(f"  len={len(log)}  retained_from={log.retain_from}  entries={[e.index for e in log.entries()]}")
+    print(f"  verify from checkpoint: {log.verify()}")
     return 0
 
 

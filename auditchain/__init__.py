@@ -1,6 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / entry_digest / verify_inclusion / verify_consistency.
+Public API: Entry / AuditLog / PruneReceipt / entry_digest / verify_inclusion /
+verify_consistency.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any, Iterator, Sequence
 __all__ = [
     "AuditLog",
     "Entry",
+    "PruneReceipt",
     "GENESIS_HASH",
     "entry_digest",
     "verify_consistency",
@@ -129,8 +131,67 @@ class Entry:
     entry_hash: bytes
 
 
+@dataclass(frozen=True)
+class PruneReceipt:
+    """Sealed checkpoint for a verifiable prefix prune.
+
+    Captures everything a later :meth:`AuditLog.prune` must agree with before
+    the payloads of the first ``size`` entries may be released:
+
+    - ``hash_name``: hash algorithm of the log that sealed the prefix,
+    - ``size``: number of entries in the sealed prefix,
+    - ``merkle_root``: Merkle root of the prefix,
+    - ``chain_hash``: entry hash of the last prefix entry (the predecessor
+      digest the first retained entry must carry); ``GENESIS_HASH`` for an
+      empty prefix.
+    """
+
+    hash_name: str
+    size: int
+    merkle_root: bytes
+    chain_hash: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        try:
+            digest_size = hashlib.new(self.hash_name).digest_size
+        except ValueError as error:
+            raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
+        for name in ("merkle_root", "chain_hash"):
+            value = getattr(self, name)
+            if not isinstance(value, (bytes, bytearray)):
+                raise TypeError(f"{name} must be bytes")
+            if len(value) != digest_size:
+                raise ValueError(f"{name} must be {digest_size} bytes")
+            if not isinstance(value, bytes):
+                object.__setattr__(self, name, bytes(value))
+
+    def matches(self, entry: Any) -> bool:
+        """Whether ``entry`` is the first record retained after this prefix.
+
+        Its absolute index must equal ``size`` and its predecessor digest must
+        equal ``chain_hash``. A receipt for the empty prefix never matches.
+        """
+        if not isinstance(entry, Entry):
+            raise TypeError("entry must be an Entry")
+        if self.size == 0:
+            return False
+        return entry.index == self.size and entry.previous_hash == self.chain_hash
+
+
 class AuditLog:
-    """Append-only hash chain held in memory."""
+    """Append-only hash chain held in memory.
+
+    A pruned log keeps only entries from ``retain_from`` onward. Absolute
+    indices, the chain head and every rebuildable Merkle snapshot stay
+    identical to an unpruned log holding the same records; snapshots wholly
+    inside a pruned prefix can no longer be produced.
+    """
 
     def __init__(self, *, hash_name: str = "sha256") -> None:
         try:
@@ -139,32 +200,44 @@ class AuditLog:
             raise ValueError(f"unknown hash algorithm: {hash_name}") from error
         self._hash_name = hash_name
         self._entries: list[Entry] = []
+        self._retain_from = 0
+        self._head: bytes = GENESIS_HASH
+        # Chain hash of the last pruned entry (GENESIS_HASH before any prune).
+        self._checkpoint_head: bytes = GENESIS_HASH
+        # Roots of the maximal perfect subtrees covering [0, retain_from),
+        # keyed by subtree height (a subtree of height h holds 2**h leaves).
+        self._frontier: dict[int, bytes] = {}
 
     @property
     def hash_name(self) -> str:
         return self._hash_name
 
+    @property
+    def retain_from(self) -> int:
+        """Absolute index of the first entry still held after the last prune."""
+        return self._retain_from
+
     def __len__(self) -> int:
-        return len(self._entries)
+        return self._retain_from + len(self._entries)
 
     def __iter__(self) -> Iterator[Entry]:
         return iter(self._entries)
 
     @property
     def head(self) -> bytes:
-        return self._entries[-1].entry_hash if self._entries else GENESIS_HASH
+        return self._head
 
     def append(self, payload: Any) -> Entry:
         material = _as_bytes(payload)
-        previous = self.head
-        index = len(self._entries)
+        index = len(self)
         entry = Entry(
             index=index,
             payload=material,
-            previous_hash=previous,
-            entry_hash=entry_digest(index, previous, material, hash_name=self._hash_name),
+            previous_hash=self._head,
+            entry_hash=entry_digest(index, self._head, material, hash_name=self._hash_name),
         )
         self._entries.append(entry)
+        self._head = entry.entry_hash
         return entry
 
     def entries(self) -> list[Entry]:
@@ -173,14 +246,21 @@ class AuditLog:
     def entry(self, index: int) -> Entry:
         if not isinstance(index, int):
             raise TypeError("index must be an integer")
-        if not 0 <= index < len(self._entries):
-            raise IndexError(f"no entry at index {index}")
-        return self._entries[index]
+        if not self._retain_from <= index < len(self):
+            raise IndexError(f"no retained entry at index {index}")
+        return self._entries[index - self._retain_from]
 
     def verify_entry(self, index: int) -> bool:
-        """Check that one entry links correctly to its predecessor."""
+        """Check that one retained entry links correctly to its predecessor."""
         entry = self.entry(index)
-        previous = GENESIS_HASH if index == 0 else self._entries[index - 1].entry_hash
+        if entry.index != index:
+            return False
+        if index == 0:
+            previous = GENESIS_HASH
+        elif index == self._retain_from:
+            previous = self._checkpoint_head
+        else:
+            previous = self._entries[index - self._retain_from - 1].entry_hash
         if entry.previous_hash != previous:
             return False
         return entry.entry_hash == entry_digest(
@@ -188,33 +268,154 @@ class AuditLog:
         )
 
     def verify(self) -> bool:
-        """Walk the whole chain from the genesis digest."""
-        for index in range(len(self._entries)):
-            entry = self._entries[index]
-            if entry.index != index:
+        """Walk the retained chain forward from the prune checkpoint."""
+        previous = self._checkpoint_head
+        for offset, entry in enumerate(self._entries):
+            index = self._retain_from + offset
+            if entry.index != index or entry.previous_hash != previous:
                 return False
-            if not self.verify_entry(index):
+            if entry.entry_hash != entry_digest(
+                index, previous, entry.payload, hash_name=self._hash_name
+            ):
                 return False
+            previous = entry.entry_hash
         return True
 
     def _resolve_size(self, size: int | None) -> int:
         if size is None:
-            return len(self._entries)
+            return len(self)
         if not isinstance(size, int):
             raise TypeError("size must be an integer")
-        if not 0 <= size <= len(self._entries):
-            raise ValueError(f"size must be within 0..{len(self._entries)}")
+        if not 0 <= size <= len(self):
+            raise ValueError(f"size must be within 0..{len(self)}")
         return size
+
+    def _require_retained_snapshot(self, size: int) -> None:
+        if size < self._retain_from:
+            raise ValueError(
+                f"snapshot at size {size} was pruned (entries are retained from {self._retain_from})"
+            )
+
+    def _chain_head_at(self, size: int) -> bytes:
+        """Entry hash of the last entry of the prefix (GENESIS_HASH at 0)."""
+        if size == 0:
+            return GENESIS_HASH
+        if size == self._retain_from:
+            return self._checkpoint_head
+        return self._entries[size - self._retain_from - 1].entry_hash
+
+    def _occupied_at(self, size: int) -> dict[int, bytes]:
+        """Perfect-subtree stack (height -> root) covering the first ``size`` leaves."""
+        occupied = dict(self._frontier)
+        for entry in self._entries[: size - self._retain_from]:
+            node = _leaf_hash(entry.entry_hash, self._hash_name)
+            height = 0
+            while height in occupied:
+                node = _node_hash(occupied.pop(height), node, self._hash_name)
+                height += 1
+            occupied[height] = node
+        return occupied
+
+    def _fold_occupied(self, occupied: dict[int, bytes]) -> bytes:
+        if not occupied:
+            return _hash_parts(self._hash_name, _EMPTY_DOMAIN)
+        root: bytes | None = None
+        # Low blocks are the rightmost subtrees; fold them in from the right.
+        for height in sorted(occupied):
+            node = occupied[height]
+            root = node if root is None else _node_hash(node, root, self._hash_name)
+        return root  # type: ignore[return-value]
 
     def merkle_root(self, size: int | None = None) -> bytes:
         """Root of the Merkle tree over the first ``size`` entries.
 
         Defaults to the whole log. Appending later entries never changes
-        the root of an earlier prefix.
+        the root of an earlier prefix. A prefix already released by
+        :meth:`prune` cannot be rebuilt and raises ValueError.
         """
         size = self._resolve_size(size)
-        leaves = [_leaf_hash(entry.entry_hash, self._hash_name) for entry in self._entries[:size]]
-        return _root_of(leaves, self._hash_name)
+        if size == 0:
+            return _hash_parts(self._hash_name, _EMPTY_DOMAIN)
+        self._require_retained_snapshot(size)
+        return self._fold_occupied(self._occupied_at(size))
+
+    def _frontier_blocks(self) -> dict[tuple[int, int], bytes]:
+        """Checkpoint subtrees as ``(height, level node index)`` nodes."""
+        blocks: dict[tuple[int, int], bytes] = {}
+        start = 0
+        for height in sorted(self._frontier, reverse=True):
+            blocks[(height, start >> height)] = self._frontier[height]
+            start += 1 << height
+        return blocks
+
+    def _perfect_node(self, height: int, index: int, blocks: dict[tuple[int, int], bytes]) -> bytes:
+        """Root of the aligned perfect subtree ``[index*2**height, (index+1)*2**height)``."""
+        cached = blocks.get((height, index))
+        if cached is not None:
+            return cached
+        if height == 0:
+            absolute = index
+            if absolute < self._retain_from:
+                raise ValueError(
+                    f"snapshot data at index {absolute} was pruned "
+                    f"(entries are retained from {self._retain_from})"
+                )
+            entry = self._entries[absolute - self._retain_from]
+            return _leaf_hash(entry.entry_hash, self._hash_name)
+        left = self._perfect_node(height - 1, index * 2, blocks)
+        right = self._perfect_node(height - 1, index * 2 + 1, blocks)
+        return _node_hash(left, right, self._hash_name)
+
+    def _level_node(
+        self, height: int, index: int, size: int, blocks: dict[tuple[int, int], bytes]
+    ) -> bytes:
+        """Node at ``index`` of tree level ``height`` under the promotion rule.
+
+        Levels combine adjacent pairs and promote the odd trailing node
+        unchanged. A level node is promoted only when it is the trailing index
+        while its parent level had an odd node count; otherwise it is the hash
+        of its two children.
+        """
+        start = index << height
+        if start + (1 << height) <= size:
+            return self._perfect_node(height, index, blocks)
+        if height == 0:
+            return self._perfect_node(0, index, blocks)
+        lower_count = (size + (1 << (height - 1)) - 1) >> (height - 1)
+        if index * 2 + 1 >= lower_count:
+            # Trailing node promoted unchanged from the lower level.
+            return self._level_node(height - 1, index * 2, size, blocks)
+        return _node_hash(
+            self._level_node(height - 1, index * 2, size, blocks),
+            self._level_node(height - 1, index * 2 + 1, size, blocks),
+            self._hash_name,
+        )
+
+    def _range_root(self, start: int, length: int, blocks: dict[tuple[int, int], bytes]) -> bytes:
+        """Merkle root of ``length`` leaves beginning at the aligned ``start``."""
+        if length & (length - 1) == 0:
+            return self._perfect_node(length.bit_length() - 1, start >> (length.bit_length() - 1), blocks)
+        k = _split_point(length)
+        return _node_hash(
+            self._range_root(start, k, blocks),
+            self._range_root(start + k, length - k, blocks),
+            self._hash_name,
+        )
+
+    def _virtual_subproof(
+        self, m: int, n: int, base: int, complete: bool, blocks: dict[tuple[int, int], bytes]
+    ) -> list[bytes]:
+        """RFC 6962 SUBPROOF over the virtual leaf range ``[base, base+n)``."""
+        if m == n:
+            return [] if complete else [self._range_root(base, n, blocks)]
+        k = _split_point(n)
+        if m <= k:
+            return self._virtual_subproof(m, k, base, complete, blocks) + [
+                self._range_root(base + k, n - k, blocks)
+            ]
+        return self._virtual_subproof(m - k, n - k, base + k, False, blocks) + [
+            self._range_root(base, k, blocks)
+        ]
 
     def inclusion_proof(self, index: int, size: int | None = None) -> tuple[bytes, ...]:
         """Sibling digests from leaf to root for ``index`` within the first ``size`` entries."""
@@ -223,15 +424,22 @@ class AuditLog:
             raise TypeError("index must be an integer")
         if not 0 <= index < size:
             raise ValueError(f"index must satisfy 0 <= index < {size}")
-        level = [_leaf_hash(entry.entry_hash, self._hash_name) for entry in self._entries[:size]]
+        if size < self._retain_from or index < self._retain_from:
+            raise ValueError(
+                f"index {index} is inside the pruned prefix (entries retained from {self._retain_from})"
+            )
+        blocks = self._frontier_blocks()
         proof: list[bytes] = []
         position = index
-        while len(level) > 1:
+        width = size
+        height = 0
+        while width > 1:
             sibling = position ^ 1
-            if sibling < len(level):
-                proof.append(level[sibling])
-            level = _next_level(level, self._hash_name)
+            if sibling < width:
+                proof.append(self._level_node(height, sibling, size, blocks))
             position //= 2
+            width = (width + 1) // 2
+            height += 1
         return tuple(proof)
 
     def consistency_proof(self, old_size: int, new_size: int | None = None) -> tuple[bytes, ...]:
@@ -239,7 +447,9 @@ class AuditLog:
 
         ``new_size`` defaults to the current log length. The digests follow the
         RFC 6962 section 2.1.2 SUBPROOF order; appending later entries never
-        changes the proof for an existing pair of prefix sizes.
+        changes the proof for an existing pair of prefix sizes. After a prune,
+        proofs from the retain point to any later prefix remain available;
+        proofs rooted inside a released prefix raise ValueError.
         """
         new_size = self._resolve_size(new_size)
         if not isinstance(old_size, int):
@@ -248,11 +458,74 @@ class AuditLog:
             raise ValueError(f"old_size must satisfy 0 <= old_size <= {new_size}")
         if old_size == 0 or old_size == new_size:
             return ()
-        leaves = [
-            _leaf_hash(entry.entry_hash, self._hash_name)
-            for entry in self._entries[:new_size]
-        ]
-        return tuple(_subproof(old_size, leaves, True, self._hash_name))
+        if old_size < self._retain_from:
+            raise ValueError(
+                f"snapshot at size {old_size} was pruned (entries are retained from {self._retain_from})"
+            )
+        blocks = self._frontier_blocks()
+        return tuple(self._virtual_subproof(old_size, new_size, 0, True, blocks))
+
+    def seal(self, size: int | None = None) -> PruneReceipt:
+        """Issue a :class:`PruneReceipt` for the prefix of the first ``size`` entries.
+
+        Defaults to the current log length. The receipt records the prefix
+        Merkle root and the entry hash of its last record; the empty prefix
+        records ``GENESIS_HASH`` as its chain hash.
+        """
+        size = self._resolve_size(size)
+        if size == 0:
+            root = _hash_parts(self._hash_name, _EMPTY_DOMAIN)
+        else:
+            self._require_retained_snapshot(size)
+            root = self._fold_occupied(self._occupied_at(size))
+        return PruneReceipt(
+            hash_name=self._hash_name,
+            size=size,
+            merkle_root=root,
+            chain_hash=self._chain_head_at(size),
+        )
+
+    def prune(self, retain_from: int, receipt: PruneReceipt) -> None:
+        """Release payloads of the sealed prefix, retaining entries from ``retain_from``.
+
+        ``retain_from`` must equal ``receipt.size`` and the receipt's hash
+        algorithm, prefix Merkle root and last-entry chain hash must match the
+        log. The retain point can only move forward and never past the log
+        end. On success the prefix payloads are dropped; indices, head,
+        appends and all rebuildable snapshots stay consistent with an unpruned
+        log.
+        """
+        if not isinstance(receipt, PruneReceipt):
+            raise TypeError("receipt must be a PruneReceipt")
+        if not isinstance(retain_from, int) or isinstance(retain_from, bool):
+            raise TypeError("retain_from must be an integer")
+        if retain_from != receipt.size:
+            raise ValueError(f"retain_from ({retain_from}) must equal receipt.size ({receipt.size})")
+        if not 0 <= retain_from <= len(self):
+            raise ValueError(f"retain_from must be within 0..{len(self)}")
+        if retain_from < self._retain_from:
+            raise ValueError(
+                f"retain_from cannot move backwards "
+                f"({self._retain_from} -> {retain_from})"
+            )
+        if receipt.hash_name != self._hash_name:
+            raise ValueError(
+                f"receipt hash_name {receipt.hash_name!r} does not match log {self._hash_name!r}"
+            )
+        expected_root = self._fold_occupied(self._occupied_at(retain_from))
+        if not hmac.compare_digest(receipt.merkle_root, expected_root):
+            raise ValueError("receipt merkle_root does not match the log prefix")
+        expected_chain = self._chain_head_at(retain_from)
+        if not hmac.compare_digest(receipt.chain_hash, expected_chain):
+            raise ValueError("receipt chain_hash does not match the last prefix entry")
+
+        if retain_from == self._retain_from:
+            self._checkpoint_head = expected_chain
+            return
+        self._frontier = self._occupied_at(retain_from)
+        del self._entries[: retain_from - self._retain_from]
+        self._retain_from = retain_from
+        self._checkpoint_head = expected_chain
 
 
 def _check_digest(value: Any, name: str, digest_size: int) -> bytes:

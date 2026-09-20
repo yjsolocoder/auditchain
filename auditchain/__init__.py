@@ -2,7 +2,8 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / entry_digest / verify_inclusion / verify_consistency /
-verify_auth / verify_audit_receipt.
+verify_auth / verify_audit_receipt / encode_audit_receipt /
+decode_audit_receipt.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ __all__ = [
     "PruneReceipt",
     "Verifier",
     "GENESIS_HASH",
+    "decode_audit_receipt",
+    "encode_audit_receipt",
     "entry_digest",
     "verify_audit_receipt",
     "verify_auth",
@@ -38,6 +41,12 @@ _EMPTY_DOMAIN = b"auditchain/merkle-empty/v1"
 _AUTH_DOMAIN = b"auditchain/auth/v1"
 _EVOLVE_DOMAIN = b"auditchain/key-evolve/v1"
 _LOCATE_DOMAIN = b"auditchain/locate/v1"
+
+# Binary framing of encode_audit_receipt / decode_audit_receipt: a fixed
+# magic, then unsigned 8-byte big-endian integers and length-prefixed blobs.
+_RECEIPT_MAGIC = b"auditchain/audit-receipt/v1\0"
+_U64_BYTES = 8
+_U64_LIMIT = 1 << 64
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -1052,6 +1061,143 @@ def verify_audit_receipt(receipt: Any) -> bool:
         ):
             return False
     return True
+
+
+def _encode_u64(value: int, name: str) -> bytes:
+    if not 0 <= value < _U64_LIMIT:
+        raise ValueError(f"{name} must satisfy 0 <= {name} < 2**64")
+    return value.to_bytes(_U64_BYTES, "big")
+
+
+def _encode_blob(material: bytes) -> bytes:
+    return _encode_u64(len(material), "blob length") + material
+
+
+def _proof_level_count(index: int, size: int) -> int:
+    """Sibling count an inclusion proof for ``index`` within ``size`` entries needs."""
+    count = 0
+    position = index
+    width = size
+    while width > 1:
+        if position % 2 == 1 or position + 1 < width:
+            count += 1
+        position //= 2
+        width = (width + 1) // 2
+    return count
+
+
+def _check_receipt_proofs(receipt: AuditReceipt) -> None:
+    for entry, proof in receipt.items:
+        expected = _proof_level_count(entry.index, receipt.size)
+        if len(proof) != expected:
+            raise ValueError(
+                f"proof for index {entry.index} must have {expected} levels, "
+                f"got {len(proof)}"
+            )
+
+
+def encode_audit_receipt(receipt: Any) -> bytes:
+    """Encode an :class:`AuditReceipt` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/audit-receipt/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear in the order ``version``, ``hash_name`` (UTF-8 blob),
+    ``size``, ``root`` blob and item count; each item is ``Entry.index``,
+    ``payload`` blob, ``previous_hash`` blob, ``entry_hash`` blob, proof
+    count and one blob per proof digest. ``receipt`` must be an
+    :class:`AuditReceipt` (anything else raises TypeError); its structure is
+    validated by the class itself, and integers that do not fit the u64
+    framing raise ValueError. Encoding is deterministic: re-encoding a
+    decoded receipt reproduces the original bytes exactly.
+    """
+    if not isinstance(receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt")
+    _check_receipt_proofs(receipt)
+    parts = [
+        _RECEIPT_MAGIC,
+        _encode_u64(receipt.version, "version"),
+        _encode_blob(receipt.hash_name.encode("utf-8")),
+        _encode_u64(receipt.size, "size"),
+        _encode_blob(bytes(receipt.root)),
+        _encode_u64(len(receipt.items), "items count"),
+    ]
+    for entry, proof in receipt.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+        parts.append(_encode_u64(len(proof), "proof count"))
+        for digest in proof:
+            parts.append(_encode_blob(bytes(digest)))
+    return b"".join(parts)
+
+
+def decode_audit_receipt(data: Any) -> AuditReceipt:
+    """Decode bytes produced by :func:`encode_audit_receipt`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad magic,
+    an unsupported version or hash algorithm, invalid UTF-8 in ``hash_name``,
+    truncation, trailing bytes, digest-length mismatches, non-ascending or
+    duplicate item indices, a missing last entry and structurally invalid
+    proofs all raise ValueError. The decoded receipt's fields equal the
+    originally encoded ones and satisfy :func:`verify_audit_receipt` whenever
+    the original did.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain audit-receipt encoding")
+    offset = len(_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        proof_count = read_u64("proof count")
+        proof = tuple(read_blob("proof element") for _ in range(proof_count))
+        items.append((Entry(index, payload, previous_hash, entry_hash), proof))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = AuditReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        items=tuple(items),
+    )
+    _check_receipt_proofs(receipt)
+    return receipt
 
 
 def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:

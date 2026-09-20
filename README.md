@@ -55,6 +55,24 @@ Merkle 根与所选条目的包含证明；`verify_audit_receipt` 重算每条 `
 并核验全部包含证明、根与末条摘要。空选择（`[]`）得到 `items == ()` 的回执；
 `size=0` 的空快照回执只接受规范空树根。签发是只读的，不影响日志任何状态。
 
+回执可编码为规范字节形式，便于落盘或传输后离线核验：
+
+```python
+data = encode_audit_receipt(receipt)      # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_audit_receipt(data)     # 字段与原回执相等
+encode_audit_receipt(restored) == data    # True：重复编码字节相同
+verify_audit_receipt(restored)            # True
+```
+
+编码以魔数 `b"auditchain/audit-receipt/v1\0"` 开头；整数均为 8 字节无符号大端，
+blob 为 u64 字节长度后接原始字节（零长度也是全零 u64）。字段顺序为 version、
+hash_name（UTF-8 blob）、size、root blob、items 计数；每个 item 依次为
+Entry.index、payload blob、previous_hash blob、entry_hash blob、proof 计数及各
+摘要 blob。`encode_audit_receipt` 只接受 `AuditReceipt`（其他类型抛 `TypeError`），
+整数超出 u64 范围抛 `ValueError`；`decode_audit_receipt` 只接受 `bytes`，魔数、
+版本、算法、非法 UTF-8、截断、尾随字节、长度溢出、摘要长度、索引顺序/重复、
+末条缺失或证明结构非法均抛 `ValueError`。
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -167,6 +185,11 @@ python3 -m auditchain
   `entry_digest` 并核验全部包含证明与快照根，空快照只接受规范空树根；结构合法但条目内容、
   证明或根不符返回 `False`；入参不是 `AuditReceipt` 抛 `TypeError`，字段结构、摘要长度或
   证明结构非法抛 `ValueError`
+- `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
+  编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
+  blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；
+  参数类型错误抛 `TypeError`，编码时整数溢出 u64 或解码时魔数、版本、算法、UTF-8、
+  截断、尾随、长度、索引顺序、末条或证明结构非法抛 `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

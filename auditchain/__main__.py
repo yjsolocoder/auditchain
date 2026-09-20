@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import os
 
-from . import AuditLog, decrypt_entry, entry_digest, verify_audit_receipt
+from . import (
+    AuditLog,
+    decrypt_entry,
+    entry_digest,
+    verify_audit_batch,
+    verify_audit_receipt,
+)
 
 RECORDS = [
     "agent started",
@@ -48,6 +54,14 @@ def main() -> int:
     audit = log.audit_receipt([1, 3])
     print(f"  size={audit.size} items={[entry.index for entry, _ in audit.items]}")
     print(f"  verifies without the log: {verify_audit_receipt(audit)}")
+
+    print()
+    print("compact offline batch audit receipt:")
+    batch = log.audit_batch([1, 3])
+    _, batch_size, _, batch_entries, batch_proof = batch
+    print(f"  size={batch_size} entries={[entry.index for entry in batch_entries]}")
+    print(f"  shared proof nodes={len(batch_proof)}")
+    print(f"  verifies without the log: {verify_audit_batch(batch)}")
 
     print()
     print("verifiable prefix pruning:")

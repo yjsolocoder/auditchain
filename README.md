@@ -269,6 +269,12 @@ python3 -m auditchain
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
+  - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
+    包含证明，返回 `(indices, proof)`：`indices` 为去重并按绝对索引升序排列的
+    元组，`proof` 为一份覆盖整个 `[0, size)` 快照、合并重复子树摘要的 `bytes`
+    元组；`size` 默认当前长度，快照须可重建。`indices` 为可迭代的互异非
+    `bool` 整数，须满足 `retain_from <= index < size` 且非空；类型非法抛
+    `TypeError`，空选择、重复、越界或快照不可重建抛 `ValueError`；调用只读
   - `consistency_proof(old_size, new_size=None)` — 两个前缀快照之间的一致性证明，不可变元组；
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
   - `seal(size=None)` — 为前 `size` 条（默认当前长度）生成 `PruneReceipt`，记录前缀根与末条摘要，
@@ -299,6 +305,13 @@ python3 -m auditchain
   `key` 长度非 32、封装魔数不符或截断、算法号未知、摘要长度不符、`entry_hash`
   不符、密钥错误或 AEAD 认证失败抛 `ValueError`；调用只读，不改变条目或日志
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
+- `verify_batch_inclusion(indices, entry_hashes, size, root, proof, *, hash_name="sha256")` —
+  只凭所选条目摘要、快照大小与根摘要离线验证 `batch_inclusion_proof` 的紧凑批量
+  证明，无需持有日志；`indices` 为非空、严格升序的非 `bool` 整数 `tuple`，
+  `entry_hashes` 为与之等长的 `bytes` 摘要 `tuple`，`proof` 为 `bytes` 节点的
+  `tuple`。类型非法抛 `TypeError`；索引越界/非升序、序列不等长、摘要宽度不符、
+  快照大小或证明节点数与 `(indices, size)` 不符抛 `ValueError`；结构合法但摘要、
+  证明或根不匹配返回 `False`，否则 `True`
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
 - `verify_audit_receipt(receipt)` — 无需持有日志即可验证 `AuditReceipt`：要求非空快照
@@ -326,6 +339,13 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 一致性证明的节点顺序遵循 RFC 6962 §2.1.2 的 SUBPROOF 递归（子树根按同一提升规则计算）。
 两个特例：`old_size == new_size` 只接受空证明且要求两根相等；`old_size == 0` 只接受空证明，
 旧根须为规范空树根 `H("auditchain/merkle-empty/v1")`，此时新根格式合法即通过（`0 -> 0` 仍须两根相等）。
+
+批量包含证明用一份 `proof` 覆盖快照中的多个所选叶，递归覆盖整个 `[0, size)`：当前子树长度
+`n > 1` 时取小于 `n` 的最大二的幂 `k`，按左 `[0, k)` 后右 `[k, n)` 的顺序处理；不含任何
+所选索引的子树只追加其 Merkle 根，含所选索引的子树继续递归，所选单叶不追加任何节点。
+因此多个所选叶共享的子树摘要只出现一次，比各自独立的包含证明更紧凑；哈希与奇数层末节点
+原样提升沿用上面的 Merkle 规则。所选叶的摘要由验证方按升序在 `entry_hashes` 中提供，
+空快照（`size=0`）不存在非空选择，故无对应的批量证明。
 
 ## 限制
 

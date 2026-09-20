@@ -178,6 +178,27 @@ verify_audit_batch(receipt)            # True：无需持有日志即可离线�
   条目或证明节点数与 `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容
   （重算 `entry_digest`）、证明或根不匹配返回 `False`，匹配返回 `True`
 
+五元组同样可编码为确定性的规范字节形式，落盘或传输后仍由
+`verify_audit_batch` 离线核验，编解码均为只读、不改变任何既有接口行为：
+
+```python
+data = encode_audit_batch(receipt)       # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_audit_batch(data)      # (hash_name, size, root, entries, proof)
+restored == receipt                      # True：字段与原五元组相等
+encode_audit_batch(restored) == data     # True：重复编码逐字节相同
+verify_audit_batch(restored)             # True：仍由 verify_audit_batch 离线核验
+```
+
+字节流以魔数 `b"auditchain/batch/v1\0"` 开头，其后依次为 version（恒为 `1` 的 u64）、
+hash_name 的 UTF-8 blob、size（u64）、root blob、entries 计数（u64）；整数均为 u64
+大端，blob 均为 u64 字节长度后接原始字节（零长度也是全零 u64）。逐个 Entry 依次写
+index（u64）、payload blob、previous_hash blob、entry_hash blob（严格升序），末尾写
+共享 proof 的 u64 节点计数及各摘要 blob。`encode_audit_batch` 只接受结构合法的五元组
+（其余抛 `TypeError`），算法、范围、宽度、顺序、缺末条或节点数不符抛 `ValueError`；
+`decode_audit_batch` 只接受 `bytes`，魔数、版本、算法、非法 UTF-8、截断、尾随字节、
+摘要长度、索引范围/顺序、缺末条或节点数不符抛 `ValueError`。内容、证明或根不匹配的
+结构合法回执仍可解码，只是 `verify_audit_batch` 返回 `False`。
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -375,6 +396,16 @@ python3 -m auditchain
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；
   参数类型错误抛 `TypeError`，编码时整数溢出 u64 或解码时魔数、版本、算法、UTF-8、
   截断、尾随、长度、索引顺序、末条或证明结构非法抛 `ValueError`
+- `encode_audit_batch(receipt)` / `decode_audit_batch(data)` — 紧凑批量审计回执五元组的
+  规范二进制编码与解码：以魔数 `b"auditchain/batch/v1\0"` 开头，后接 version=1 的 u64、
+  hash_name 的 UTF-8 blob、size、root blob、entries 计数；整数均为 u64 大端，blob 为
+  u64 长度前缀加原始字节；逐个 Entry 依次为 index、payload、previous_hash、entry_hash，
+  末尾为共享 proof 的 u64 计数及节点 blob。`encode_audit_batch` 只接受结构合法的五元组
+  （非五元组或字段/条目类型错抛 `TypeError`），算法、范围、宽度、顺序、缺末条或节点数
+  不符抛 `ValueError`；`decode_audit_batch` 只接受 `bytes`（其他抛 `TypeError`），魔数、
+  版本、UTF-8、截断、尾随、算法、范围、宽度、顺序、缺末条或节点数不符抛 `ValueError`；
+  解码返回与原五元组相等的 `(hash_name, size, root, entries, proof)`，重复编码逐字节
+  相同；内容、证明或根不匹配仍可解码，由 `verify_audit_batch` 返回 `False`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

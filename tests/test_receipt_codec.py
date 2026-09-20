@@ -66,7 +66,14 @@ class EncodeAuditReceiptTest(unittest.TestCase):
 
     def test_integer_overflow(self):
         receipt = self.log.audit_receipt([1])
-        big = AuditReceipt(1, "sha256", 1 << 64, receipt.root, ())
+        # size == 2**64 with no items is rejected by the constructor, so
+        # bypass it to exercise the encoder's own u64 range check.
+        big = AuditReceipt.__new__(AuditReceipt)
+        object.__setattr__(big, "version", 1)
+        object.__setattr__(big, "hash_name", "sha256")
+        object.__setattr__(big, "size", 1 << 64)
+        object.__setattr__(big, "root", receipt.root)
+        object.__setattr__(big, "items", ())
         with self.assertRaises(ValueError):
             encode_audit_receipt(big)
         entry = Entry(1 << 64, b"x", receipt.root, receipt.root)
@@ -198,6 +205,20 @@ class DecodeAuditReceiptTest(unittest.TestCase):
         item = (self.log.entry(0), self.log.inclusion_proof(0))
         with self.assertRaises(ValueError):
             decode_audit_receipt(encode_audit_receipt(self.make_bypassed((item,))))
+
+    def test_non_empty_snapshot_with_zero_items_rejected(self):
+        # size > 0 but an empty item list: the last entry and its inclusion
+        # proof are missing, so the zero-evidence receipt must not decode.
+        data = (
+            MAGIC
+            + u64(1)
+            + blob(b"sha256")
+            + u64(5)
+            + blob(self.log.merkle_root(5))
+            + u64(0)
+        )
+        with self.assertRaises(ValueError):
+            decode_audit_receipt(data)
 
     def test_proof_structure_checked(self):
         receipt = self.log.audit_receipt([1])

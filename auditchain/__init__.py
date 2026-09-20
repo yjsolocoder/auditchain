@@ -435,7 +435,12 @@ class AuditReceipt:
                     raise TypeError("proof element must be bytes")
                 if len(sibling) != digest_size:
                     raise ValueError(f"proof element must be {digest_size} bytes")
-        if self.items and self.items[-1][0].index != self.size - 1:
+        if not self.items:
+            if self.size > 0:
+                raise ValueError(
+                    "a non-empty receipt must include the entry at index size - 1"
+                )
+        elif self.items[-1][0].index != self.size - 1:
             raise ValueError(
                 "a non-empty receipt must include the entry at index size - 1"
             )
@@ -1118,13 +1123,14 @@ class AuditLog:
 
         ``indices`` is an iterable of distinct non-bool absolute indices,
         each satisfying ``retain_from <= index < size``; ``size`` defaults to
-        the current log length and the snapshot must still be rebuildable. A
-        non-empty selection automatically also includes the last entry of the
-        snapshot (index ``size - 1``); an empty selection — and always an
-        empty snapshot — yields ``items == ()``. Items are stored in
-        ascending absolute index order, each paired with its inclusion proof
-        within the snapshot. The call is read-only: entries, head,
-        authentication state, Merkle roots and proofs are left untouched.
+        the current log length and the snapshot must still be rebuildable.
+        Any receipt over a non-empty snapshot — even an empty selection —
+        carries the last entry of the snapshot (index ``size - 1``) together
+        with its inclusion proof; only an empty snapshot yields
+        ``items == ()``. Items are stored in ascending absolute index order,
+        each paired with its inclusion proof within the snapshot. The call is
+        read-only: entries, head, authentication state, Merkle roots and
+        proofs are left untouched.
         """
         size = self._resolve_size(size)
         try:
@@ -1143,8 +1149,9 @@ class AuditLog:
                     f"<= index < size ({size})"
                 )
             selected.add(index)
-        if selected:
-            # A non-empty receipt always carries the last snapshot entry.
+        if size > 0:
+            # A non-empty snapshot always vouches for its last entry, so a
+            # zero-evidence receipt with an arbitrary root can never verify.
             selected.add(size - 1)
         root = self.merkle_root(size)
         items = tuple(
@@ -1403,19 +1410,26 @@ def verify_consistency(
 def verify_audit_receipt(receipt: Any) -> bool:
     """Verify an :class:`AuditReceipt` without holding the log.
 
-    Recomputes every item's entry digest from the entry's fields and
-    re-verifies every inclusion proof against the receipt's snapshot root;
-    an empty snapshot only accepts the canonical empty-tree root. A
-    structurally valid receipt whose entry content, proofs or root do not
-    match returns False; malformed input raises TypeError or ValueError
-    (see :class:`AuditReceipt` for the structural rules).
+    A receipt over a non-empty snapshot must carry the last entry (index
+    ``size - 1``); such a receipt can never be accepted on zero evidence.
+    Every item's entry digest is recomputed from the entry's fields and its
+    inclusion proof re-verified against the receipt's snapshot root, with the
+    last entry's proof and root checked explicitly. An empty snapshot only
+    accepts the canonical empty-tree root. A structurally valid receipt whose
+    last entry is missing or whose entry content, proofs or root do not match
+    returns False; malformed input raises TypeError or ValueError (see
+    :class:`AuditReceipt` for the structural rules).
     """
     if not isinstance(receipt, AuditReceipt):
         raise TypeError("receipt must be an AuditReceipt")
     if receipt.size == 0:
-        return hmac.compare_digest(
+        return not receipt.items and hmac.compare_digest(
             receipt.root, _hash_parts(receipt.hash_name, _EMPTY_DOMAIN)
         )
+    # Defense in depth: a bypassed constructor cannot leave a non-empty
+    # snapshot with no items, or the last entry absent from the items.
+    if not receipt.items or receipt.items[-1][0].index != receipt.size - 1:
+        return False
     for entry, proof in receipt.items:
         recomputed = entry_digest(
             entry.index,

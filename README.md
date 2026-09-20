@@ -116,14 +116,17 @@ receipt = log.apply_retention(3, mode="keep_last")  # 保留点 = max(当前保�
 
 ```python
 receipt = log.audit_receipt([1, 3])     # 自动并入末条；size 默认当前长度
+receipt = log.audit_receipt([])         # 空选择在非空快照上仍携带末条
 receipt.items                           # ((Entry, proof), ...) 按绝对索引升序
 verify_audit_receipt(receipt)           # True：无需持有日志即可离线核验
 ```
 
 回执为冻结的 `AuditReceipt(version=1, hash_name, size, root, items)`，记录快照
 Merkle 根与所选条目的包含证明；`verify_audit_receipt` 重算每条 `entry_digest`
-并核验全部包含证明、根与末条摘要。空选择（`[]`）得到 `items == ()` 的回执；
-`size=0` 的空快照回执只接受规范空树根。签发是只读的，不影响日志任何状态。
+并核验全部包含证明、根与末条摘要。非空快照（`size > 0`，即使空选择 `[]`）的
+`items` 必含末条（`index == size - 1`）及其包含证明，因此不可能用零证据回执
+认领任意根；仅 `size=0` 的空快照得到 `items == ()`，且只接受规范空树根。
+签发是只读的，不影响日志任何状态。
 
 回执可编码为规范字节形式，便于落盘或传输后离线核验：
 
@@ -270,9 +273,10 @@ python3 -m auditchain
     空前缀记录该宽度的零摘要（sha256 下为 `GENESIS_HASH`）
   - `audit_receipt(indices, size=None)` — 为快照中选定条目生成离线 `AuditReceipt`：
     `indices` 为可迭代的互异非 `bool` 整数，须满足 `retain_from <= index < size`；
-    `size` 默认当前长度，快照须可重建；非空选择自动并入末条（`index == size - 1`），
-    空选择及空快照得到 `items == ()`；条目按绝对索引升序携带各自包含证明；
-    调用只读，类型非法抛 `TypeError`，越界或重复抛 `ValueError`
+    `size` 默认当前长度，快照须可重建；`size > 0` 时即使空选择（`[]`）也自动并入
+    末条（`index == size - 1`）及其包含证明，仅空快照得到 `items == ()`；
+    条目按绝对索引升序携带各自包含证明；调用只读，类型非法抛 `TypeError`，
+    越界或重复抛 `ValueError`
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -295,15 +299,20 @@ python3 -m auditchain
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
-- `verify_audit_receipt(receipt)` — 无需持有日志即可验证 `AuditReceipt`：重算每个条目的
-  `entry_digest` 并核验全部包含证明与快照根，空快照只接受规范空树根；结构合法但条目内容、
-  证明或根不符返回 `False`；入参不是 `AuditReceipt` 抛 `TypeError`，字段结构、摘要长度或
-  证明结构非法抛 `ValueError`
+- `verify_audit_receipt(receipt)` — 无需持有日志即可验证 `AuditReceipt`：非空快照
+  必须携带末条（`index == size - 1`）及其包含证明，重算每个条目的
+  `entry_digest` 并核验全部包含证明与快照根，空快照只接受规范空树根且
+  `items == ()`；结构合法但末条缺失（含绕过构造器得到的 `size > 0`、
+  `items == ()` 零证据回执）或条目内容、证明、根不符返回 `False`；
+  入参不是 `AuditReceipt` 抛 `TypeError`，字段结构、摘要长度或证明结构非法抛
+  `ValueError`
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
-  blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；
-  参数类型错误抛 `TypeError`，编码时整数溢出 u64 或解码时魔数、版本、算法、UTF-8、
-  截断、尾随、长度、索引顺序、末条或证明结构非法抛 `ValueError`
+  blob 为 u64 长度前缀加原始字节（零长度 blob 仍以全零 u64 前缀编码）；
+  解码结果字段与原回执相等且重复编码字节相同；参数类型错误抛 `TypeError`，
+  编码时整数溢出 u64 或解码时魔数、版本、算法、UTF-8、截断、尾随、长度、
+  索引顺序、末条缺失（含 `size > 0` 且 items 计数为 0）或证明结构非法抛
+  `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

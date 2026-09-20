@@ -34,11 +34,19 @@ class AuditReceiptIssueTest(unittest.TestCase):
         receipt = self.log.audit_receipt([3, 0, 1])
         self.assertEqual([entry.index for entry, _ in receipt.items], [0, 1, 3, 4])
 
-    def test_empty_indices_give_empty_items(self):
+    def test_empty_selection_still_carries_last_entry(self):
         receipt = self.log.audit_receipt([])
-        self.assertEqual(receipt.items, ())
         self.assertEqual(receipt.size, 5)
+        self.assertEqual([entry.index for entry, _ in receipt.items], [4])
         self.assertEqual(receipt.root, self.log.merkle_root(5))
+        self.assertTrue(verify_audit_receipt(receipt))
+
+    def test_empty_selection_on_explicit_size_carries_that_last_entry(self):
+        receipt = self.log.audit_receipt([], 3)
+        self.assertEqual(receipt.size, 3)
+        self.assertEqual([entry.index for entry, _ in receipt.items], [2])
+        self.assertEqual(receipt.root, self.log.merkle_root(3))
+        self.assertTrue(verify_audit_receipt(receipt))
 
     def test_empty_snapshot(self):
         receipt = self.log.audit_receipt((), 0)
@@ -232,6 +240,12 @@ class AuditReceiptValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make(items=((self.log.entry(0), self.log.inclusion_proof(0)),))
 
+    def test_non_empty_receipt_with_no_items_rejected(self):
+        # size > 0 with items == () is a missing last entry, not a valid
+        # "empty selection": such a receipt would carry zero evidence.
+        with self.assertRaises(ValueError):
+            self.make(items=())
+
     def test_empty_snapshot_requires_empty_items(self):
         empty = self.log.audit_receipt((), 0)
         self.assertEqual(empty.items, ())
@@ -258,6 +272,42 @@ class VerifyAuditReceiptTest(unittest.TestCase):
         forged = AuditReceipt(1, "sha256", 0, b"\x00" * 32, ())
         self.assertFalse(verify_audit_receipt(forged))
         self.assertTrue(verify_audit_receipt(receipt))
+
+    def make_bypassed(self, **overrides):
+        receipt = self.log.audit_receipt([1])
+        fields = {
+            "version": 1,
+            "hash_name": "sha256",
+            "size": receipt.size,
+            "root": receipt.root,
+            "items": receipt.items,
+        }
+        fields.update(overrides)
+        forged = AuditReceipt.__new__(AuditReceipt)
+        for name, value in fields.items():
+            object.__setattr__(forged, name, value)
+        return forged
+
+    def test_zero_evidence_non_empty_receipt_returns_false(self):
+        # The bypass under repair: size > 0, items == () and an arbitrary
+        # root must never be accepted without the last entry and its proof.
+        for root in (b"\x00" * 32, self.log.merkle_root(5), b"\xff" * 32):
+            forged = self.make_bypassed(root=root, items=())
+            self.assertFalse(verify_audit_receipt(forged))
+
+    def test_bypassed_receipt_missing_last_entry_returns_false(self):
+        receipt = self.log.audit_receipt([1])
+        entry, proof = receipt.items[0]
+        forged = self.make_bypassed(items=((entry, proof),))
+        self.assertFalse(verify_audit_receipt(forged))
+
+    def test_bypassed_empty_snapshot_with_items_returns_false(self):
+        forged = self.make_bypassed(
+            size=0,
+            root=b"\x00" * 32,
+            items=((self.log.entry(0), ()),),
+        )
+        self.assertFalse(verify_audit_receipt(forged))
 
     def test_wrong_root_returns_false(self):
         receipt = self.log.audit_receipt([1])

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from . import AuditLog, entry_digest, verify_audit_receipt
+import os
+
+from . import AuditLog, decrypt_entry, entry_digest, verify_audit_receipt
 
 RECORDS = [
     "agent started",
@@ -32,6 +34,14 @@ def main() -> int:
     print(f"  recomputing entry #2 with changed payload gives")
     print(f"    {forged.hex()[:32]}…")
     print(f"  which differs from the recorded hash: {forged != log.entry(2).entry_hash}")
+
+    print()
+    print("encrypted append (AES-256-GCM):")
+    key = os.urandom(32)
+    secret = log.encrypt("classified position claim", key)
+    print(f"  #{secret.index} payload={secret.payload[:31].decode('ascii', 'replace')!r}…")
+    print(f"  decrypts offline to: {decrypt_entry(secret, key).decode('utf-8')!r}")
+    print(f"  find never decrypts: plaintext hits={log.find(b'classified position claim')}")
 
     print()
     print("offline audit receipt:")

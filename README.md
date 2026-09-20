@@ -4,7 +4,8 @@
 
 ## 环境
 
-Python 3.10+，只依赖标准库（`hashlib` / `hmac`）。
+Python 3.10+。只依赖标准库（`hashlib` / `hmac` / `os`）与
+[`cryptography`](https://cryptography.io/)（加密追加使用其中的 `AESGCM`）。
 
 ## 使用
 
@@ -25,6 +26,39 @@ log.append("agent started")
 log.find("agent started")   # (0, 2)：绝对索引升序元组，无匹配为 ()
 log.find(b"agent", 1, 3)    # 半开区间 [1, 3) 内查找 bytes
 ```
+
+### 加密追加（AES-256-GCM）
+
+`encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但
+`Entry.payload` 保存的是自描述密文封装，密钥只按次传入、日志从不保存：
+
+```python
+import os
+from auditchain import decrypt_entry
+
+key = os.urandom(32)                 # 必须是 32 字节 bytes
+entry = log.encrypt("secret event", key)            # nonce=None 时用 os.urandom(12)
+entry.payload                        # b"auditchain/encrypted-entry/v1\0" + 0x01 + nonce + 密文||tag
+decrypt_entry(entry, key)            # b"secret event"：顶层函数，无需持有日志
+log.find(b"secret event")            # ()：find 只匹配封装，不做解密检索
+log.find(entry.payload)              # (index,)：按封装本体可以命中
+```
+
+- 封装依次为 `b"auditchain/encrypted-entry/v1\0"`、算法号 `0x01`（AES-256-GCM）、
+  12 字节 nonce、AESGCM 输出的 `ciphertext || 16 字节 tag`
+- AEAD 的 AAD 依次为 `b"auditchain/aead/v1\0"`、`0x01`、index 的 u64 大端编码、
+  `previous_hash`，把密文绑定到链上位置；封装整体作为 payload 参与 `entry_digest`
+- 解密返回的明文规则与 `append` 一致：传入 `str` 取回其 UTF-8 字节
+- `nonce` 须为 12 字节 `bytes`，且在同一日志内历史不重复——nonce 使用记录在日志
+  整个生命期内保留，**裁剪后也不允许复用**旧 nonce
+- 普通 `append` 行为不变；裁剪与审计回执原样保留密文（回执中的加密条目同样可用
+  `decrypt_entry` 离线解密），不需要密钥即可 `verify()` / 验回执 / 重建 Merkle 根
+- `key` 必须是 32 字节 `bytes`（其他类型抛 `TypeError`，长度不符抛 `ValueError`）；
+  nonce 类型错抛 `TypeError`、长度或重复抛 `ValueError`；`encrypt` 失败不改变任何
+  日志状态（被拒绝的 nonce 不会被记为已使用）
+- `decrypt_entry(entry, key, *, hash_name="sha256")` 依次校验封装、摘要与 AEAD 认证：
+  非 `Entry`、密钥/字段类型错抛 `TypeError`；封装魔数/截断、算法号、摘要长度、
+  `entry_hash` 不符、密钥错误或认证失败抛 `ValueError`；调用为只读
 
 ### 可验证前缀裁剪
 
@@ -144,6 +178,16 @@ python3 -m auditchain
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
   空 `key` 抛 `ValueError`
   - `append(payload)` — 接受 `bytes` 或 `str`（UTF-8 编码），返回新条目
+  - `encrypt(payload, key, nonce=None)` — AES-256-GCM 加密追加：链式规则与
+    `append` 相同，但 `Entry.payload` 保存自描述密文封装
+    （`b"auditchain/encrypted-entry/v1\0" || 0x01 || 12 字节 nonce ||
+    ciphertext || 16 字节 tag`）；AAD 为
+    `b"auditchain/aead/v1\0" || 0x01 || index(u64 大端) || previous_hash`，
+    封装作为 payload 参与 `entry_digest`。`key` 为 32 字节 `bytes`、按次传入不保存；
+    `nonce=None` 时生成 `os.urandom(12)`，显式 nonce 须为 12 字节 `bytes` 且在本日志
+    历史中不重复（裁剪后仍记录）。明文编码规则同 `append`；类型错抛 `TypeError`，
+    密钥/nonce 长度、nonce 重复抛 `ValueError`，失败不改变日志状态。解密用顶层
+    `decrypt_entry`；`find` 只匹配封装本体，不按明文检索
   - `entries()` / `entry(index)` / `__len__()` / `__iter__()` / `head` 属性
   - `find(payload, start=None, stop=None)` — 在保留段内按内容查找，返回匹配条目的绝对索引
     升序元组，无匹配为 `()`；`payload` 只接受 `bytes` 或 `str`（UTF-8 编码），其他类型抛
@@ -178,6 +222,13 @@ python3 -m auditchain
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
     回执不匹配或无有效回执抛 `ValueError`
 - `entry_digest(index, previous_hash, payload, *, hash_name)` — 条目摘要计算
+- `decrypt_entry(entry, key, *, hash_name="sha256")` — 解密 `AuditLog.encrypt` 产生的
+  条目，无需持有日志：先校验封装格式与 `entry_hash == entry_digest(...)`（封装作为
+  payload），再以 `b"auditchain/aead/v1\0" || 0x01 || index(u64 大端) ||
+  previous_hash` 为 AAD 校验 AES-256-GCM 标签，全部通过才返回明文 bytes
+  （规则同 `append`）。入参不是 `Entry` 或 `key`/字段类型非法抛 `TypeError`；
+  `key` 长度非 32、封装魔数不符或截断、算法号未知、摘要长度不符、`entry_hash`
+  不符、密钥错误或 AEAD 认证失败抛 `ValueError`；调用只读，不改变条目或日志
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
@@ -208,9 +259,11 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 ## 限制
 
 线性哈希链加顺序遍历校验，保留段查询是 `O(n)` 的（证明生成随保留长度增长）。
-已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建；条目内容明文存储，
-没有加密。认证标签提供前向安全：stage-0 密钥需在首次演进前通过
-`export_verifier()` 另行交给验证方，日志自身演进后不保留任何旧密钥。
+已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建。普通 `append`
+的条目内容明文存储；需要保密时用 `encrypt` 追加 AES-256-GCM 密文，密钥从不落盘、
+由调用方按次提供，nonce 历史（每条 12 字节）为日志全程保留。认证标签提供前向安全：
+stage-0 密钥需在首次演进前通过 `export_verifier()` 另行交给验证方，日志自身演进后
+不保留任何旧密钥。
 
 ## 测试
 

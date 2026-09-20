@@ -63,6 +63,11 @@ _EMPTY_DOMAIN = b"auditchain/merkle-empty/v1"
 _AUTH_DOMAIN = b"auditchain/auth/v1"
 _EVOLVE_DOMAIN = b"auditchain/key-evolve/v1"
 _LOCATE_DOMAIN = b"auditchain/locate/v1"
+# HMAC keyed by the caller-supplied encryption key, locating encrypted
+# entries by their original plaintext. HMAC (rather than a plain hash) keeps
+# the locator unguessable without the key; the index stores only these
+# digests, never the plaintext or the key.
+_ENC_LOCATE_DOMAIN = b"auditchain/encrypted-locate/v1\0"
 
 # Binary framing of encode_audit_receipt / decode_audit_receipt: a fixed
 # magic, then unsigned 8-byte big-endian integers and length-prefixed blobs.
@@ -243,6 +248,16 @@ def _evolve_key(key: bytes, hash_name: str) -> bytes:
 def _locator_digest(payload: bytes, hash_name: str) -> bytes:
     """Content digest used only to locate candidate entries in the index."""
     return _hash_parts(hash_name, _LOCATE_DOMAIN, payload)
+
+
+def _encrypted_locator_digest(key: bytes, payload: bytes, hash_name: str) -> bytes:
+    """Keyed locator digest of an encrypted entry's original plaintext.
+
+    ``HMAC(key, b"auditchain/encrypted-locate/v1\\0" || payload)``: only a
+    holder of the append-time key can compute a candidate, and neither the
+    plaintext nor the key is stored in the index.
+    """
+    return hmac.new(key, _ENC_LOCATE_DOMAIN + payload, hash_name).digest()
 
 
 def _auth_tag(stage: int, entry_hash: bytes, key: bytes, hash_name: str) -> bytes:
@@ -624,6 +639,15 @@ class AuditLog:
         # indices of the retained entries carrying that digest. Digests only
         # narrow the candidates; find() always re-compares the stored payload.
         self._index: dict[bytes, list[int]] = {}
+        # Keyed locator index for find_encrypted(): HMAC over the original
+        # plaintext -> ascending absolute indices of retained encrypted
+        # entries. Holds neither plaintext nor keys; a hit is always confirmed
+        # by decrypting with the query key and byte-comparing the plaintext.
+        self._encrypted_index: dict[bytes, list[int]] = {}
+        # Reverse map (absolute index -> its locator digest) so a prune can
+        # drop released encrypted entries from _encrypted_index without the
+        # append-time key; only retained entries are present.
+        self._encrypted_locators: dict[int, bytes] = {}
         # Chain hash of the last pruned entry (the digest_size-byte zero
         # predecessor before any prune).
         self._checkpoint_head: bytes = genesis
@@ -716,7 +740,15 @@ class AuditLog:
         aad = _seal_aad(index, previous_hash)
         sealed = AESGCM(key).encrypt(nonce, material, aad)
         envelope = _seal_envelope(nonce, sealed)
-        # Encryption succeeded; commit exactly as append() does.
+        # The plaintext locator is keyed with this append's key. Compute it
+        # before committing while the plaintext is at hand; the digest leaks
+        # neither the plaintext nor the key.
+        encrypted_locator = _encrypted_locator_digest(
+            key, material, self._hash_name
+        )
+        # Encryption succeeded; commit exactly as append() does, plus the
+        # plaintext locator entry. Nothing before this point mutates the log,
+        # so a failed encrypt leaves both indexes untouched.
         entry = Entry(
             index=index,
             payload=envelope,
@@ -725,6 +757,8 @@ class AuditLog:
         )
         self._entries.append(entry)
         self._index.setdefault(_locator_digest(envelope, self._hash_name), []).append(index)
+        self._encrypted_index.setdefault(encrypted_locator, []).append(index)
+        self._encrypted_locators[index] = encrypted_locator
         self._used_nonces.add(nonce)
         self._head = entry.entry_hash
         return entry
@@ -821,6 +855,26 @@ class AuditLog:
             material = payload
         else:
             raise TypeError("payload must be bytes or str")
+        start, stop = self._resolve_find_range(start, stop)
+        candidates = self._index.get(_locator_digest(material, self._hash_name), ())
+        return tuple(
+            index
+            for index in candidates
+            if start <= index < stop
+            and self._entries[index - self._retain_from].payload == material
+        )
+
+    def _resolve_find_range(
+        self, start: int | None, stop: int | None
+    ) -> tuple[int, int]:
+        """Validate the half-open ``[start, stop)`` range shared by find and
+        find_encrypted, applying the same defaults and bounds as ``find``.
+
+        Defaults are ``[retain_from, len(log))``; explicit bounds must be
+        non-bool integers satisfying
+        ``retain_from <= start <= stop <= len(log)``. Wrong types raise
+        TypeError and out-of-range values ValueError.
+        """
         first = self._retain_from
         last = len(self)
         if start is None:
@@ -835,13 +889,57 @@ class AuditLog:
             raise ValueError(
                 f"range must satisfy retain_from ({first}) <= start <= stop <= len ({last})"
             )
-        candidates = self._index.get(_locator_digest(material, self._hash_name), ())
-        return tuple(
-            index
-            for index in candidates
-            if start <= index < stop
-            and self._entries[index - self._retain_from].payload == material
-        )
+        return start, stop
+
+    def find_encrypted(
+        self, payload: Any, key: Any, start: int | None = None, stop: int | None = None
+    ) -> tuple[int, ...]:
+        """Locate retained encrypted entries whose original plaintext equals
+        ``payload``, using the key supplied when they were appended.
+
+        ``payload`` accepts ``bytes`` or ``str`` (normalized to ``P``; a
+        ``str`` is UTF-8 encoded); anything else raises TypeError. ``key``
+        must be exactly 32 ``bytes`` — a non-bytes value raises TypeError and
+        a wrong length raises ValueError. The range defaults and half-open
+        ``[start, stop)`` bounds are exactly those of :meth:`find`. Candidates
+        come from a keyed locator index storing only
+        ``HMAC(key, b"auditchain/encrypted-locate/v1\\0" || P, hash_name)``
+        against absolute indices; the index holds neither plaintext nor keys
+        and never changes the ciphertext envelope, entry digests, the chain
+        or Merkle results.
+
+        Every candidate is confirmed by decrypting the stored envelope with
+        the query key and comparing the recovered plaintext byte-for-byte
+        against ``P``, so an authentication failure or a digest collision can
+        never produce a false hit. A valid 32-byte key that simply was not the
+        append key yields ``()`` rather than raising. Plain entries and
+        entries sealed under other keys never match. The query is read-only
+        and never stores the plaintext, the key or the locator digest.
+        """
+        if isinstance(payload, str):
+            material = payload.encode("utf-8")
+        elif isinstance(payload, bytes):
+            material = payload
+        else:
+            raise TypeError("payload must be bytes or str")
+        _check_key(key)
+        start, stop = self._resolve_find_range(start, stop)
+        locator = _encrypted_locator_digest(key, material, self._hash_name)
+        matches: list[int] = []
+        for index in self._encrypted_index.get(locator, ()):
+            if not start <= index < stop:
+                continue
+            entry = self._entries[index - self._retain_from]
+            try:
+                plaintext = decrypt_entry(entry, key, hash_name=self._hash_name)
+            except ValueError:
+                # A candidate under the locator digest that does not
+                # authenticate with this key (a collision or a foreign key)
+                # is simply not a hit.
+                continue
+            if plaintext == material:
+                matches.append(index)
+        return tuple(matches)
 
     def verify_entry(self, index: int) -> bool:
         """Check that one retained entry links correctly to its predecessor."""
@@ -1364,10 +1462,19 @@ class AuditLog:
         del self._entries[: retain_from - self._retain_from]
         for entry in released:
             # Released indices are the ascending prefix of each digest list.
-            hits = self._index[_locator_digest(entry.payload, self._hash_name)]
+            digest = _locator_digest(entry.payload, self._hash_name)
+            hits = self._index[digest]
             del hits[0]
             if not hits:
-                del self._index[_locator_digest(entry.payload, self._hash_name)]
+                del self._index[digest]
+            # Drop the keyed plaintext locator of a released encrypted entry;
+            # the reverse map supplies its locator without the append key.
+            encrypted_locator = self._encrypted_locators.pop(entry.index, None)
+            if encrypted_locator is not None:
+                encrypted_hits = self._encrypted_index[encrypted_locator]
+                del encrypted_hits[0]
+                if not encrypted_hits:
+                    del self._encrypted_index[encrypted_locator]
         for released_index in range(self._retain_from, retain_from):
             self._tags.pop(released_index, None)
         self._retain_from = retain_from

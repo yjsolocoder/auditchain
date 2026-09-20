@@ -55,6 +55,7 @@ entry.payload                        # b"auditchain/encrypted-entry/v1\0" + 0x01
 decrypt_entry(entry, key)            # b"secret event"：顶层函数，无需持有日志
 log.find(b"secret event")            # ()：find 只匹配封装，不做解密检索
 log.find(entry.payload)              # (index,)：按封装本体可以命中
+log.find_encrypted("secret event", key)  # (index,)：持密钥按原明文定位，见下节
 ```
 
 - 封装依次为 `b"auditchain/encrypted-entry/v1\0"`、算法号 `0x01`（AES-256-GCM）、
@@ -72,6 +73,35 @@ log.find(entry.payload)              # (index,)：按封装本体可以命中
 - `decrypt_entry(entry, key, *, hash_name="sha256")` 依次校验封装、摘要与 AEAD 认证：
   非 `Entry`、密钥/字段类型错抛 `TypeError`；封装魔数/截断、算法号、摘要长度、
   `entry_hash` 不符、密钥错误或认证失败抛 `ValueError`；调用为只读
+
+#### 按原明文定位加密条目
+
+持有追加时 AES 密钥的调用方可按原明文精确定位加密条目，日志既不保存明文也不
+保存密钥，且不改变现有密文封装、`Entry` 摘要、链与 Merkle 结果：
+
+```python
+log.encrypt("secret event", key)
+log.find_encrypted("secret event", key)   # (0,)：升序绝对索引 tuple
+log.find(b"secret event")                 # ()：find 仍只匹配封装本体
+log.find_encrypted("secret event", wrong_key)  # ()：合法但错误的密钥不命中、不抛错
+```
+
+- 签名为 `find_encrypted(payload, key, start=None, stop=None) -> tuple[int, ...]`，
+  返回半开区间 `[start, stop)` 内的升序绝对索引 tuple，无命中为 `()`；范围参数的
+  默认值、半开边界与越界规则与 `find` 完全相同（默认
+  `[retain_from, len(log))`，显式边界须满足
+  `retain_from <= start <= stop <= len(log)`）
+- `payload` 仅为 `bytes` 或 `str`（`str` 按 UTF-8 规范化为 `P`），其他类型抛
+  `TypeError`；`key` 仅为 32 字节 `bytes`（其他类型抛 `TypeError`，长度不符抛
+  `ValueError`）；范围类型非法抛 `TypeError`、越界抛 `ValueError`；合法但错误的
+  密钥返回 `()`，查询只读
+- 定位摘要为
+  `HMAC(key, b"auditchain/encrypted-locate/v1\0" || P, hash_name)`，只把该摘要
+  映射到绝对索引；摘要不含明文、也无法在无密钥时伪造或猜测
+- 定位项仅在 `encrypt` **追加成功后**才提交，任何 `encrypt` 失败都不改变索引；
+  `prune` 成功时同步删除已释放前缀的定位项（无需追加时的密钥），裁剪失败索引不变
+- 候选命中后必须用查询密钥解密对应封装并把明文与 `P` **逐字节比较**：AEAD
+  认证失败或定位摘要碰撞都不会误命中。普通条目、不同密钥追加的条目均不命中
 
 ### 可验证前缀裁剪
 
@@ -301,6 +331,18 @@ python3 -m auditchain
     类型非法抛 `TypeError`、越界抛 `ValueError`。索引由 `append` 增量维护、`prune`
     成功时同步删除已释放前缀（失败不变）；定位摘要命中后仍逐条比较原 payload，
     哈希碰撞不会产生误命中；查询为只读，不改变条目、`head`、认证状态、Merkle 根或证明
+  - `find_encrypted(payload, key, start=None, stop=None)` — 供持有追加时 AES
+    密钥的调用方按原明文定位保留段内的加密条目，返回匹配条目的绝对索引升序元组，
+    无命中为 `()`；范围参数的默认值、半开 `[start, stop)` 边界与越界规则与
+    `find` 完全相同。`payload` 仅接受 `bytes` 或 `str`（规范化为 `P`，`str`
+    按 UTF-8 编码），其他类型抛 `TypeError`；`key` 仅接受 32 字节 `bytes`，
+    类型错抛 `TypeError`、长度不符抛 `ValueError`。索引只保存
+    `HMAC(key, b"auditchain/encrypted-locate/v1\0" || P, hash_name)` 到绝对索引
+    的映射，既不保存明文也不保存密钥，且不改变密文封装、`Entry` 摘要、链与
+    Merkle 结果；定位项仅在 `encrypt` 追加成功后提交，`prune` 成功时删除已释放
+    前缀的项（失败均不改索引）。候选命中后仍以查询密钥解密并逐字节比较 `P`，
+    认证失败或摘要碰撞均不误命中；普通条目或不同密钥的条目不命中，合法但错误的
+    密钥返回 `()`，查询为只读
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
   - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于

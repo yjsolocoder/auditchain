@@ -48,6 +48,10 @@ def main() -> int:
     print(f"  #{secret.index} payload={secret.payload[:31].decode('ascii', 'replace')!r}…")
     print(f"  decrypts offline to: {decrypt_entry(secret, key).decode('utf-8')!r}")
     print(f"  find never decrypts: plaintext hits={log.find(b'classified position claim')}")
+    print(
+        "  find_encrypted locates by plaintext with the key: "
+        f"hits={log.find_encrypted('classified position claim', key)}"
+    )
 
     print()
     print("offline audit receipt:")

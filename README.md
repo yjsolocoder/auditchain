@@ -72,6 +72,12 @@ log.find(entry.payload)              # (index,)：按封装本体可以命中
 - `decrypt_entry(entry, key, *, hash_name="sha256")` 依次校验封装、摘要与 AEAD 认证：
   非 `Entry`、密钥/字段类型错抛 `TypeError`；封装魔数/截断、算法号、摘要长度、
   `entry_hash` 不符、密钥错误或认证失败抛 `ValueError`；调用为只读
+- `find_encrypted(payload, key, start=None, stop=None)` 授权精确检索：持有追加时
+  AES 密钥的调用方可按原明文定位保留的加密条目，返回绝对索引升序元组（无匹配为
+  `()`）。定位摘要为 `HMAC(key, b"auditchain/encrypted-locate/v1\0" || P)`（`P` 为
+  规范化明文，`str` 按 UTF-8），日志只保存该单向摘要，从不保存明文或密钥；候选命中后
+  仍用查询密钥解密并逐字节比较，密钥错误或摘要碰撞不会误命中（合法错误密钥返回 `()`）。
+  范围参数与 `find` 相同；普通条目、其他密钥加密的条目均不命中，`find` 行为不变
 
 ### 可验证前缀裁剪
 
@@ -301,6 +307,15 @@ python3 -m auditchain
     类型非法抛 `TypeError`、越界抛 `ValueError`。索引由 `append` 增量维护、`prune`
     成功时同步删除已释放前缀（失败不变）；定位摘要命中后仍逐条比较原 payload，
     哈希碰撞不会产生误命中；查询为只读，不改变条目、`head`、认证状态、Merkle 根或证明
+  - `find_encrypted(payload, key, start=None, stop=None)` — 加密条目的授权精确检索：
+    按追加时的原明文定位保留的加密条目，返回绝对索引升序元组，无匹配为 `()`；
+    `payload` 只接受 `bytes` 或 `str`（UTF-8 编码），`key` 必须为 32 字节 `bytes`；
+    范围参数默认值、半开边界与校验规则和 `find` 相同。定位摘要为
+    `HMAC(key, b"auditchain/encrypted-locate/v1\0" || P)`，由 `encrypt` 在追加成功后
+    提交、`prune` 成功时同步删除已释放前缀（失败均不变）；日志只保存该单向摘要，
+    不保存明文或密钥。候选命中后用查询密钥解密并逐字节比较 `P`，认证失败或摘要碰撞
+    不产生误命中，合法错误密钥返回 `()`；普通条目或不同密钥的条目不命中，`find`
+    仍只匹配封装。类型错抛 `TypeError`，密钥长度或范围非法抛 `ValueError`；查询只读
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
   - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于

@@ -5,7 +5,8 @@ Verifier / SignedRoot / IntegrityIssue / IntegrityReport / entry_digest /
 decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_audit_receipt / verify_audit_batch /
 verify_signed_root / encode_audit_receipt / decode_audit_receipt /
-encode_audit_batch / decode_audit_batch.
+encode_audit_batch / decode_audit_batch /
+encode_signed_root / decode_signed_root.
 """
 
 from __future__ import annotations
@@ -40,9 +41,11 @@ __all__ = [
     "GENESIS_HASH",
     "decode_audit_batch",
     "decode_audit_receipt",
+    "decode_signed_root",
     "decrypt_entry",
     "encode_audit_batch",
     "encode_audit_receipt",
+    "encode_signed_root",
     "entry_digest",
     "verify_audit_receipt",
     "verify_audit_batch",
@@ -571,22 +574,21 @@ class SignedRoot:
             raise TypeError("size must be an integer")
         if not 0 <= self.size < _U64_LIMIT:
             raise ValueError("size must satisfy 0 <= size < 2**64")
-        for name in ("root", "head"):
+        # root, head and signature must be exact bytes: bytearray and
+        # memoryview are rejected rather than copied, so a received receipt
+        # never silently aliases a mutable caller buffer.
+        for name in ("root", "head", "signature"):
             value = getattr(self, name)
-            if not isinstance(value, (bytes, bytearray)):
-                raise TypeError(f"{name} must be bytes")
-            if len(value) != digest_size:
-                raise ValueError(f"{name} must be {digest_size} bytes")
             if not isinstance(value, bytes):
-                object.__setattr__(self, name, bytes(value))
-        if not isinstance(self.signature, (bytes, bytearray)):
-            raise TypeError("signature must be bytes")
+                raise TypeError(f"{name} must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        if len(self.head) != digest_size:
+            raise ValueError(f"head must be {digest_size} bytes")
         if len(self.signature) != _ED25519_SIGNATURE_BYTES:
             raise ValueError(
                 f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
             )
-        if not isinstance(self.signature, bytes):
-            object.__setattr__(self, "signature", bytes(self.signature))
 
 
 @dataclass(frozen=True)
@@ -2531,3 +2533,104 @@ def verify_signed_root(receipt: Any, public_key: Any) -> bool:
     except InvalidSignature:
         return False
     return True
+
+
+def encode_signed_root(receipt: Any) -> bytes:
+    """Encode a :class:`SignedRoot` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/signed-root/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear in the order ``version`` (always 1), ``hash_name``
+    (UTF-8 blob), ``size``, ``root`` blob, ``head`` blob and ``signature``
+    blob. ``receipt`` must be a :class:`SignedRoot` — anything else, or a
+    receipt whose fields have been bypassed to wrong types, raises TypeError;
+    a version other than 1, a size outside the u64 range, an unknown hash
+    algorithm, a root/head of the wrong digest width or a signature that is
+    not 64 bytes raises ValueError. The call is read-only and deterministic:
+    it never mutates the receipt, and re-encoding a decoded one reproduces the
+    original bytes exactly.
+    """
+    if not isinstance(receipt, SignedRoot):
+        raise TypeError("receipt must be a SignedRoot")
+    # Re-validate every field even for a receipt built with object.__setattr__
+    # bypassing the frozen constructor, so structural corruption raises
+    # exactly as the constructor would.
+    checked = SignedRoot(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.head,
+        receipt.signature,
+    )
+    return b"".join((
+        _SIGNED_ROOT_DOMAIN,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(checked.root),
+        _encode_blob(checked.head),
+        _encode_blob(checked.signature),
+    ))
+
+
+def decode_signed_root(data: Any) -> SignedRoot:
+    """Decode bytes produced by :func:`encode_signed_root`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown hash algorithm, truncation,
+    trailing bytes, an oversized blob length, a size outside the u64 range, a
+    root/head whose width does not match the named digest, or a signature
+    that is not 64 bytes raises ValueError. The decoded receipt's fields
+    equal the originally encoded ones, re-encoding reproduces the original
+    bytes exactly, and it verifies under :func:`verify_signed_root` whenever
+    the original did; a structurally sound encoding whose signature does not
+    match the claimed fields still decodes, and verification returns False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_ROOT_DOMAIN):
+        raise ValueError("not an auditchain signed-root encoding")
+    offset = len(_SIGNED_ROOT_DOMAIN)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    head = read_blob("head")
+    signature = read_blob("signature")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed root")
+    return SignedRoot(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        head=head,
+        signature=signature,
+    )

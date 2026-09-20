@@ -276,10 +276,35 @@ log.sign_root(seed, 0)                   # 空前缀：规范空树根 + 同宽�
   重建同一签名原文并用公钥校验 64 字节签名。公钥不是对应签发方，或结构合法但
   `root` / `head` / `signature` / `size` / `hash_name` 任一字段被改，均返回
   `False`（绝不抛异常）
-- 类型边界只接受 `bytes`：私钥种子、公钥传入 `str` / `bytearray` /
-  `memoryview` 等抛 `TypeError`；私钥种子或公钥不是 32 字节、`version` 非
-  `1`、未知摘要算法、`size` 超出 `0 <= size < 2**64`、`root` / `head` 宽度
-  与算法不符、`signature` 不是 64 字节抛 `ValueError`；两个入口均为只读
+- 类型边界只接受 `bytes`：私钥种子、公钥以及回执的 `root` / `head` /
+  `signature` 传入 `str` / `bytearray` / `memoryview` 等抛 `TypeError`
+  （二进制字段不做静默拷贝，回执绝不别名调用方的可变缓冲区）；私钥种子或公钥
+  不是 32 字节、`version` 非 `1`、未知摘要算法、`size` 超出
+  `0 <= size < 2**64`、`root` / `head` 宽度与算法不符、`signature` 不是
+  64 字节抛 `ValueError`；各入口均为只读
+- `encode_signed_root(receipt)` / `decode_signed_root(data)` 把检查点序列化为
+  规范二进制并原样还原，使其可落盘、跨进程传输后继续由 `verify_signed_root`
+  验真：
+
+```python
+from auditchain import encode_signed_root, decode_signed_root
+
+data = encode_signed_root(receipt)         # bytes，可写文件/发网络
+restored = decode_signed_root(data)        # SignedRoot，字段与原回执相等
+restored == receipt                        # True
+encode_signed_root(restored) == data       # True：重编码逐字节相同
+verify_signed_root(restored, public_key)   # True：无需持有日志
+```
+
+  编码以魔数 `b"auditchain/signed-root/v1\0"` 开头，依次写 `version`（恒为
+  `1`）、`hash_name` 的 UTF-8 blob、`size`、`root` blob、`head` blob、
+  `signature` blob；所有整数为 8 字节无符号大端，每个 blob 为 u64 字节长度
+  前缀加原始字节（零长度也是全零 u64）。`encode_signed_root` 只接受
+  `SignedRoot`、`decode_signed_root` 只接受 `bytes`（含拒绝 `bytearray` /
+  `memoryview`），非对应类型或绕过构造器写入的字段类型错抛 `TypeError`；魔数、
+  版本、UTF-8、未知算法、截断、尾随、blob 长度、`size` 范围、摘要宽度或签名
+  宽度非法抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，
+  `verify_signed_root` 返回 `False`。两个入口均为只读
 
 ### 前向安全认证
 
@@ -355,8 +380,10 @@ python3 -m auditchain
   可信签名快照检查点，按全部字段相等、支持位置构造；`version` 恒为 `1`，`root`
   为前 `size` 条的 Merkle 根，`head` 为该前缀末条摘要（空前缀为该摘要宽度的零
   链头，sha256 下即 `GENESIS_HASH`），`signature` 为 64 字节 Ed25519 签名；
-  `size` 须满足 `0 <= size < 2**64`。类型非法抛 `TypeError`，版本非 1、未知算法、
-  `size` 越界、`root`/`head` 摘要宽度不符或 `signature` 不是 64 字节抛 `ValueError`
+  `root`、`head`、`signature` 只接受精确的 `bytes`（拒绝 `bytearray` 与
+  `memoryview`，不做拷贝归一化）；`size` 须满足 `0 <= size < 2**64`。类型非法
+  抛 `TypeError`，版本非 1、未知算法、`size` 越界、`root`/`head` 摘要宽度不符
+  或 `signature` 不是 64 字节抛 `ValueError`
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -509,6 +536,16 @@ python3 -m auditchain
   返回 `True`。入参不是 `SignedRoot` 或公钥不是 `bytes` 抛 `TypeError`；版本、
   未知算法、`size` 范围、摘要宽度、签名长度或公钥长度（非 32 字节）非法抛
   `ValueError`；调用只读
+- `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
+  规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
+  version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head
+  blob、signature blob；整数为 8 字节无符号大端，blob 为 u64 长度前缀加原始字节
+  （零长度也写全零 u64）。解码结果字段与原回执相等、类型为 `bytes`，重编码逐字节
+  相同，并可继续由 `verify_signed_root` 离线验真。前者只接受 `SignedRoot`，后者只
+  接受 `bytes`（拒绝 `bytearray` / `memoryview`）；非对应类型或字段类型错（含绕过
+  冻结构造器的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、blob
+  长度、`size` 范围、摘要宽度或签名宽度非法抛 `ValueError`；结构合法但签名不匹配
+  仍可解码，验签返回 `False`；两个入口均为只读
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；

@@ -237,16 +237,12 @@ class SignedRootValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make(signature=b"\x00" * 65)
 
-    def test_bytearray_fields_normalized(self):
-        receipt = self.make(
-            root=bytearray(self.receipt.root),
-            head=bytearray(self.receipt.head),
-            signature=bytearray(self.receipt.signature),
-        )
-        self.assertIsInstance(receipt.root, bytes)
-        self.assertIsInstance(receipt.head, bytes)
-        self.assertIsInstance(receipt.signature, bytes)
-        self.assertEqual(receipt, self.receipt)
+    def test_binary_fields_accept_only_bytes(self):
+        for name in ("root", "head", "signature"):
+            value = getattr(self.receipt, name)
+            for bad in (bytearray(value), memoryview(value)):
+                with self.assertRaises(TypeError):
+                    self.make(**{name: bad})
 
 
 class VerifySignedRootTest(unittest.TestCase):

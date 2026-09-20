@@ -1050,6 +1050,47 @@ class AuditLog:
         self._retain_from = retain_from
         self._checkpoint_head = expected_chain
 
+    def apply_retention(self, value: int, *, mode: str = "retain_from") -> PruneReceipt:
+        """Seal and prune atomically at a retention point derived from ``value``.
+
+        With ``mode="retain_from"`` the target retain point is exactly
+        ``value``; with ``mode="keep_last"`` it is
+        ``max(retain_from, len(log) - value)``, so at most the newest
+        ``value`` entries are kept without ever moving the retain point
+        backwards.
+
+        ``value`` must be a non-bool integer. In ``retain_from`` mode it must
+        satisfy ``retain_from <= value <= len(log)``; in ``keep_last`` mode it
+        must be non-negative. ``mode`` must be one of the two known strings.
+        On success the call is exactly ``receipt = seal(target);
+        prune(target, receipt)`` and the receipt is returned. A type error in
+        ``value`` or ``mode`` raises TypeError; an unknown mode or an
+        out-of-range value raises ValueError before anything is touched, so on
+        failure every entry, authentication tag/stage/key, locator index,
+        frontier checkpoint and nonce history stays exactly as it was.
+        """
+        if not isinstance(mode, str):
+            raise TypeError("mode must be a string")
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("value must be an integer")
+        length = len(self)
+        if mode == "retain_from":
+            target = value
+            if not self._retain_from <= target <= length:
+                raise ValueError(
+                    f"value must satisfy retain_from ({self._retain_from}) "
+                    f"<= value <= len ({length})"
+                )
+        elif mode == "keep_last":
+            if value < 0:
+                raise ValueError("value must be non-negative")
+            target = max(self._retain_from, length - value)
+        else:
+            raise ValueError(f"unknown mode {mode!r}; expected 'retain_from' or 'keep_last'")
+        receipt = self.seal(target)
+        self.prune(target, receipt)
+        return receipt
+
 
 def _check_digest(value: Any, name: str, digest_size: int) -> bytes:
     if not isinstance(value, (bytes, bytearray)):

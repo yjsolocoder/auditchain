@@ -146,6 +146,35 @@ Entry.index、payload blob、previous_hash blob、entry_hash blob、proof 计数
 版本、算法、非法 UTF-8、截断、尾随字节、长度溢出、摘要长度、索引顺序/重复、
 末条缺失或证明结构非法均抛 `ValueError`。
 
+#### 紧凑离线批量审计回执
+
+`audit_batch` 与 `audit_receipt` 同样可离线核验所选条目、快照根与末条，但多条
+所选记录共享一份 `batch_inclusion_proof` 紧凑 Merkle 批量包含证明，而非各自
+携带独立包含证明，共同子树摘要只出现一次。回执就是一个普通五元组：
+
+```python
+hash_name, size, root, entries, proof = log.audit_batch([1, 3])  # 非空快照自动并入末条
+entries                        # (Entry, ...) 按绝对索引严格升序
+verify_audit_batch(...)        # True：无需持有日志即可离线核验
+# proof 与 batch_inclusion_proof 对同一索引集、size 的结果逐字节相同：
+assert proof == log.batch_inclusion_proof([e.index for e in entries], size)[1]
+```
+
+- 返回 `(hash_name: str, size: int, root: bytes, entries, proof)`；`entries` 为
+  严格升序的 `Entry` 元组，索引均满足 `retain_from <= i < size`；**非空快照自动
+  并入末条 `size-1`**（即使 `indices` 为空选择），空快照（`size=0`）只接受空选择，
+  返回规范空树根、空 `entries` 与空 `proof`
+- `indices` 须为互异非 `bool` 整数的可迭代对象，`size` 默认当前长度；类型错抛
+  `TypeError`，重复、越界、空快照携带选择或快照不可重建抛 `ValueError`；签发为
+  只读，任何失败均不改状态
+- `proof` 为 `bytes` 元组，须逐字节等于 `batch_inclusion_proof` 对该索引集与
+  `size` 的结果；叶摘要由验证方用 `entry_digest` 重算，其余 Merkle 规则沿用文末
+  的批量包含证明章节
+- `verify_audit_batch(receipt)` 为顶层导出函数：入参非五元组或元素类型错抛
+  `TypeError`；算法未知、`size` 非法、摘要宽度不符、索引越界/非严格升序/重复、
+  非空回执缺末条、空回执携带条目或证明节点数与 `(indices, size)` 不符抛
+  `ValueError`；结构合法但条目内容、证明或根不匹配返回 `False`，匹配返回 `True`
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -285,6 +314,16 @@ python3 -m auditchain
     （`index == size - 1`）及其包含证明，即使 `indices` 为空也不例外**，只有
     `size=0` 的空快照得到 `items == ()`；条目按绝对索引升序携带各自包含证明；
     调用只读，类型非法抛 `TypeError`，越界或重复抛 `ValueError`
+  - `audit_batch(indices, size=None)` — 为快照中选定条目生成紧凑离线批量审计回执，
+    返回普通五元组 `(hash_name, size, root, entries, proof)`：`entries` 为严格升序的
+    `Entry` 元组（`retain_from <= i < size`），`proof` 是全部所选条目共享的一份
+    `batch_inclusion_proof` 紧凑证明，逐字节等于对同一索引集（含自动并入的末条）与
+    `size` 调用 `batch_inclusion_proof` 的结果；非空快照自动并入末条 `size-1`
+    （即使 `indices` 为空），空快照只接受空选择并返回规范空树根、空 `entries` 与空
+    `proof`；`size` 默认当前长度，`indices` 为互异非 `bool` 整数的可迭代对象；
+    类型非法抛 `TypeError`，重复、越界、空快照携带选择或快照不可重建抛
+    `ValueError`；签发只读，任何失败均不改状态；离线核验用顶层
+    `verify_audit_batch`
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -320,6 +359,15 @@ python3 -m auditchain
   结构合法但条目内容、证明或根不符，或非空回执缺失末条（含绕过构造器的
   `size>0 且 items==()` 零证据回执）返回 `False`；入参不是 `AuditReceipt` 抛
   `TypeError`，字段结构、摘要长度或证明结构非法抛 `ValueError`
+- `verify_audit_batch(receipt)` — 无需持有日志即可验证 `AuditLog.audit_batch` 的紧凑
+  批量回执五元组 `(hash_name, size, root, entries, proof)`：非空快照必携末条
+  （`entries` 末项 `index == size-1`），重算每个 `Entry` 的 `entry_digest`，再以
+  共享的批量包含证明与快照根核验（等价于 `verify_batch_inclusion`）；空快照
+  （`size=0`、`entries==()`、`proof==()`）只接受规范空树根。入参非五元组或元素
+  类型非法抛 `TypeError`；未知算法、负或非整数 `size`、摘要宽度不符、条目索引
+  越界/非严格升序/重复、非空回执缺末条、空回执携带条目或证明节点数与
+  `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容、证明或根不匹配返回
+  `False`，否则 `True`
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；
@@ -346,6 +394,8 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 因此多个所选叶共享的子树摘要只出现一次，比各自独立的包含证明更紧凑；哈希与奇数层末节点
 原样提升沿用上面的 Merkle 规则。所选叶的摘要由验证方按升序在 `entry_hashes` 中提供，
 空快照（`size=0`）不存在非空选择，故无对应的批量证明。
+`AuditLog.audit_batch` 签发的紧凑批量审计回执即以此证明作为全部所选条目（含自动并入的
+末条）共享的 `proof`，由 `verify_audit_batch` 用同一递归规则离线核验。
 
 ## 限制
 

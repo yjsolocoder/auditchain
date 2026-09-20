@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from . import AuditLog, decrypt_entry, entry_digest, verify_audit_receipt
+from . import AuditLog, decrypt_entry, entry_digest, verify_audit_batch, verify_audit_receipt
 
 RECORDS = [
     "agent started",
@@ -48,6 +48,12 @@ def main() -> int:
     audit = log.audit_receipt([1, 3])
     print(f"  size={audit.size} items={[entry.index for entry, _ in audit.items]}")
     print(f"  verifies without the log: {verify_audit_receipt(audit)}")
+
+    print()
+    print("compact offline batch audit receipt:")
+    hash_name, size, root, entries, proof = log.audit_batch([1, 3])
+    print(f"  hash={hash_name} size={size} items={[entry.index for entry in entries]} proof nodes={len(proof)}")
+    print(f"  verifies without the log: {verify_audit_batch((hash_name, size, root, entries, proof))}")
 
     print()
     print("verifiable prefix pruning:")

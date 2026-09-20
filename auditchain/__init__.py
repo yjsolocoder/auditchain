@@ -3,7 +3,8 @@
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
 verify_inclusion / verify_batch_inclusion / verify_consistency / verify_auth /
-verify_audit_receipt / encode_audit_receipt / decode_audit_receipt.
+verify_audit_receipt / verify_audit_batch / encode_audit_receipt /
+decode_audit_receipt.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ __all__ = [
     "decrypt_entry",
     "encode_audit_receipt",
     "entry_digest",
+    "verify_audit_batch",
     "verify_audit_receipt",
     "verify_auth",
     "verify_batch_inclusion",
@@ -1246,6 +1248,75 @@ class AuditLog:
             items=items,
         )
 
+    def audit_batch(
+        self, indices: Iterable[int], size: int | None = None
+    ) -> tuple[str, int, bytes, tuple[Entry, ...], tuple[bytes, ...]]:
+        """Issue a compact offline batch-audit receipt as a plain five-tuple.
+
+        Unlike :meth:`audit_receipt`, which bundles a separate inclusion proof
+        per entry, all selected entries share one compact
+        :meth:`batch_inclusion_proof` covering the whole ``[0, size)``
+        snapshot; shared subtree digests appear only once. The returned
+        receipt is ``(hash_name, size, root, entries, proof)``:
+
+        - ``hash_name``: hash algorithm of the issuing log,
+        - ``size``: number of entries in the snapshot,
+        - ``root``: Merkle root of that snapshot,
+        - ``entries``: strictly ascending tuple of :class:`Entry` records,
+          all within ``[retain_from, size)``; for a non-empty snapshot the
+          last snapshot entry (index ``size - 1``) is automatically merged
+          in even when ``indices`` is empty,
+        - ``proof``: the compact batch inclusion proof tuple, byte-identical
+          to ``batch_inclusion_proof(selected_indices_with_last, size)[1]``.
+
+        An empty snapshot (``size == 0``) accepts only an empty selection and
+        returns the canonical empty-tree root, an empty ``entries`` tuple and
+        an empty ``proof``. Issuance is read-only: it never changes entries,
+        head, authentication state, Merkle roots or proofs, and any failure
+        leaves all log state unchanged.
+
+        ``indices`` must be an iterable of distinct non-bool integers
+        satisfying ``retain_from <= index < size``; wrong index types raise
+        TypeError; duplicate or out-of-range indices, a non-empty selection
+        for an empty snapshot or an unrebuildable snapshot raise ValueError.
+        """
+        size = self._resolve_size(size)
+        if isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < size:
+                raise ValueError(
+                    f"index {index} must satisfy retain_from ({self._retain_from}) "
+                    f"<= index < size ({size})"
+                )
+            selected.add(index)
+        if size == 0:
+            if selected:
+                raise ValueError("an empty snapshot accepts only an empty selection")
+            return (
+                self._hash_name,
+                0,
+                _hash_parts(self._hash_name, _EMPTY_DOMAIN),
+                (),
+                (),
+            )
+        # A non-empty snapshot batch always carries the last entry (like
+        # audit_receipt), so an empty selection cannot attest to a root
+        # without evidence.
+        selected.add(size - 1)
+        ordered, proof = self.batch_inclusion_proof(selected, size)
+        entries = tuple(self.entry(index) for index in ordered)
+        return (self._hash_name, size, self.merkle_root(size), entries, proof)
+
     def prune(self, retain_from: int, receipt: PruneReceipt) -> None:
         """Release payloads of the sealed prefix, retaining entries from ``retain_from``.
 
@@ -1669,6 +1740,124 @@ def verify_audit_receipt(receipt: Any) -> bool:
         ):
             return False
     return True
+
+
+def verify_audit_batch(receipt: Any) -> bool:
+    """Verify a compact batch-audit receipt without holding the log.
+
+    The receipt must be the five-tuple
+    ``(hash_name, size, root, entries, proof)`` produced by
+    :meth:`AuditLog.audit_batch`:
+
+    - ``hash_name``: a fixed-output-length ``hashlib`` algorithm name,
+    - ``size``: a non-negative non-bool integer snapshot size,
+    - ``root``: the snapshot Merkle root (``bytes`` of the digest width),
+    - ``entries``: a tuple of :class:`Entry` records in strictly ascending
+      absolute-index order, each within ``[0, size)`` with ``bytes`` fields
+      of the digest width; every non-empty receipt must carry the last entry
+      (index ``size - 1``) as its final entry; an empty snapshot carries no
+      entries,
+    - ``proof``: a tuple of ``bytes`` proof nodes whose count fits
+      ``(indices, size)`` exactly.
+
+    Each entry digest is recomputed via :func:`entry_digest` from the entry
+    fields, and the single shared batch inclusion proof is verified against
+    the snapshot root via :func:`verify_batch_inclusion`; an empty snapshot
+    only accepts the canonical empty-tree root. A receipt that is not a
+    five-tuple, or carries wrong element types, raises TypeError; a bad
+    algorithm, a negative or wrong-width size, a digest of the wrong width,
+    non-ascending/duplicate or out-of-range indices, a missing last entry,
+    an empty snapshot carrying entries, or a proof whose node count does not
+    fit ``(indices, size)`` raises ValueError. Structurally valid receipts
+    whose entry content, proof or root simply do not match return False.
+    """
+    if not isinstance(receipt, tuple) or len(receipt) != 5:
+        raise TypeError("batch audit receipt must be a five-tuple")
+    hash_name, size, root, entries, proof = receipt
+
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    digest_size = _digest_size(hash_name)
+
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError("size must be an integer")
+    if size < 0:
+        raise ValueError("size must be non-negative")
+
+    root = _check_digest(root, "root", digest_size)
+
+    if not isinstance(entries, tuple):
+        raise TypeError("entries must be a tuple of Entry records")
+    if not isinstance(proof, tuple):
+        raise TypeError("proof must be a tuple of digests")
+    for node in proof:
+        if not isinstance(node, bytes):
+            raise TypeError("proof elements must be bytes")
+        if len(node) != digest_size:
+            raise ValueError(f"proof element must be {digest_size} bytes")
+
+    if size == 0:
+        if entries:
+            raise ValueError("an empty snapshot receipt must carry no entries")
+        if proof:
+            raise ValueError("an empty snapshot receipt must carry an empty proof")
+        return hmac.compare_digest(root, _hash_parts(hash_name, _EMPTY_DOMAIN))
+
+    if not entries:
+        raise ValueError(
+            "a receipt for a non-empty snapshot must include the entry at index size - 1"
+        )
+
+    indices: list[int] = []
+    entry_hashes: list[bytes] = []
+    previous_index = -1
+    for entry in entries:
+        if not isinstance(entry, Entry):
+            raise TypeError("each entry must be an Entry")
+        if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+            raise TypeError("entry.index must be an integer")
+        if entry.index <= previous_index:
+            raise ValueError(
+                "entries must be in strictly ascending order with no duplicates"
+            )
+        if entry.index < 0 or entry.index >= size:
+            raise ValueError(
+                f"entry index {entry.index} must satisfy 0 <= index < size ({size})"
+            )
+        for name in ("payload", "previous_hash", "entry_hash"):
+            if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                raise TypeError(f"entry.{name} must be bytes")
+        if len(entry.previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        if len(entry.entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        recomputed = entry_digest(
+            entry.index,
+            bytes(entry.previous_hash),
+            bytes(entry.payload),
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, bytes(entry.entry_hash)):
+            return False
+        indices.append(entry.index)
+        entry_hashes.append(bytes(entry.entry_hash))
+        previous_index = entry.index
+
+    if indices[-1] != size - 1:
+        raise ValueError(
+            "a receipt for a non-empty snapshot must include the entry at index size - 1"
+        )
+
+    # verify_batch_inclusion enforces the canonical proof node count for
+    # (indices, size) and raises ValueError when it does not fit.
+    return verify_batch_inclusion(
+        tuple(indices),
+        tuple(entry_hashes),
+        size,
+        root,
+        proof,
+        hash_name=hash_name,
+    )
 
 
 def _encode_u64(value: int, name: str) -> bytes:

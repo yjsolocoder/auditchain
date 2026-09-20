@@ -1,8 +1,8 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / entry_digest / decrypt_entry / verify_inclusion /
-verify_consistency / verify_auth / verify_audit_receipt /
+Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
+verify_inclusion / verify_consistency / verify_auth / verify_audit_receipt /
 encode_audit_receipt / decode_audit_receipt.
 """
 
@@ -22,6 +22,8 @@ __all__ = [
     "AuditReceipt",
     "AuthTag",
     "Entry",
+    "IntegrityIssue",
+    "IntegrityReport",
     "PruneReceipt",
     "Verifier",
     "GENESIS_HASH",
@@ -483,6 +485,101 @@ class Verifier:
         _digest_size(self.hash_name)
 
 
+# Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
+# mismatch at a retained entry's absolute index; "head" pinpoints no entry,
+# only that the recomputed chain head does not equal the recorded log head.
+_ISSUE_INDEX = "index"
+_ISSUE_PREVIOUS_HASH = "previous_hash"
+_ISSUE_ENTRY_HASH = "entry_hash"
+_ISSUE_HEAD = "head"
+_ISSUE_CODES = frozenset(
+    {_ISSUE_INDEX, _ISSUE_PREVIOUS_HASH, _ISSUE_ENTRY_HASH, _ISSUE_HEAD}
+)
+
+
+@dataclass(frozen=True)
+class IntegrityIssue:
+    """One locateable integrity problem found by :meth:`AuditLog.verify_report`.
+
+    - ``code``: one of ``"index"``, ``"previous_hash"``, ``"entry_hash"``
+      (a mismatch at the retained entry given by ``index``) or ``"head"``
+      (the recomputed chain head does not match the recorded log head);
+    - ``index``: the absolute index of the offending entry, or ``None`` for
+      the entry-independent trailing ``"head"`` issue (and only for it).
+
+    Issues compare and hash by their two fields and may be built positionally.
+    """
+
+    code: str
+    index: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _ISSUE_CODES:
+            raise ValueError(
+                f"unknown issue code {self.code!r}; expected one of "
+                f"'index', 'previous_hash', 'entry_hash', 'head'"
+            )
+        if self.code == _ISSUE_HEAD:
+            if self.index is not None:
+                raise ValueError("a 'head' issue must carry index None")
+        elif not isinstance(self.index, int) or isinstance(self.index, bool):
+            raise TypeError("index must be an integer or None")
+        elif self.index < 0:
+            raise ValueError("index must be non-negative")
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    """Result of :meth:`AuditLog.verify_report`.
+
+    ``issues`` holds :class:`IntegrityIssue` values in ascending absolute
+    index order; the entry-independent ``("head", None)`` issue, when present,
+    is the trailing element. ``ok`` is the single source of truth and is
+    ``True`` exactly when ``issues`` is empty. Reports compare by their fields
+    (``ok`` and ``issues`` only) and may be built positionally.
+    """
+
+    ok: bool
+    issues: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if not isinstance(self.issues, tuple):
+            raise TypeError("issues must be a tuple")
+        for issue in self.issues:
+            if not isinstance(issue, IntegrityIssue):
+                raise TypeError("each issue must be an IntegrityIssue")
+        rank = {
+            _ISSUE_INDEX: 0,
+            _ISSUE_PREVIOUS_HASH: 1,
+            _ISSUE_ENTRY_HASH: 2,
+            _ISSUE_HEAD: 3,
+        }
+
+        def order_key(issue: IntegrityIssue) -> tuple[int, int, int]:
+            # The index-less "head" issue sorts after every indexed position.
+            if issue.code == _ISSUE_HEAD:
+                return (1, 0, rank[_ISSUE_HEAD])
+            return (0, issue.index, rank[issue.code])  # type: ignore[arg-type]
+
+        previous_key: tuple[int, int, int] | None = None
+        for position, issue in enumerate(self.issues):
+            if issue.code == _ISSUE_HEAD and position != len(self.issues) - 1:
+                raise ValueError("a 'head' issue may only be the final issue")
+            key = order_key(issue)
+            if previous_key is not None and key <= previous_key:
+                raise ValueError(
+                    "issues must be in ascending index order, with codes "
+                    "'index', 'previous_hash', 'entry_hash' at one position"
+                )
+            previous_key = key
+        if self.ok != (len(self.issues) == 0):
+            raise ValueError("ok must be True exactly when issues is empty")
+
+
 class AuditLog:
     """Append-only hash chain held in memory.
 
@@ -746,18 +843,70 @@ class AuditLog:
         )
 
     def verify(self) -> bool:
-        """Walk the retained chain forward from the prune checkpoint."""
+        """Whether the retained chain is intact (``verify_report().ok``)."""
+        return self.verify_report().ok
+
+    def verify_report(self) -> IntegrityReport:
+        """Verify the retained chain, locating every mismatch in the result.
+
+        Walks the retained entries forward from the prune checkpoint — the
+        digest-width zero predecessor for an unpruned or empty log, the sealed
+        checkpoint after a prune. At each expected absolute index the entry
+        digest is recomputed as
+        ``H(b"auditchain/entry/v1" || index (u64 big-endian) ||
+        previous_recomputed || payload)`` with the log's own hash algorithm
+        and digest width, and compared against the recorded index,
+        predecessor and entry digest. After the walk the final recomputed
+        digest must equal the recorded :attr:`head`.
+
+        Structurally valid data that simply does not match is collected as
+        :class:`IntegrityIssue` records with ``ok=False`` rather than raised:
+        at one position the codes appear in the order ``"index"``,
+        ``"previous_hash"``, ``"entry_hash"``; a head mismatch appends the
+        trailing ``("head", None)``. Issues are listed in ascending absolute
+        index order. Walking always continues with the *expected* index and
+        the *recomputed* predecessor, so later damage is diagnosed even after
+        an earlier mismatch. Illegal fields still raise TypeError or
+        ValueError exactly as elsewhere (a non-``Entry`` record, an index that
+        is not a non-bool non-negative integer, a non-bytes field, or a
+        predecessor/entry digest of the wrong width); such structural
+        corruption is reported as an exception, never as an issue. The call is
+        read-only.
+        """
+        issues: list[IntegrityIssue] = []
         previous = self._checkpoint_head
         for offset, entry in enumerate(self._entries):
             index = self._retain_from + offset
-            if entry.index != index or entry.previous_hash != previous:
-                return False
-            if entry.entry_hash != entry_digest(
-                index, previous, entry.payload, hash_name=self._hash_name
-            ):
-                return False
-            previous = entry.entry_hash
-        return True
+            if not isinstance(entry, Entry):
+                raise TypeError("entry must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != self._digest_size:
+                raise ValueError(
+                    f"entry.previous_hash must be {self._digest_size} bytes"
+                )
+            if len(entry.entry_hash) != self._digest_size:
+                raise ValueError(
+                    f"entry.entry_hash must be {self._digest_size} bytes"
+                )
+            if entry.index != index:
+                issues.append(IntegrityIssue(_ISSUE_INDEX, index))
+            if entry.previous_hash != previous:
+                issues.append(IntegrityIssue(_ISSUE_PREVIOUS_HASH, index))
+            recomputed = entry_digest(
+                index, previous, bytes(entry.payload), hash_name=self._hash_name
+            )
+            if entry.entry_hash != recomputed:
+                issues.append(IntegrityIssue(_ISSUE_ENTRY_HASH, index))
+            previous = recomputed
+        if previous != self._head:
+            issues.append(IntegrityIssue(_ISSUE_HEAD, None))
+        return IntegrityReport(ok=not issues, issues=tuple(issues))
 
     def _resolve_size(self, size: int | None) -> int:
         if size is None:

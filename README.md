@@ -181,7 +181,9 @@ verify_auth(log.entry(1), tag1, verifier)  # True
   产生的新 `Entry` 与从未裁剪的日志逐字节相同
 - `entries()` 与迭代只列出保留段；`entry(i)` / `verify_entry(i)` 访问已裁剪索引抛 `IndexError`，
   `inclusion_proof(i, …)` 对已裁剪索引抛 `ValueError`
-- `verify()` 从封存检查点（末条摘要）向前校验保留段
+- `verify()` 从创世摘要（裁剪后从检查点）开始校验持有的链段；需要定位具体问题时用
+  `verify_report()`，它返回不可变 `IntegrityReport`，按期望绝对索引升序列出每条不匹配，
+  并在末尾核对链头（重写最后一条也无法蒙混过关）
 - 保留点及之后任意快照的 `merkle_root`、`inclusion_proof`、`consistency_proof`
   重建结果与未裁剪日志相同；完全落在已裁剪前缀内的快照无法重建，抛 `ValueError`
   （空快照 `size=0` 是内容无关常量，始终可用）
@@ -209,6 +211,14 @@ python3 -m auditchain
   按字段相等、支持位置构造；`version` 恒为 `1`，`root` 为快照 Merkle 根，
   `items` 为按绝对索引升序的 `(Entry, 证明元组)` 元组，非空回执必含 `index == size - 1`
   的末条；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或条目结构非法抛 `ValueError`
+- `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
+  `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
+  或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
+  `code` 类型/取值、`index` 类型或负值非法抛 `TypeError` / `ValueError`
+- `IntegrityReport(ok, issues)` — 不可变的链校验报告，按字段相等、支持位置构造；
+  `issues` 仅含 `IntegrityIssue`，`ok` 当且仅当 `issues` 为空。问题按期望绝对索引升序，
+  同一位置依次为 `"index"`、`"previous_hash"`、`"entry_hash"`，`("head", None)` 只能在末尾；
+  顺序或 `ok`/`issues` 不一致抛 `ValueError`，类型非法抛 `TypeError`
 - `GENESIS_HASH` — `bytes(32)` 全零起始前驱摘要（sha256 创世前驱；其他宽度日志用其自身 `digest_size` 个零）
 - `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
@@ -234,7 +244,17 @@ python3 -m auditchain
     哈希碰撞不会产生误命中；查询为只读，不改变条目、`head`、认证状态、Merkle 根或证明
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
-  - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段
+  - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于
+    `verify_report().ok`
+  - `verify_report()` — 与 `verify()` 同样从检查点逐条推进，但返回不可变
+    `IntegrityReport(ok, issues)` 精确定位不匹配：每条以期望绝对 index、上一步
+    重算摘要与当前 payload 重算 `entry_digest`，依次比对记录的 index、
+    previous_hash 与 entry_hash，最后要求重算链头等于 `head`（空日志从同宽零摘要
+    开始）。问题按绝对索引升序，同位置 code 依次为 `"index"`、`"previous_hash"`、
+    `"entry_hash"`，不匹配链头只在末尾追加 `("head", None)`；遍历始终用期望 index
+    与重算前驱，故前面的损坏不影响后续定位。结构合法但不匹配只写入 `issues` 并令
+    `ok=False`（不抛异常）；非法字段（非 `Entry`、index 非非 bool 非负整数、字段非
+    `bytes` 或摘要宽度不符）沿用 `TypeError` / `ValueError`；调用只读
   - `verify_entry(index)` — 只校验某条与前驱的连接
   - `auth(index)` — 为保留段中的条目签发不可变 `AuthTag`，返回后立即以
     `H(b"auditchain/key-evolve/v1" + K)` 替换密钥、stage 加一，不保存旧密钥、不追加条目；

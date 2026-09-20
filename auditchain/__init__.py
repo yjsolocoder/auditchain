@@ -67,6 +67,24 @@ _U64_LIMIT = 1 << 64
 _MAX_STAGE = 1 << 64
 
 
+def _digest_size_for(hash_name: Any) -> int:
+    """Digest width of a supported fixed-output hash algorithm.
+
+    A non-string ``hash_name`` raises TypeError; an unknown algorithm or one
+    without a fixed output size (e.g. the SHAKE extendable-output functions)
+    raises ValueError.
+    """
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    try:
+        digest_size = hashlib.new(hash_name).digest_size
+    except ValueError as error:
+        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+    if digest_size <= 0:
+        raise ValueError(f"hash algorithm must have a fixed output size: {hash_name}")
+    return digest_size
+
+
 def _as_bytes(payload: Any) -> bytes:
     if isinstance(payload, bytes):
         return payload
@@ -132,12 +150,20 @@ def _parse_envelope(payload: Any) -> tuple[int, bytes, bytes]:
 
 
 def entry_digest(index: int, previous_hash: bytes, payload: bytes, *, hash_name: str = "sha256") -> bytes:
-    """Digest binding an entry to its position and predecessor."""
+    """Digest binding an entry to its position and predecessor.
+
+    ``index`` is encoded as an unsigned 64-bit big-endian integer and
+    ``previous_hash`` must be exactly the digest size of ``hash_name``; the
+    result is ``hashlib.new(hash_name).digest_size`` bytes long.
+    """
     if not isinstance(index, int) or index < 0:
         raise ValueError("index must be a non-negative integer")
+    if index >= _U64_LIMIT:
+        raise ValueError("index must fit in an unsigned 64-bit integer")
+    digest_size = _digest_size_for(hash_name)
     previous = bytes(previous_hash)
-    if len(previous) != 32:
-        raise ValueError("previous_hash must be 32 bytes")
+    if len(previous) != digest_size:
+        raise ValueError(f"previous_hash must be {digest_size} bytes")
     digest = hashlib.new(hash_name)
     digest.update(_DOMAIN)
     digest.update(index.to_bytes(_INDEX_BYTES, "big"))
@@ -164,8 +190,7 @@ def decrypt_entry(entry: Any, key: Any, *, hash_name: str = "sha256") -> bytes:
     """
     if not isinstance(entry, Entry):
         raise TypeError("entry must be an Entry")
-    if not isinstance(hash_name, str):
-        raise TypeError("hash_name must be a string")
+    digest_size = _digest_size_for(hash_name)
     _check_key(key)
     if not isinstance(entry.index, int) or isinstance(entry.index, bool):
         raise TypeError("entry.index must be an integer")
@@ -176,10 +201,6 @@ def decrypt_entry(entry: Any, key: Any, *, hash_name: str = "sha256") -> bytes:
     if not isinstance(entry.entry_hash, (bytes, bytearray)):
         raise TypeError("entry.entry_hash must be bytes")
     _, nonce, sealed = _parse_envelope(entry.payload)
-    try:
-        digest_size = hashlib.new(hash_name).digest_size
-    except ValueError as error:
-        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
     previous_hash = bytes(entry.previous_hash)
     if len(previous_hash) != digest_size:
         raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
@@ -303,8 +324,8 @@ class PruneReceipt:
     - ``size``: number of entries in the sealed prefix,
     - ``merkle_root``: Merkle root of the prefix,
     - ``chain_hash``: entry hash of the last prefix entry (the predecessor
-      digest the first retained entry must carry); ``GENESIS_HASH`` for an
-      empty prefix.
+      digest the first retained entry must carry); ``digest_size`` zero bytes
+      (``GENESIS_HASH`` under SHA-256) for an empty prefix.
     """
 
     hash_name: str
@@ -313,16 +334,11 @@ class PruneReceipt:
     chain_hash: bytes
 
     def __post_init__(self) -> None:
-        if not isinstance(self.hash_name, str):
-            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size_for(self.hash_name)
         if not isinstance(self.size, int) or isinstance(self.size, bool):
             raise TypeError("size must be an integer")
         if self.size < 0:
             raise ValueError("size must be non-negative")
-        try:
-            digest_size = hashlib.new(self.hash_name).digest_size
-        except ValueError as error:
-            raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
         for name in ("merkle_root", "chain_hash"):
             value = getattr(self, name)
             if not isinstance(value, (bytes, bytearray)):
@@ -337,8 +353,8 @@ class PruneReceipt:
 
         Its absolute index must equal ``size`` and its predecessor digest must
         equal ``chain_hash``. A receipt for the empty prefix matches the
-        genesis record: an entry at index 0 whose predecessor is
-        ``GENESIS_HASH``.
+        genesis record: an entry at index 0 whose predecessor is the
+        digest-width zero hash (``GENESIS_HASH`` under SHA-256).
         """
         if not isinstance(entry, Entry):
             raise TypeError("entry must be an Entry")
@@ -374,12 +390,7 @@ class AuditReceipt:
             raise TypeError("version must be an integer")
         if self.version != 1:
             raise ValueError("version must be 1")
-        if not isinstance(self.hash_name, str):
-            raise TypeError("hash_name must be a string")
-        try:
-            digest_size = hashlib.new(self.hash_name).digest_size
-        except ValueError as error:
-            raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
+        digest_size = _digest_size_for(self.hash_name)
         if not isinstance(self.size, int) or isinstance(self.size, bool):
             raise TypeError("size must be an integer")
         if self.size < 0:
@@ -465,12 +476,7 @@ class Verifier:
             raise TypeError("key must be bytes")
         if len(self.key) == 0:
             raise ValueError("key must be non-empty")
-        if not isinstance(self.hash_name, str):
-            raise TypeError("hash_name must be a string")
-        try:
-            hashlib.new(self.hash_name)
-        except ValueError as error:
-            raise ValueError(f"unknown hash algorithm: {self.hash_name}") from error
+        _digest_size_for(self.hash_name)
 
 
 class AuditLog:
@@ -483,25 +489,26 @@ class AuditLog:
     """
 
     def __init__(self, *, key: bytes | None = None, hash_name: str = "sha256") -> None:
-        try:
-            hashlib.new(hash_name)
-        except ValueError as error:
-            raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+        digest_size = _digest_size_for(hash_name)
         if key is not None:
             if not isinstance(key, bytes):
                 raise TypeError("key must be bytes")
             if len(key) == 0:
                 raise ValueError("key must be non-empty")
         self._hash_name = hash_name
+        self._digest_size = digest_size
         self._entries: list[Entry] = []
         self._retain_from = 0
-        self._head: bytes = GENESIS_HASH
+        # Genesis predecessor: digest_size zero bytes (GENESIS_HASH under
+        # SHA-256).
+        self._head: bytes = bytes(digest_size)
         # Locator index for find(): payload digest -> ascending absolute
         # indices of the retained entries carrying that digest. Digests only
         # narrow the candidates; find() always re-compares the stored payload.
         self._index: dict[bytes, list[int]] = {}
-        # Chain hash of the last pruned entry (GENESIS_HASH before any prune).
-        self._checkpoint_head: bytes = GENESIS_HASH
+        # Chain hash of the last pruned entry (the genesis predecessor before
+        # any prune).
+        self._checkpoint_head: bytes = bytes(digest_size)
         # Roots of the maximal perfect subtrees covering [0, retain_from),
         # keyed by subtree height (a subtree of height h holds 2**h leaves).
         self._frontier: dict[int, bytes] = {}
@@ -724,7 +731,7 @@ class AuditLog:
         if entry.index != index:
             return False
         if index == 0:
-            previous = GENESIS_HASH
+            previous = bytes(self._digest_size)
         elif index == self._retain_from:
             previous = self._checkpoint_head
         else:
@@ -765,9 +772,9 @@ class AuditLog:
             )
 
     def _chain_head_at(self, size: int) -> bytes:
-        """Entry hash of the last entry of the prefix (GENESIS_HASH at 0)."""
+        """Entry hash of the last prefix entry (genesis predecessor at 0)."""
         if size == 0:
-            return GENESIS_HASH
+            return bytes(self._digest_size)
         if size == self._retain_from:
             return self._checkpoint_head
         return self._entries[size - self._retain_from - 1].entry_hash
@@ -938,7 +945,8 @@ class AuditLog:
 
         Defaults to the current log length. The receipt records the prefix
         Merkle root and the entry hash of its last record; the empty prefix
-        records ``GENESIS_HASH`` as its chain hash.
+        records the digest-width zero hash (``GENESIS_HASH`` under SHA-256)
+        as its chain hash.
         """
         size = self._resolve_size(size)
         if size == 0:
@@ -1117,12 +1125,7 @@ def verify_inclusion(
     valid inputs that do not match return False; malformed inputs raise
     TypeError or ValueError.
     """
-    if not isinstance(hash_name, str):
-        raise TypeError("hash_name must be a string")
-    try:
-        digest_size = hashlib.new(hash_name).digest_size
-    except ValueError as error:
-        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+    digest_size = _digest_size_for(hash_name)
 
     entry_hash = _check_digest(entry_hash, "entry_hash", digest_size)
     root = _check_digest(root, "root", digest_size)
@@ -1182,12 +1185,7 @@ def verify_consistency(
     that do not match return False; malformed inputs raise TypeError or
     ValueError.
     """
-    if not isinstance(hash_name, str):
-        raise TypeError("hash_name must be a string")
-    try:
-        digest_size = hashlib.new(hash_name).digest_size
-    except ValueError as error:
-        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+    digest_size = _digest_size_for(hash_name)
 
     old_root = _check_digest(old_root, "old_root", digest_size)
     new_root = _check_digest(new_root, "new_root", digest_size)
@@ -1446,7 +1444,7 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
     if not 0 <= tag.stage < _MAX_STAGE:
         raise ValueError("tag.stage must satisfy 0 <= stage < 2**64")
 
-    digest_size = hashlib.new(verifier.hash_name).digest_size
+    digest_size = _digest_size_for(verifier.hash_name)
     for name in ("previous_hash", "entry_hash", "payload"):
         value = getattr(entry, name)
         if not isinstance(value, (bytes, bytearray)):

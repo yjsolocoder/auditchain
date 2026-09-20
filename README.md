@@ -146,6 +146,24 @@ Entry.index、payload blob、previous_hash blob、entry_hash blob、proof 计数
 版本、算法、非法 UTF-8、截断、尾随字节、长度溢出、摘要长度、索引顺序/重复、
 末条缺失或证明结构非法均抛 `ValueError`。
 
+### 紧凑批量包含证明
+
+一次为大量条目签发一份合并了重复子树摘要的包含证明，并可仅凭所选条目摘要、快照
+大小与根离线核验：
+
+```python
+indices, proof = log.batch_inclusion_proof([1, 3, 5])  # size 默认当前长度
+root = log.merkle_root()
+hashes = tuple(log.entry(i).entry_hash for i in indices)
+verify_batch_inclusion(indices, hashes, len(log), root, proof)  # True，无需日志
+```
+
+返回的 `indices` 为严格升序元组，与输入顺序无关；证明递归覆盖 `[0, size)`——
+长度 `n > 1` 以小于 `n` 的最大二的幂切成左右子树、先左后右，没有所选索引的子树
+只追加一次其 Merkle 根（多条单叶证明中的重复子树因此被合并），含所选索引的子树
+递归，所选单叶本身不追加节点。选中全部叶子时证明为 `()`；签发只读，空选择、
+越界、重复或快照不可重建抛 `ValueError`，类型错抛 `TypeError`。
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -269,6 +287,16 @@ python3 -m auditchain
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
+  - `batch_inclusion_proof(indices, size=None)` — 一次覆盖大量条目的紧凑批量包含证明，
+    返回 `(indices, proof)`：`indices` 为所选绝对索引严格升序元组，`proof` 为合并了
+    重复子树摘要的一份规范不可变元组（多个单条包含证明中的相同子树只出现一次）。证明
+    递归覆盖整个快照 `[0, size)`：长度 `n > 1` 的区间以小于 `n` 的最大二的幂 `k` 切成
+    左右子树并先左后右，不含所选索引的子树追加其 Merkle 根，含所选索引则递归，所选
+    单叶不追加节点；哈希与奇数末节点提升沿用同一 Merkle 规则，仅凭所选条目摘要、快照
+    大小与根即可用顶层 `verify_batch_inclusion` 离线核验全部叶子。`indices` 为可迭代
+    的互异非 `bool` 整数，须满足 `retain_from <= index < size <= len(log)`；`size`
+    默认当前长度，快照须可重建；空选择、越界、重复或快照不可重建抛 `ValueError`，类型
+    错抛 `TypeError`；调用只读，不改变日志
   - `consistency_proof(old_size, new_size=None)` — 两个前缀快照之间的一致性证明，不可变元组；
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
   - `seal(size=None)` — 为前 `size` 条（默认当前长度）生成 `PruneReceipt`，记录前缀根与末条摘要，
@@ -299,6 +327,14 @@ python3 -m auditchain
   `key` 长度非 32、封装魔数不符或截断、算法号未知、摘要长度不符、`entry_hash`
   不符、密钥错误或 AEAD 认证失败抛 `ValueError`；调用只读，不改变条目或日志
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
+- `verify_batch_inclusion(indices, entry_hashes, size, root, proof, *, hash_name="sha256")` —
+  只凭所选条目摘要、快照大小与根摘要验证一份紧凑批量包含证明，无需持有日志。按
+  `AuditLog.batch_inclusion_proof` 的同一规范递归（`n > 1` 以小于 `n` 的最大二的幂切分、
+  先左后右、无子选区取追加根、所选单叶不追加）重算整棵 `[0, size)` 的根。三个序列
+  依次校验：`indices` 为非空、严格升序的非 `bool` 整数元组且满足
+  `0 <= index < size`，`entry_hashes` 为与 `indices` 等长的 `bytes` 摘要元组，`proof`
+  为 `bytes` 节点元组；类型错抛 `TypeError`，边界、顺序、摘要宽度或证明节点数不符抛
+  `ValueError`，结构合法但内容/根不匹配返回 `False`，否则 `True`
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
 - `verify_audit_receipt(receipt)` — 无需持有日志即可验证 `AuditReceipt`：要求非空快照

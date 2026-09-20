@@ -2,8 +2,8 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
-verify_inclusion / verify_consistency / verify_auth / verify_audit_receipt /
-encode_audit_receipt / decode_audit_receipt.
+verify_inclusion / verify_batch_inclusion / verify_consistency / verify_auth /
+verify_audit_receipt / encode_audit_receipt / decode_audit_receipt.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -33,6 +34,7 @@ __all__ = [
     "entry_digest",
     "verify_audit_receipt",
     "verify_auth",
+    "verify_batch_inclusion",
     "verify_consistency",
     "verify_inclusion",
 ]
@@ -301,6 +303,54 @@ def _subproof_length(m: int, n: int, complete: bool) -> int:
     if m <= k:
         return _subproof_length(m, k, complete) + 1
     return _subproof_length(m - k, n - k, False) + 1
+
+
+def _batch_fold(
+    base: int,
+    length: int,
+    positions: tuple[int, ...],
+    leaf,
+    subtree,
+    combine,
+):
+    """Canonical recursion of a compact batch inclusion proof.
+
+    Covers ``length`` leaves at absolute offset ``base``; ``positions`` is a
+    strictly ascending tuple of selected *local* indices
+    (``0 <= p < length``) and is never empty on entry. A length-1 range is a
+    single selected leaf: ``leaf(base)`` supplies its node and no proof node
+    is appended. For ``length > 1`` the range is split at ``k``, the largest
+    power of two strictly smaller than ``length``; the left subtree
+    (``k`` leaves) is visited before the right (``length - k`` leaves). A
+    subtree carrying a selection recurses; a subtree without one contributes
+    its Merkle root once via ``subtree(start, subtree_length)``. The two
+    subtree roots are joined with ``combine(left, right)``.
+
+    With the split at the largest power of two below ``length`` every emitted
+    subtree is aligned and the two children always pair into a node hash
+    (the odd-trailing-node promotion is absorbed by the split shape), so the
+    fold reproduces exactly the README tree including promoted odd nodes.
+    """
+    if length == 1:
+        return leaf(base)
+    k = _split_point(length)
+    cut = bisect_left(positions, k)
+    if cut > 0:
+        left_node = _batch_fold(base, k, positions[:cut], leaf, subtree, combine)
+    else:
+        left_node = subtree(base, k)
+    if cut < len(positions):
+        right_node = _batch_fold(
+            base + k,
+            length - k,
+            tuple(p - k for p in positions[cut:]),
+            leaf,
+            subtree,
+            combine,
+        )
+    else:
+        right_node = subtree(base + k, length - k)
+    return combine(left_node, right_node)
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1128,72 @@ class AuditLog:
             height += 1
         return tuple(proof)
 
+    def batch_inclusion_proof(
+        self, indices: Iterable[int], size: int | None = None
+    ) -> tuple[tuple[int, ...], tuple[bytes, ...]]:
+        """Compact Merkle inclusion proof covering many entries at once.
+
+        Returns ``(indices, proof)`` where ``indices`` is the tuple of the
+        selected absolute indices in strictly ascending order and ``proof`` is
+        a single canonical tuple of sibling subtree digests shared by all of
+        them. The proof covers the whole snapshot ``[0, size)``: a subtree
+        carrying a selected index recurses, while a subtree carrying none
+        contributes its Merkle root exactly once (so duplicated subtrees over
+        several single-entry proofs are merged), and a selected leaf
+        contributes nothing. Recursion splits any range of length ``n > 1`` at
+        the largest power of two ``k < n`` and visits the left subtree before
+        the right; hashing and odd-trailing-node promotion follow the same
+        rules as the rest of the tree.
+
+        ``indices`` must be a non-empty iterable of distinct non-bool integers
+        satisfying ``retain_from <= index < size``; ``size`` defaults to the
+        current log length and the snapshot must still be rebuildable. The
+        result is verified offline with :func:`verify_batch_inclusion`. The
+        call is read-only: it changes no log state.
+        """
+        size = self._resolve_size(size)
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < size:
+                raise ValueError(
+                    f"index {index} must satisfy retain_from ({self._retain_from}) "
+                    f"<= index < size ({size})"
+                )
+            selected.add(index)
+        if not selected:
+            raise ValueError("indices must select at least one entry")
+        ordered = tuple(sorted(selected))
+        # Rebuilding the root also rejects a snapshot inside the pruned prefix.
+        self.merkle_root(size)
+        blocks = self._frontier_blocks()
+        proof: list[bytes] = []
+
+        def leaf(start: int) -> bytes:
+            return self._perfect_node(0, start, blocks)
+
+        def subtree(start: int, length: int) -> bytes:
+            root = self._range_root(start, length, blocks)
+            proof.append(root)
+            return root
+
+        _batch_fold(
+            0,
+            size,
+            ordered,
+            leaf,
+            subtree,
+            lambda left, right: _node_hash(left, right, self._hash_name),
+        )
+        return ordered, tuple(proof)
+
     def consistency_proof(self, old_size: int, new_size: int | None = None) -> tuple[bytes, ...]:
         """Proof that the first ``old_size`` entries are a prefix of the first ``new_size``.
 
@@ -1330,6 +1446,136 @@ def verify_inclusion(
     if consumed != len(siblings):
         raise ValueError("proof has too many levels")
     return hmac.compare_digest(node, root)
+
+
+def _batch_proof_len(length: int, positions: tuple[int, ...]) -> int:
+    """Canonical subtree-root count for ``positions`` within ``length`` leaves."""
+    if length == 1:
+        return 0
+    k = _split_point(length)
+    cut = bisect_left(positions, k)
+    if cut > 0:
+        left_count = _batch_proof_len(k, positions[:cut])
+    else:
+        left_count = 1
+    if cut < len(positions):
+        right_count = _batch_proof_len(
+            length - k, tuple(p - k for p in positions[cut:])
+        )
+    else:
+        right_count = 1
+    return left_count + right_count
+
+
+def verify_batch_inclusion(
+    indices: tuple[int, ...],
+    entry_hashes: tuple[bytes, ...],
+    size: int,
+    root: bytes,
+    proof: tuple[bytes, ...],
+    *,
+    hash_name: str = "sha256",
+) -> bool:
+    """Verify a compact batch inclusion proof without holding the log.
+
+    Rebuilds the Merkle root of a snapshot of ``size`` entries from the
+    selected leaf digests ``entry_hashes`` at ``indices`` and a single shared
+    canonical ``proof`` produced by :meth:`AuditLog.batch_inclusion_proof`.
+    The recursion covers all of ``[0, size)``: a subtree carrying a selected
+    index recurses, a subtree carrying none consumes its appended Merkle root,
+    and a selected leaf supplies only its own leaf hash; ranges of length
+    ``n > 1`` split at the largest power of two below ``n``, left before
+    right, with the same hashing and odd-node promotion rules as the rest of
+    the tree.
+
+    The three sequences are validated in order: ``indices`` must be a non-empty
+    tuple of strictly ascending non-bool integers within ``[0, size)``,
+    ``entry_hashes`` a tuple of ``bytes`` digests exactly as long as
+    ``indices``, and ``proof`` a tuple of ``bytes`` nodes. Wrong types raise
+    TypeError; boundary, ordering, digest-width or proof-node-count problems
+    raise ValueError. Structurally valid inputs that simply do not match the
+    given ``root`` return False.
+    """
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    digest_size = _digest_size(hash_name)
+
+    # Sequence 1: indices — a non-empty tuple of strictly ascending non-bool
+    # integers. Type and intrinsic order are checked first, then the range
+    # once size is validated below.
+    if not isinstance(indices, tuple):
+        raise TypeError("indices must be a tuple of integers")
+    for index in indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("indices must be non-bool integers")
+    if not indices:
+        raise ValueError("indices must select at least one entry")
+    previous = -1
+    for index in indices:
+        if index <= previous:
+            raise ValueError("indices must be strictly ascending")
+        previous = index
+        if index < 0:
+            raise ValueError("indices must be non-negative")
+
+    # Sequence 2: entry_hashes — a tuple of bytes, as many as indices.
+    if not isinstance(entry_hashes, tuple):
+        raise TypeError("entry_hashes must be a tuple of bytes digests")
+    for digest in entry_hashes:
+        if not isinstance(digest, bytes):
+            raise TypeError("entry_hashes elements must be bytes")
+    if len(entry_hashes) != len(indices):
+        raise ValueError("entry_hashes must have exactly as many elements as indices")
+    for digest in entry_hashes:
+        if len(digest) != digest_size:
+            raise ValueError(f"entry_hashes elements must be {digest_size} bytes")
+
+    # Sequence 3: proof — a tuple of bytes nodes of the digest width.
+    if not isinstance(proof, tuple):
+        raise TypeError("proof must be a tuple of bytes nodes")
+    for node in proof:
+        if not isinstance(node, bytes):
+            raise TypeError("proof elements must be bytes")
+    for node in proof:
+        if len(node) != digest_size:
+            raise ValueError(f"proof elements must be {digest_size} bytes")
+
+    if not isinstance(size, int) or isinstance(size, bool):
+        raise TypeError("size must be an integer")
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if size < 0:
+        raise ValueError("size must be non-negative")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    for index in indices:
+        if index >= size:
+            raise ValueError(f"index {index} must satisfy 0 <= index < size ({size})")
+
+    expected_nodes = _batch_proof_len(size, indices)
+    if len(proof) != expected_nodes:
+        raise ValueError(
+            f"proof must have {expected_nodes} nodes for these indices and size"
+        )
+
+    nodes = list(proof)
+
+    def leaf(start: int) -> bytes:
+        position = bisect_left(indices, start)
+        return _leaf_hash(entry_hashes[position], hash_name)
+
+    def subtree(start: int, length: int) -> bytes:
+        return nodes.pop(0)
+
+    computed = _batch_fold(
+        0,
+        size,
+        indices,
+        leaf,
+        subtree,
+        lambda left, right: _node_hash(left, right, hash_name),
+    )
+    return hmac.compare_digest(computed, root)
 
 
 def verify_consistency(

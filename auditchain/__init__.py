@@ -4,7 +4,7 @@ Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
 verify_inclusion / verify_batch_inclusion / verify_consistency / verify_auth /
 verify_audit_receipt / verify_audit_batch / encode_audit_receipt /
-decode_audit_receipt.
+decode_audit_receipt / encode_audit_batch / decode_audit_batch.
 """
 
 from __future__ import annotations
@@ -28,8 +28,10 @@ __all__ = [
     "PruneReceipt",
     "Verifier",
     "GENESIS_HASH",
+    "decode_audit_batch",
     "decode_audit_receipt",
     "decrypt_entry",
+    "encode_audit_batch",
     "encode_audit_receipt",
     "entry_digest",
     "verify_audit_receipt",
@@ -65,6 +67,10 @@ _LOCATE_DOMAIN = b"auditchain/locate/v1"
 # Binary framing of encode_audit_receipt / decode_audit_receipt: a fixed
 # magic, then unsigned 8-byte big-endian integers and length-prefixed blobs.
 _RECEIPT_MAGIC = b"auditchain/audit-receipt/v1\0"
+# Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
+# rules, one shared proof at the end instead of one proof per item.
+_BATCH_MAGIC = b"auditchain/batch/v1\0"
+_BATCH_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
 
@@ -1741,31 +1747,16 @@ def verify_audit_receipt(receipt: Any) -> bool:
     return True
 
 
-def verify_audit_batch(receipt: Any) -> bool:
-    """Verify a compact batch audit receipt without holding the log.
+def _unpack_audit_batch(
+    receipt: Any,
+) -> tuple[str, int, bytes, tuple[Entry, ...], tuple[bytes, ...]]:
+    """Validate the five-tuple shape shared by :func:`verify_audit_batch` and
+    :func:`decode_audit_batch`.
 
-    The receipt is the five-tuple
-    ``(hash_name, size, root, entries, proof)`` returned by
-    :meth:`AuditLog.audit_batch`: the hash algorithm, the snapshot size, the
-    snapshot Merkle root, a strictly ascending tuple of :class:`Entry` records
-    and the single shared :meth:`AuditLog.batch_inclusion_proof` node tuple
-    covering them. Verification recomputes each :func:`entry_digest` from the
-    entry fields, then rebuilds the snapshot root from those leaf digests and
-    the shared proof via :func:`verify_batch_inclusion`, requiring the entries
-    to include the non-empty snapshot's last record (index ``size - 1``); an
-    empty snapshot (``size == 0``) must carry no entries and only the canonical
-    empty-tree root.
-
-    Anything that is not a five-tuple, or whose element types are wrong
-    (``hash_name``/``root``/``entries``/``proof`` or an entry's fields), raises
-    TypeError. An unknown hash algorithm, a negative size, an entry index out
-    of range, a digest of the wrong width, entries that are not strictly
-    ascending or repeat an index, a non-empty snapshot missing its last entry
-    (including the zero-evidence ``size > 0`` with no entries case), an empty
-    snapshot that carries entries, or a proof node count that does not fit the
-    indices and size raises ValueError. A structurally valid receipt whose
-    entry content, proof or root simply do not match returns False; a genuine
-    receipt returns True.
+    Returns the canonicalized fields (bytearray fields copied to bytes). Only
+    structural properties are checked; entry content, proof and root are left
+    to :func:`verify_audit_batch`, so a structurally sound receipt that simply
+    does not match still unpacks.
     """
     if not isinstance(receipt, tuple) or len(receipt) != 5:
         raise TypeError(
@@ -1799,7 +1790,7 @@ def verify_audit_batch(receipt: Any) -> bool:
             raise ValueError("an empty snapshot receipt must carry no entries")
         if nodes:
             raise ValueError("an empty snapshot receipt must carry an empty proof")
-        return hmac.compare_digest(root, _hash_parts(hash_name, _EMPTY_DOMAIN))
+        return hash_name, size, root, (), ()
 
     if not entries:
         # Zero evidence must never attest a non-empty snapshot's root.
@@ -1809,6 +1800,7 @@ def verify_audit_batch(receipt: Any) -> bool:
 
     # First pass: validate the structure of every entry so a malformed receipt
     # raises even when some entry's content would also fail to match.
+    checked_entries: list[Entry] = []
     indices: list[int] = []
     previous_index = -1
     for entry in entries:
@@ -1835,6 +1827,14 @@ def verify_audit_batch(receipt: Any) -> bool:
             raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
         previous_index = entry.index
         indices.append(entry.index)
+        checked_entries.append(
+            Entry(
+                entry.index,
+                bytes(entry.payload),
+                bytes(entry.previous_hash),
+                bytes(entry.entry_hash),
+            )
+        )
 
     if indices[-1] != size - 1:
         raise ValueError(
@@ -1849,28 +1849,62 @@ def verify_audit_batch(receipt: Any) -> bool:
             f"got {len(nodes)}"
         )
 
+    return hash_name, size, root, tuple(checked_entries), tuple(nodes)
+
+
+def verify_audit_batch(receipt: Any) -> bool:
+    """Verify a compact batch audit receipt without holding the log.
+
+    The receipt is the five-tuple
+    ``(hash_name, size, root, entries, proof)`` returned by
+    :meth:`AuditLog.audit_batch`: the hash algorithm, the snapshot size, the
+    snapshot Merkle root, a strictly ascending tuple of :class:`Entry` records
+    and the single shared :meth:`AuditLog.batch_inclusion_proof` node tuple
+    covering them. Verification recomputes each :func:`entry_digest` from the
+    entry fields, then rebuilds the snapshot root from those leaf digests and
+    the shared proof via :func:`verify_batch_inclusion`, requiring the entries
+    to include the non-empty snapshot's last record (index ``size - 1``); an
+    empty snapshot (``size == 0``) must carry no entries and only the canonical
+    empty-tree root.
+
+    Anything that is not a five-tuple, or whose element types are wrong
+    (``hash_name``/``root``/``entries``/``proof`` or an entry's fields), raises
+    TypeError. An unknown hash algorithm, a negative size, an entry index out
+    of range, a digest of the wrong width, entries that are not strictly
+    ascending or repeat an index, a non-empty snapshot missing its last entry
+    (including the zero-evidence ``size > 0`` with no entries case), an empty
+    snapshot that carries entries, or a proof node count that does not fit the
+    indices and size raises ValueError. A structurally valid receipt whose
+    entry content, proof or root simply do not match returns False; a genuine
+    receipt returns True.
+    """
+    hash_name, size, root, entries, nodes = _unpack_audit_batch(receipt)
+
+    if size == 0:
+        return hmac.compare_digest(root, _hash_parts(hash_name, _EMPTY_DOMAIN))
+
     # Second pass: the structure is sound; recompute every leaf digest. Any
     # content mismatch (and only a content mismatch) now yields False.
     entry_hashes: list[bytes] = []
     for entry in entries:
         recomputed = entry_digest(
             entry.index,
-            bytes(entry.previous_hash),
-            bytes(entry.payload),
+            entry.previous_hash,
+            entry.payload,
             hash_name=hash_name,
         )
-        if not hmac.compare_digest(recomputed, bytes(entry.entry_hash)):
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
             return False
-        entry_hashes.append(bytes(entry.entry_hash))
+        entry_hashes.append(entry.entry_hash)
 
     # Rebuild the snapshot root from the leaf digests and the single shared
     # proof; a wrong proof or root is a mismatch, not a structural error.
     return verify_batch_inclusion(
-        tuple(indices),
+        tuple(entry.index for entry in entries),
         tuple(entry_hashes),
         size,
         root,
-        tuple(nodes),
+        nodes,
         hash_name=hash_name,
     )
 
@@ -2016,6 +2050,119 @@ def decode_audit_receipt(data: Any) -> AuditReceipt:
         items=tuple(items),
     )
     _check_receipt_proofs(receipt)
+    return receipt
+
+
+def encode_audit_batch(receipt: Any) -> bytes:
+    """Encode an :meth:`AuditLog.audit_batch` five-tuple into canonical bytes.
+
+    The encoding starts with the magic ``b"auditchain/batch/v1\\0"``; every
+    integer is an unsigned 8-byte big-endian value and every blob is a u64
+    byte length followed by the raw bytes (a zero length is an all-zero u64).
+    Fields appear in the order ``version`` (1), ``hash_name`` (UTF-8 blob),
+    ``size``, ``root`` blob and entry count; each :class:`Entry` is written as
+    ``index`` (u64), ``payload`` blob, ``previous_hash`` blob and
+    ``entry_hash`` blob, and the single shared proof follows as a node count
+    plus one blob per digest.
+
+    ``receipt`` must be the five-tuple
+    ``(hash_name, size, root, entries, proof)`` accepted by
+    :func:`verify_audit_batch` — anything else, or a field of the wrong type,
+    raises TypeError and structural violations (an unknown hash algorithm,
+    out-of-range or non-ascending indices, a missing last snapshot entry,
+    wrong digest widths or proof node count, ...) raise ValueError. Encoding is
+    read-only and deterministic: re-encoding a decoded tuple reproduces the
+    original bytes exactly, and integers outside the u64 range raise
+    ValueError. A structurally valid receipt whose content, root or proof does
+    not match encodes just as well; :func:`verify_audit_batch` reports False.
+    """
+    hash_name, size, root, entries, proof = _unpack_audit_batch(receipt)
+    parts = [
+        _BATCH_MAGIC,
+        _encode_u64(_BATCH_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "size"),
+        _encode_blob(root),
+        _encode_u64(len(entries), "entries count"),
+    ]
+    for entry in entries:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+    parts.append(_encode_u64(len(proof), "proof count"))
+    for node in proof:
+        parts.append(_encode_blob(node))
+    return b"".join(parts)
+
+
+def decode_audit_batch(data: Any) -> tuple[str, int, bytes, tuple[Entry, ...], tuple[bytes, ...]]:
+    """Decode bytes produced by :func:`encode_audit_batch`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad magic,
+    an unsupported version or hash algorithm, invalid UTF-8 in ``hash_name``,
+    truncation, trailing bytes, digest-length/width mismatches, entry indices
+    out of range, non-ascending or duplicate entries, a missing last entry —
+    including an entry count of 0 for a ``size > 0`` snapshot — an empty
+    snapshot carrying entries or proof nodes, or a proof node count that does
+    not fit the entries and size all raise ValueError. The decoded tuple has
+    the same ``(hash_name, size, root, entries, proof)`` shape as
+    :meth:`AuditLog.audit_batch` output and satisfies
+    :func:`verify_audit_batch` whenever the original did; a structurally sound
+    encoding whose entry content, root or proof does not match decodes fine,
+    and verification of the result returns False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_BATCH_MAGIC):
+        raise ValueError("not an auditchain batch-receipt encoding")
+    offset = len(_BATCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _BATCH_VERSION:
+        raise ValueError(f"unsupported batch receipt version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    entry_count = read_u64("entries count")
+    entries = []
+    for _ in range(entry_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        entries.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the batch receipt")
+    receipt = (hash_name, size, root, tuple(entries), proof)
+    # Apply the same structural contract as audit_batch / verify_audit_batch:
+    # algorithm, ranges, digest widths, ordering, last entry and node count.
+    _unpack_audit_batch(receipt)
     return receipt
 
 

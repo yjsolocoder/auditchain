@@ -262,6 +262,30 @@ verify_auth(log.entry(1), tag1, verifier)  # True
   认证或日志状态
 - 裁剪时同步删除已释放前缀的标签，保留段标签与后续演进不受影响
 
+### 可信签名检查点
+
+`sign_root` 用调用方按次提供的 Ed25519 私钥种子为某个前缀快照的 Merkle 根与
+链头签发不可变 `SignedRoot` 检查点；接收方凭预先信任的 32 字节公钥即可跨进程、
+跨存储介质离线验真，无需持有日志，私钥从不落盘：
+
+```python
+seed = ...                              # 32 字节 Ed25519 私钥种子（bytes）
+receipt = log.sign_root(seed)           # size 默认当前长度
+verify_signed_root(receipt, public_key)  # True：凭预置公钥离线验真
+```
+
+- 签名原文为 `M = D || 0x01 || B(hash_name) || U(size) || B(root) || B(head)`，
+  其中 `D = b"auditchain/signed-root/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`signature` 为 Ed25519 对 `M` 的 64 字节签名，
+  `version` 恒为 `1`
+- 空前缀（`size=0`）签署规范空树根与同宽零链头；已裁剪前缀内的快照无法重建，
+  抛 `ValueError`（与 `seal` 相同）
+- 私钥种子与公钥均为 32 字节 `bytes`；类型错抛 `TypeError`，长度、版本、
+  `size` 范围、算法或摘要宽度错抛 `ValueError`；验签公钥错误，或结构合法但
+  根、链头、签名被改，返回 `False`
+- `sign_root` 与 `verify_signed_root` 均为只读：不改变条目、`head`、认证状态、
+  Merkle 根或证明，也不保存私钥
+
 裁剪只释放内容、不改变逻辑：
 
 - `len(log)` 仍是累计条数；索引始终为绝对值（下一条仍接在原末尾之后）；`head`、`append`
@@ -300,6 +324,11 @@ python3 -m auditchain
   必含 `index == size - 1` 的末条（在 items 末尾）及其包含证明**，`size == 0` 时
   `items` 必须为 `()`；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或
   条目结构非法（含非空回执缺失末条、空回执携带条目）抛 `ValueError`
+- `SignedRoot(version, hash_name, size, root, head, signature)` — 不可变的可信签名
+  检查点，按字段相等、支持位置构造；`version` 恒为 `1`，`root` / `head` 为
+  `hash_name` 摘要宽度（空前缀为规范空树根与同宽零链头），`signature` 为 64 字节
+  Ed25519 签名；类型非法抛 `TypeError`，版本、负 `size`、未知算法、摘要宽度或
+  签名长度非法抛 `ValueError`
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -375,6 +404,11 @@ python3 -m auditchain
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
   - `seal(size=None)` — 为前 `size` 条（默认当前长度）生成 `PruneReceipt`，记录前缀根与末条摘要，
     空前缀记录该宽度的零摘要（sha256 下为 `GENESIS_HASH`）
+  - `sign_root(private_key, size=None)` — 用 32 字节 Ed25519 私钥种子为前 `size` 条
+    （默认当前长度）快照的根与链头签发不可变 `SignedRoot`；空前缀签署规范空树根与
+    同宽零链头，已裁剪前缀内的快照抛 `ValueError`；私钥类型错抛 `TypeError`、长度
+    不符抛 `ValueError`，`size` 类型或范围非法抛 `TypeError` / `ValueError`；
+    调用只读，私钥不保存
   - `audit_receipt(indices, size=None)` — 为快照中选定条目生成离线 `AuditReceipt`：
     `indices` 为可迭代的互异非 `bool` 整数，须满足 `retain_from <= index < size`；
     `size` 默认当前长度，快照须可重建；**任何 `size > 0` 的快照都自动并入末条
@@ -434,6 +468,11 @@ python3 -m auditchain
   顺序/重复、缺末条（含 `size>0 且 entries==()`）、空快照携带条目或证明节点数与
   `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容、证明或根不匹配返回
   `False`，匹配返回 `True`
+- `verify_signed_root(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥离线
+  核验 `SignedRoot`：按 `D || 0x01 || B(hash_name) || U(size) || B(root) || B(head)`
+  重建签名原文并验签，无需持有日志；`receipt` 不是 `SignedRoot` 或 `public_key`
+  类型错抛 `TypeError`，公钥长度不符抛 `ValueError`；公钥错误或结构合法但根、
+  链头、签名被改返回 `False`，真实检查点返回 `True`；调用只读
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；

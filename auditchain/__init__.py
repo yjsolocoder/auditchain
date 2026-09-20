@@ -1,17 +1,21 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / entry_digest / verify_inclusion / verify_consistency /
-verify_auth / verify_audit_receipt / encode_audit_receipt /
-decode_audit_receipt.
+Verifier / entry_digest / decrypt_entry / verify_inclusion /
+verify_consistency / verify_auth / verify_audit_receipt /
+encode_audit_receipt / decode_audit_receipt.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 __all__ = [
     "AuditLog",
@@ -22,6 +26,7 @@ __all__ = [
     "Verifier",
     "GENESIS_HASH",
     "decode_audit_receipt",
+    "decrypt_entry",
     "encode_audit_receipt",
     "entry_digest",
     "verify_audit_receipt",
@@ -41,6 +46,15 @@ _EMPTY_DOMAIN = b"auditchain/merkle-empty/v1"
 _AUTH_DOMAIN = b"auditchain/auth/v1"
 _EVOLVE_DOMAIN = b"auditchain/key-evolve/v1"
 _LOCATE_DOMAIN = b"auditchain/locate/v1"
+
+# Self-describing encrypted-entry envelope: magic, one algorithm byte
+# (0x01 = AES-256-GCM), the 12-byte nonce, then ciphertext || 16-byte tag.
+_ENCRYPTED_MAGIC = b"auditchain/encrypted-entry/v1\0"
+_AEAD_DOMAIN = b"auditchain/aead/v1\0"
+_AEAD_ALGORITHM = 0x01
+_KEY_BYTES = 32
+_NONCE_BYTES = 12
+_TAG_BYTES = 16
 
 # Binary framing of encode_audit_receipt / decode_audit_receipt: a fixed
 # magic, then unsigned 8-byte big-endian integers and length-prefixed blobs.
@@ -92,6 +106,24 @@ def _evolve_key(key: bytes, hash_name: str) -> bytes:
 def _locator_digest(payload: bytes, hash_name: str) -> bytes:
     """Content digest used only to locate candidate entries in the index."""
     return _hash_parts(hash_name, _LOCATE_DOMAIN, payload)
+
+
+def _check_aead_key(key: Any) -> bytes:
+    if not isinstance(key, bytes):
+        raise TypeError("key must be bytes")
+    if len(key) != _KEY_BYTES:
+        raise ValueError("key must be 32 bytes")
+    return key
+
+
+def _aead_aad(index: int, previous_hash: bytes) -> bytes:
+    """Associated data binding the ciphertext to its chain position."""
+    return (
+        _AEAD_DOMAIN
+        + bytes([_AEAD_ALGORITHM])
+        + index.to_bytes(_INDEX_BYTES, "big")
+        + previous_hash
+    )
 
 
 def _auth_tag(stage: int, entry_hash: bytes, key: bytes, hash_name: str) -> bytes:
@@ -391,6 +423,9 @@ class AuditLog:
         self._verifier_exported = False
         # Tags of retained entries, keyed by absolute index.
         self._tags: dict[int, AuthTag] = {}
+        # Every nonce ever used by encrypt(); kept across prunes so a nonce
+        # can never be reused under this log's history.
+        self._nonces: set[bytes] = set()
 
     @property
     def hash_name(self) -> str:
@@ -423,6 +458,52 @@ class AuditLog:
         self._entries.append(entry)
         self._index.setdefault(_locator_digest(material, self._hash_name), []).append(index)
         self._head = entry.entry_hash
+        return entry
+
+    def encrypt(self, payload: Any, key: bytes, nonce: bytes | None = None) -> Entry:
+        """Append one AES-256-GCM encrypted record and return its entry.
+
+        ``payload`` follows the same rules as :meth:`append` (bytes,
+        bytearray or str). ``key`` must be 32 bytes and is used for this call
+        only — it is never stored. ``nonce`` must be 12 bytes and must never
+        repeat within this log's history; ``None`` (the default) draws a
+        fresh nonce from ``os.urandom(12)``. The stored payload is the
+        self-describing envelope ``magic || 0x01 || nonce || ciphertext ||
+        tag``; the AAD binds the domain separator, algorithm byte, absolute
+        index and the current chain head, and the envelope itself feeds
+        ``entry_digest``, so pruning and audit receipts handle encrypted
+        entries exactly like plain ones. Wrong types raise TypeError; a bad
+        key/nonce length or a repeated nonce raises ValueError. A failed call
+        leaves the log unchanged.
+        """
+        material = _as_bytes(payload)
+        key = _check_aead_key(key)
+        if nonce is None:
+            while True:
+                nonce = os.urandom(_NONCE_BYTES)
+                if nonce not in self._nonces:
+                    break
+        else:
+            if not isinstance(nonce, bytes):
+                raise TypeError("nonce must be bytes")
+            if len(nonce) != _NONCE_BYTES:
+                raise ValueError("nonce must be 12 bytes")
+            if nonce in self._nonces:
+                raise ValueError("nonce has already been used for this log")
+        index = len(self)
+        aad = _aead_aad(index, self._head)
+        ciphertext = AESGCM(key).encrypt(nonce, material, aad)
+        envelope = _ENCRYPTED_MAGIC + bytes([_AEAD_ALGORITHM]) + nonce + ciphertext
+        entry = Entry(
+            index=index,
+            payload=envelope,
+            previous_hash=self._head,
+            entry_hash=entry_digest(index, self._head, envelope, hash_name=self._hash_name),
+        )
+        self._entries.append(entry)
+        self._index.setdefault(_locator_digest(envelope, self._hash_name), []).append(index)
+        self._head = entry.entry_hash
+        self._nonces.add(nonce)
         return entry
 
     @property
@@ -1257,3 +1338,63 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
         key = _evolve_key(key, verifier.hash_name)
     expected = _auth_tag(tag.stage, entry.entry_hash, key, verifier.hash_name)
     return hmac.compare_digest(expected, tag.tag)
+
+
+def decrypt_entry(entry: Any, key: Any, *, hash_name: str = "sha256") -> bytes:
+    """Decrypt one entry written by :meth:`AuditLog.encrypt`.
+
+    ``entry`` must be an :class:`Entry` whose payload is the self-describing
+    envelope and ``key`` the 32-byte AES-256-GCM key used to encrypt it; the
+    key is used for this call only. The entry digest is first recomputed
+    under ``hash_name`` and compared with ``entry.entry_hash``, then the
+    envelope's magic, algorithm byte, nonce and tag are checked and the
+    ciphertext is opened against the AAD rebuilt from ``entry.index`` and
+    ``entry.previous_hash``. The plaintext is returned as ``bytes`` (the
+    exact bytes :meth:`AuditLog.encrypt` stored, per the append payload
+    rules). Wrong types raise TypeError; an unknown hash algorithm, wrong
+    digest/key lengths, a malformed envelope, an unsupported algorithm byte,
+    a digest mismatch or an authentication failure raise ValueError. The
+    function is read-only and never touches any log state.
+    """
+    if not isinstance(entry, Entry):
+        raise TypeError("entry must be an Entry")
+    key = _check_aead_key(key)
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    try:
+        digest_size = hashlib.new(hash_name).digest_size
+    except ValueError as error:
+        raise ValueError(f"unknown hash algorithm: {hash_name}") from error
+    if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+        raise TypeError("entry.index must be an integer")
+    if entry.index < 0:
+        raise ValueError("entry.index must be non-negative")
+    for name in ("payload", "previous_hash", "entry_hash"):
+        if not isinstance(getattr(entry, name), (bytes, bytearray)):
+            raise TypeError(f"entry.{name} must be bytes")
+    if len(entry.previous_hash) != digest_size:
+        raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+    if len(entry.entry_hash) != digest_size:
+        raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+    payload = bytes(entry.payload)
+    previous_hash = bytes(entry.previous_hash)
+    recomputed = entry_digest(
+        entry.index, previous_hash, payload, hash_name=hash_name
+    )
+    if not hmac.compare_digest(recomputed, bytes(entry.entry_hash)):
+        raise ValueError("entry digest does not match entry_hash")
+    header = len(_ENCRYPTED_MAGIC) + 1 + _NONCE_BYTES
+    if not payload.startswith(_ENCRYPTED_MAGIC):
+        raise ValueError("not an auditchain encrypted entry")
+    if len(payload) < header + _TAG_BYTES:
+        raise ValueError("truncated encrypted entry")
+    algorithm = payload[len(_ENCRYPTED_MAGIC)]
+    if algorithm != _AEAD_ALGORITHM:
+        raise ValueError(f"unsupported algorithm byte: {algorithm:#04x}")
+    nonce = payload[len(_ENCRYPTED_MAGIC) + 1 : header]
+    ciphertext = payload[header:]
+    aad = _aead_aad(entry.index, previous_hash)
+    try:
+        return AESGCM(key).decrypt(nonce, ciphertext, aad)
+    except InvalidTag as error:
+        raise ValueError("encrypted entry authentication failed") from error

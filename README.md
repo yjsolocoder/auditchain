@@ -4,7 +4,8 @@
 
 ## 环境
 
-Python 3.10+，只依赖标准库（`hashlib` / `hmac`）。
+Python 3.10+，依赖 `cryptography`（AES-256-GCM 加密追加），其余为标准库
+（`hashlib` / `hmac`）。
 
 ## 使用
 
@@ -105,6 +106,31 @@ verify_auth(log.entry(1), tag1, verifier)  # True
   认证或日志状态
 - 裁剪时同步删除已释放前缀的标签，保留段标签与后续演进不受影响
 
+### AES-256-GCM 加密追加
+
+`encrypt(payload, key, nonce=None)` 以 AES-256-GCM（`cryptography.AESGCM`）加密后追加，
+`Entry.payload` 保存自描述密文封装；`key` 为 32 字节 `bytes`，按次传入、绝不保存；
+`nonce` 为 12 字节 `bytes` 且在同一日志历史中不得重复，`None`（默认）用
+`os.urandom(12)` 现取。普通 `append` 行为不变，裁剪与审计回执原样保留密文。
+
+```python
+key = os.urandom(32)
+entry = log.encrypt("secret payload", key)     # nonce 随机生成
+entry.payload                                  # 自描述封装，不是明文
+decrypt_entry(entry, key)                      # b"secret payload"
+log.find(b"secret payload")                    # ()：find 只匹配封装，不做解密检索
+```
+
+封装依次为魔数 `b"auditchain/encrypted-entry/v1\0"`、算法号 `0x01`
+（AES-256-GCM）、12 字节 nonce、AESGCM 输出的 `ciphertext || 16 字节 tag`。
+AAD 依次为 `b"auditchain/aead/v1\0"`、`0x01`、index 的 u64 大端、
+`previous_hash`，把密文绑定到链上位置；封装本身作为 payload 参与
+`entry_digest`，因此 `verify` / Merkle 证明 / 审计回执对加密条目与明文条目
+一视同仁。明文规则同 `append`（`bytes` / `bytearray` / `str`）。
+
+类型错误抛 `TypeError`；key/nonce 长度不符、nonce 重复、算法号、封装、
+条目摘要或 AEAD 认证不符抛 `ValueError`；任何失败都不改变日志状态。
+
 裁剪只释放内容、不改变逻辑：
 
 - `len(log)` 仍是累计条数；索引始终为绝对值（下一条仍接在原末尾之后）；`head`、`append`
@@ -144,6 +170,11 @@ python3 -m auditchain
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
   空 `key` 抛 `ValueError`
   - `append(payload)` — 接受 `bytes` 或 `str`（UTF-8 编码），返回新条目
+  - `encrypt(payload, key, nonce=None)` — AES-256-GCM 加密追加：`key` 为 32 字节
+    `bytes`、按次传入不保存；`nonce` 为 12 字节 `bytes` 且历史不重复，`None` 用
+    `os.urandom(12)`；`payload` 规则同 `append`，返回条目的 `payload` 为自描述
+    封装（魔数 + `0x01` + nonce + 密文 || tag）；类型错误抛 `TypeError`，长度不符
+    或 nonce 重复抛 `ValueError`，失败不改变状态
   - `entries()` / `entry(index)` / `__len__()` / `__iter__()` / `head` 属性
   - `find(payload, start=None, stop=None)` — 在保留段内按内容查找，返回匹配条目的绝对索引
     升序元组，无匹配为 `()`；`payload` 只接受 `bytes` 或 `str`（UTF-8 编码），其他类型抛
@@ -178,6 +209,11 @@ python3 -m auditchain
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
     回执不匹配或无有效回执抛 `ValueError`
 - `entry_digest(index, previous_hash, payload, *, hash_name)` — 条目摘要计算
+- `decrypt_entry(entry, key, *, hash_name="sha256")` — 离线解密 `encrypt` 写入的条目：
+  先在 `hash_name` 下重算 `entry_digest` 核对 `entry.entry_hash`，再解析封装并依
+  AAD（域分隔符 + 算法号 + index + previous_hash）打开密文，返回明文 `bytes`；
+  入参类型错误抛 `TypeError`，未知算法、摘要/key 长度不符、封装或算法号非法、
+  摘要不符或 AEAD 认证失败抛 `ValueError`；只读，不触碰任何日志状态
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
@@ -208,8 +244,10 @@ Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry
 ## 限制
 
 线性哈希链加顺序遍历校验，保留段查询是 `O(n)` 的（证明生成随保留长度增长）。
-已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建；条目内容明文存储，
-没有加密。认证标签提供前向安全：stage-0 密钥需在首次演进前通过
+已封存前缀的 payload 被释放后不可再取回，其前缀快照也无法重建；`append` 写入的
+条目内容明文存储，需要保密时改用 `encrypt`（密文封装同样参与哈希链与 Merkle 树，
+但 `find` 只匹配封装字节，不做解密检索；解密密钥由调用方自行保管，日志不保存）。
+认证标签提供前向安全：stage-0 密钥需在首次演进前通过
 `export_verifier()` 另行交给验证方，日志自身演进后不保留任何旧密钥。
 
 ## 测试

@@ -76,6 +76,27 @@ log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证�
 `receipt.matches(entry)` 当且仅当 `entry.index == 0` 且
 `entry.previous_hash == GENESIS_HASH`。
 
+### 保留策略（封存 + 裁剪一步原子完成）
+
+`apply_retention(value, *, mode="retain_from")` 先按模式算出保留点，再原子地
+封存并裁剪，成功时等价于 `receipt = log.seal(target)` 后
+`log.prune(target, receipt)`，返回该 `PruneReceipt`：
+
+```python
+receipt = log.apply_retention(2)              # mode="retain_from"：target = value = 2
+receipt = log.apply_retention(3, mode="keep_last")  # 只保留最新 3 条
+```
+
+- `mode` 只接受 `"retain_from"` 或 `"keep_last"`：
+  - `"retain_from"`（默认）令目标保留点等于 `value`，要求
+    `retain_from <= value <= len(log)`（保留点只能前移）
+  - `"keep_last"` 令目标保留点等于 `max(retain_from, len(log) - value)`，
+    要求 `value >= 0`；保留条数超过日志长度时为空操作（已释放前缀不可恢复）
+- `value` 须为非 `bool` 整数；`value` 或 `mode` 类型非法抛 `TypeError`，
+  未知 `mode` 或违反上述范围抛 `ValueError`
+- 任何失败都在修改状态前抛出：条目、认证状态、定位索引、Merkle 状态与
+  nonce 使用记录全部保持不变（加密 nonce 跨裁剪仍不可复用）
+
 ### 离线审计回执
 
 ```python
@@ -221,6 +242,14 @@ python3 -m auditchain
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
     回执不匹配或无有效回执抛 `ValueError`
+  - `apply_retention(value, *, mode="retain_from")` — 按保留策略原子完成封存与裁剪，
+    返回 `PruneReceipt`，成功等价于 `seal(target)` 后 `prune(target, receipt)`。
+    `mode="retain_from"` 令 `target = value`，要求
+    `retain_from <= value <= len(log)`；`mode="keep_last"` 令
+    `target = max(retain_from, len(log) - value)`，要求 `value >= 0`。
+    `value` 须为非 `bool` 整数，`mode` 须为字符串；类型非法抛 `TypeError`，
+    未知 `mode` 或越界抛 `ValueError`；任何失败均不改变日志、认证、索引、
+    Merkle 与 nonce 状态
 - `entry_digest(index, previous_hash, payload, *, hash_name)` — 条目摘要计算
 - `decrypt_entry(entry, key, *, hash_name="sha256")` — 解密 `AuditLog.encrypt` 产生的
   条目，无需持有日志：先校验封装格式与 `entry_hash == entry_digest(...)`（封装作为

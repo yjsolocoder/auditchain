@@ -167,6 +167,15 @@ python3 -m auditchain
   `entry_digest` 并核验全部包含证明与快照根，空快照只接受规范空树根；结构合法但条目内容、
   证明或根不符返回 `False`；入参不是 `AuditReceipt` 抛 `TypeError`，字段结构、摘要长度或
   证明结构非法抛 `ValueError`
+- `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — `AuditReceipt` 的规范
+  字节编码与解码。编码以魔数 `b"auditchain/audit-receipt/v1\0"` 开头，其后整数皆为 8 字节
+  无符号大端，blob 为 u64 字节长度后接原始字节（零长度即全零 u64）；字段顺序为
+  `version`、`hash_name`（UTF-8 blob）、`size`、`root` blob、条目计数，每个条目依次为
+  `Entry.index`、payload blob、previous_hash blob、entry_hash blob、证明计数及各摘要 blob。
+  编码是确定性的：解码后再编码字节完全相同。`encode` 入参不是 `AuditReceipt` 抛
+  `TypeError`，整数超出 u64 抛 `ValueError`；`decode` 只接受 `bytes`（其他类型抛
+  `TypeError`），魔数、版本、未知算法、非法 UTF-8、截断、尾随字节、长度溢出、摘要长度、
+  索引顺序/重复、缺末条或证明结构非法均抛 `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

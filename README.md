@@ -42,6 +42,19 @@ log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证�
 `receipt.matches(entry)` 当且仅当 `entry.index == 0` 且
 `entry.previous_hash == GENESIS_HASH`。
 
+### 离线审计回执
+
+```python
+receipt = log.audit_receipt([1, 3])     # 自动并入末条；size 默认当前长度
+receipt.items                           # ((Entry, proof), ...) 按绝对索引升序
+verify_audit_receipt(receipt)           # True：无需持有日志即可离线核验
+```
+
+回执为冻结的 `AuditReceipt(version=1, hash_name, size, root, items)`，记录快照
+Merkle 根与所选条目的包含证明；`verify_audit_receipt` 重算每条 `entry_digest`
+并核验全部包含证明、根与末条摘要。空选择（`[]`）得到 `items == ()` 的回执；
+`size=0` 的空快照回执只接受规范空树根。签发是只读的，不影响日志任何状态。
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -104,6 +117,10 @@ python3 -m auditchain
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
     是返回 `True`，否则 `False`；空前缀回执匹配索引为 0、前驱为 `GENESIS_HASH` 的创世条目；
     入参不是 `Entry` 抛 `TypeError`
+- `AuditReceipt(version, hash_name, size, root, items)` — 不可变的离线审计回执，
+  按字段相等、支持位置构造；`version` 恒为 `1`，`root` 为快照 Merkle 根，
+  `items` 为按绝对索引升序的 `(Entry, 证明元组)` 元组，非空回执必含 `index == size - 1`
+  的末条；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或条目结构非法抛 `ValueError`
 - `GENESIS_HASH` — 全零的起始前驱摘要
 - `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
@@ -133,6 +150,11 @@ python3 -m auditchain
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
   - `seal(size=None)` — 为前 `size` 条（默认当前长度）生成 `PruneReceipt`，记录前缀根与末条摘要，
     空前缀记录 `GENESIS_HASH`
+  - `audit_receipt(indices, size=None)` — 为快照中选定条目生成离线 `AuditReceipt`：
+    `indices` 为可迭代的互异非 `bool` 整数，须满足 `retain_from <= index < size`；
+    `size` 默认当前长度，快照须可重建；非空选择自动并入末条（`index == size - 1`），
+    空选择及空快照得到 `items == ()`；条目按绝对索引升序携带各自包含证明；
+    调用只读，类型非法抛 `TypeError`，越界或重复抛 `ValueError`
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -141,6 +163,10 @@ python3 -m auditchain
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
+- `verify_audit_receipt(receipt)` — 无需持有日志即可验证 `AuditReceipt`：重算每个条目的
+  `entry_digest` 并核验全部包含证明与快照根，空快照只接受规范空树根；结构合法但条目内容、
+  证明或根不符返回 `False`；入参不是 `AuditReceipt` 抛 `TypeError`，字段结构、摘要长度或
+  证明结构非法抛 `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

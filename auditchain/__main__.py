@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import AuditLog, entry_digest
+from . import AuditLog, entry_digest, verify_audit_receipt
 
 RECORDS = [
     "agent started",
@@ -32,6 +32,12 @@ def main() -> int:
     print(f"  recomputing entry #2 with changed payload gives")
     print(f"    {forged.hex()[:32]}…")
     print(f"  which differs from the recorded hash: {forged != log.entry(2).entry_hash}")
+
+    print()
+    print("offline audit receipt:")
+    audit = log.audit_receipt([1, 3])
+    print(f"  size={audit.size} items={[entry.index for entry, _ in audit.items]}")
+    print(f"  verifies without the log: {verify_audit_receipt(audit)}")
 
     print()
     print("verifiable prefix pruning:")

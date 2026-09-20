@@ -1,7 +1,8 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / PruneReceipt / AuthTag / Verifier /
-entry_digest / verify_inclusion / verify_consistency / verify_auth.
+Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
+Verifier / entry_digest / verify_inclusion / verify_consistency /
+verify_auth / verify_audit_receipt.
 """
 
 from __future__ import annotations
@@ -13,12 +14,14 @@ from typing import Any, Iterator, Sequence
 
 __all__ = [
     "AuditLog",
+    "AuditReceipt",
     "AuthTag",
     "Entry",
     "PruneReceipt",
     "Verifier",
     "GENESIS_HASH",
     "entry_digest",
+    "verify_audit_receipt",
     "verify_auth",
     "verify_consistency",
     "verify_inclusion",
@@ -38,6 +41,9 @@ _LOCATE_DOMAIN = b"auditchain/locate/v1"
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
+
+# Audit receipt format version; bump when the field layout changes.
+_RECEIPT_VERSION = 1
 
 
 def _as_bytes(payload: Any) -> bytes:
@@ -210,6 +216,33 @@ class PruneReceipt:
         if not isinstance(entry, Entry):
             raise TypeError("entry must be an Entry")
         return entry.index == self.size and entry.previous_hash == self.chain_hash
+
+
+@dataclass(frozen=True)
+class AuditReceipt:
+    """Immutable offline receipt for selected entries of a snapshot.
+
+    Issued by :meth:`AuditLog.audit_receipt`; verified without the log by
+    :func:`verify_audit_receipt`. Equality, hashing and construction are
+    purely by field, so a receipt rebuilt from its fields compares equal to
+    the original.
+
+    - ``version``: receipt format version, always 1.
+    - ``hash_name``: hash algorithm of the log that issued the receipt.
+    - ``size``: snapshot size the receipt anchors.
+    - ``root``: Merkle root of the first ``size`` entries.
+    - ``items``: ``(Entry, proof)`` pairs ordered by ascending absolute
+      index, where ``proof`` is the tuple of sibling digests placing the
+      entry inside the snapshot. A non-empty snapshot always carries the
+      entry at ``index == size - 1`` as its last item; an empty snapshot
+      carries ``()``.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    items: tuple
 
 
 @dataclass(frozen=True)
@@ -732,6 +765,69 @@ class AuditLog:
         self._retain_from = retain_from
         self._checkpoint_head = expected_chain
 
+    def audit_receipt(self, indices: Any, size: int | None = None) -> AuditReceipt:
+        """Issue an :class:`AuditReceipt` for entries of the first ``size`` records.
+
+        ``size`` defaults to the current log length and must satisfy
+        ``0 <= size <= len(log)``; a non-empty snapshot must still be
+        rebuildable, i.e. ``size > retain_from`` (an empty snapshot is a
+        content-independent constant and always works). ``indices`` is an
+        iterable of distinct non-bool integers with
+        ``retain_from <= index < size``; a non-empty snapshot automatically
+        adds ``size - 1`` so the receipt always anchors the snapshot head.
+        Items come back ordered by ascending absolute index; an empty
+        snapshot yields ``items == ()``.
+
+        The call is read-only: entries, head, authentication state, Merkle
+        roots and proofs are all left untouched. Wrong types raise
+        TypeError; out-of-range sizes or indices, duplicates and pruned
+        snapshots raise ValueError.
+        """
+        if size is None:
+            size = len(self)
+        elif not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        if not 0 <= size <= len(self):
+            raise ValueError(f"size must be within 0..{len(self)}")
+        if 0 < size <= self._retain_from:
+            raise ValueError(
+                f"snapshot at size {size} was pruned (entries are retained from {self._retain_from})"
+            )
+        if isinstance(indices, (str, bytes, bytearray)):
+            raise TypeError("indices must be an iterable of integers")
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        picked: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be integers")
+            if not self._retain_from <= index < size:
+                raise ValueError(
+                    f"index {index} must satisfy retain_from ({self._retain_from}) "
+                    f"<= index < size ({size})"
+                )
+            if index in picked:
+                raise ValueError(f"duplicate index {index}")
+            picked.add(index)
+        if size > 0:
+            picked.add(size - 1)
+        items = tuple(
+            (
+                self._entries[index - self._retain_from],
+                self.inclusion_proof(index, size),
+            )
+            for index in sorted(picked)
+        )
+        return AuditReceipt(
+            version=_RECEIPT_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=self.merkle_root(size),
+            items=items,
+        )
+
 
 def _check_digest(value: Any, name: str, digest_size: int) -> bytes:
     if not isinstance(value, (bytes, bytearray)):
@@ -885,6 +981,103 @@ def verify_consistency(
     if sn != 0:
         raise ValueError("proof has too few nodes")
     return hmac.compare_digest(fr, old_root) and hmac.compare_digest(sr, new_root)
+
+
+def verify_audit_receipt(receipt: Any) -> bool:
+    """Verify an :class:`AuditReceipt` without holding the log.
+
+    Recomputes every carried entry's digest from its fields and replays its
+    inclusion proof against the receipt's Merkle root, so a receipt only
+    verifies when the snapshot root, the anchored last entry and every
+    listed entry genuinely belong together. A receipt for the empty
+    snapshot must carry no items and the canonical empty-tree root.
+
+    Structural problems raise TypeError (wrong field or element types) or
+    ValueError (unsupported version, negative or out-of-range indices,
+    duplicated or unsorted items, a missing snapshot head, an unknown hash
+    algorithm, wrong digest lengths or a malformed proof). A structurally
+    valid receipt whose content, proofs or root do not match returns False.
+    """
+    if not isinstance(receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt")
+    if not isinstance(receipt.version, int) or isinstance(receipt.version, bool):
+        raise TypeError("receipt.version must be an integer")
+    if receipt.version != _RECEIPT_VERSION:
+        raise ValueError(f"unsupported receipt version: {receipt.version}")
+    if not isinstance(receipt.hash_name, str):
+        raise TypeError("receipt.hash_name must be a string")
+    try:
+        digest_size = hashlib.new(receipt.hash_name).digest_size
+    except ValueError as error:
+        raise ValueError(f"unknown hash algorithm: {receipt.hash_name}") from error
+    if not isinstance(receipt.size, int) or isinstance(receipt.size, bool):
+        raise TypeError("receipt.size must be an integer")
+    if receipt.size < 0:
+        raise ValueError("receipt.size must be non-negative")
+    root = _check_digest(receipt.root, "receipt.root", digest_size)
+    if not isinstance(receipt.items, tuple):
+        raise TypeError("receipt.items must be a tuple")
+
+    items: list[tuple[Entry, tuple[bytes, ...]]] = []
+    previous_index = -1
+    for item in receipt.items:
+        if not isinstance(item, tuple):
+            raise TypeError("receipt items must be (Entry, proof) tuples")
+        if len(item) != 2:
+            raise ValueError("receipt items must be (Entry, proof) pairs")
+        entry, proof = item
+        if not isinstance(entry, Entry):
+            raise TypeError("receipt item entry must be an Entry")
+        if not isinstance(proof, tuple):
+            raise TypeError("receipt item proof must be a tuple of digests")
+        if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+            raise TypeError("entry.index must be an integer")
+        if entry.index < 0:
+            raise ValueError("entry.index must be non-negative")
+        if entry.index >= _MAX_STAGE:
+            raise ValueError("entry.index must be less than 2**64")
+        if entry.index >= receipt.size:
+            raise ValueError("entry.index must satisfy 0 <= index < receipt.size")
+        if entry.index <= previous_index:
+            raise ValueError("receipt items must be distinct and ascending by index")
+        previous_index = entry.index
+        for name in ("previous_hash", "entry_hash", "payload"):
+            if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                raise TypeError(f"entry.{name} must be bytes")
+        if len(entry.previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        if len(entry.entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        siblings = tuple(
+            _check_digest(sibling, "proof element", digest_size) for sibling in proof
+        )
+        items.append((entry, siblings))
+
+    if receipt.size == 0:
+        empty_root = _hash_parts(receipt.hash_name, _EMPTY_DOMAIN)
+        return hmac.compare_digest(root, empty_root)
+    if not items or items[-1][0].index != receipt.size - 1:
+        raise ValueError("a non-empty snapshot receipt must contain index size - 1")
+
+    for entry, siblings in items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=receipt.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        if not verify_inclusion(
+            entry.entry_hash,
+            entry.index,
+            receipt.size,
+            root,
+            siblings,
+            hash_name=receipt.hash_name,
+        ):
+            return False
+    return True
 
 
 def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:

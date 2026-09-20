@@ -42,6 +42,24 @@ log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证�
 `receipt.matches(entry)` 当且仅当 `entry.index == 0` 且
 `entry.previous_hash == GENESIS_HASH`。
 
+### 离线审计回执
+
+`audit_receipt(indices, size=None)` 为前 `size` 条快照（默认当前长度）签发一份
+可离线核验的回执；非空快照自动补入末条 `size - 1`，空快照 `items == ()`：
+
+```python
+receipt = log.audit_receipt([1, 3])     # 自动加入末条索引，按绝对索引升序
+verify_audit_receipt(receipt)           # True：无需持有日志
+```
+
+- `AuditReceipt(version, hash_name, size, root, items)` 为冻结值对象，`version` 恒为 1，
+  按字段相等、支持位置构造；`items` 是 `(Entry, 包含证明)` 元组
+- `indices` 只收非 `bool` 整数、互异且满足 `retain_from <= index < size`；类型非法抛
+  `TypeError`，越界、重复或快照已裁剪抛 `ValueError`；调用只读，不改变日志任何状态
+- `verify_audit_receipt` 重算每个条目的 `entry_digest` 并回放全部包含证明，核验根、
+  字段结构与末条摘要；结构非法抛 `TypeError`/`ValueError`，结构合法但内容、证明或根
+  不符返回 `False`
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -104,6 +122,9 @@ python3 -m auditchain
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
     是返回 `True`，否则 `False`；空前缀回执匹配索引为 0、前驱为 `GENESIS_HASH` 的创世条目；
     入参不是 `Entry` 抛 `TypeError`
+- `AuditReceipt(version, hash_name, size, root, items)` — 不可变的离线审计回执，
+  `version` 恒为 1，`items` 为按绝对索引升序的 `(Entry, 包含证明)` 元组，
+  非空快照末项必为 `index == size - 1`，空快照为 `()`
 - `GENESIS_HASH` — 全零的起始前驱摘要
 - `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
@@ -128,6 +149,10 @@ python3 -m auditchain
   - `export_verifier()` — 仅可在首次演进前调用一次，返回不可变 `Verifier`；
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
+  - `audit_receipt(indices, size=None)` — 为前 `size` 条快照（默认当前长度）签发离线
+    `AuditReceipt`；`indices` 为可迭代的非 `bool` 整数、互异且满足
+    `retain_from <= index < size`，非空快照自动补入 `size - 1`；类型非法抛
+    `TypeError`，越界、重复或快照已裁剪抛 `ValueError`；调用只读
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `consistency_proof(old_size, new_size=None)` — 两个前缀快照之间的一致性证明，不可变元组；
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
@@ -141,6 +166,10 @@ python3 -m auditchain
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_consistency(old_size, old_root, new_size, new_root, proof, *, hash_name="sha256")` — 只凭两次快照的大小、根与证明验证后者由前者追加形成，无需日志；
   结构非法抛 `TypeError`/`ValueError`，结构合法但不匹配返回 `False`
+- `verify_audit_receipt(receipt)` — 无需日志核验 `AuditReceipt`：重算每个条目的
+  `entry_digest` 并回放全部包含证明，核验根、字段结构与末条摘要；类型非法抛
+  `TypeError`，版本、范围、重复、未知算法、摘要长度或证明结构非法抛 `ValueError`，
+  结构合法但内容、证明或根不符返回 `False`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

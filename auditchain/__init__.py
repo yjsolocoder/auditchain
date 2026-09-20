@@ -376,9 +376,10 @@ class AuditReceipt:
     - ``root``: Merkle root of that snapshot,
     - ``items``: ``(Entry, proof)`` pairs in ascending absolute index order,
       where ``proof`` is the tuple of sibling digests of the entry's
-      inclusion proof within the snapshot. A non-empty receipt always
-      carries the last entry of the snapshot (index ``size - 1``); an empty
-      snapshot carries ``items == ()``.
+      inclusion proof within the snapshot. Every receipt for a non-empty
+      snapshot carries its last entry (index ``size - 1``) with its inclusion
+      proof; only an empty snapshot (``size == 0``) carries ``items == ()``,
+      and an empty snapshot never carries any items.
     """
 
     version: int
@@ -435,9 +436,17 @@ class AuditReceipt:
                     raise TypeError("proof element must be bytes")
                 if len(sibling) != digest_size:
                     raise ValueError(f"proof element must be {digest_size} bytes")
-        if self.items and self.items[-1][0].index != self.size - 1:
+        if self.size == 0:
+            if self.items:
+                raise ValueError("an empty snapshot receipt must carry no items")
+        elif not self.items or self.items[-1][0].index != self.size - 1:
+            # A non-empty snapshot receipt must carry the entry at
+            # index size - 1 with its inclusion proof; an items==() receipt
+            # for size > 0 would attest to an arbitrary root with no
+            # evidence at all and must never be constructible.
             raise ValueError(
-                "a non-empty receipt must include the entry at index size - 1"
+                "a receipt for a non-empty snapshot must include the entry "
+                "at index size - 1"
             )
 
 
@@ -1118,13 +1127,14 @@ class AuditLog:
 
         ``indices`` is an iterable of distinct non-bool absolute indices,
         each satisfying ``retain_from <= index < size``; ``size`` defaults to
-        the current log length and the snapshot must still be rebuildable. A
-        non-empty selection automatically also includes the last entry of the
-        snapshot (index ``size - 1``); an empty selection — and always an
-        empty snapshot — yields ``items == ()``. Items are stored in
-        ascending absolute index order, each paired with its inclusion proof
-        within the snapshot. The call is read-only: entries, head,
-        authentication state, Merkle roots and proofs are left untouched.
+        the current log length and the snapshot must still be rebuildable.
+        Any receipt for a non-empty snapshot automatically also includes the
+        last entry of the snapshot (index ``size - 1``) with its inclusion
+        proof, even when ``indices`` is empty; only an empty snapshot yields
+        ``items == ()``. Items are stored in ascending absolute index order,
+        each paired with its inclusion proof within the snapshot. The call is
+        read-only: entries, head, authentication state, Merkle roots and
+        proofs are left untouched.
         """
         size = self._resolve_size(size)
         try:
@@ -1143,8 +1153,10 @@ class AuditLog:
                     f"<= index < size ({size})"
                 )
             selected.add(index)
-        if selected:
-            # A non-empty receipt always carries the last snapshot entry.
+        if size > 0:
+            # A non-empty snapshot receipt always carries the last entry and
+            # its inclusion proof, so an empty selection can never attest to a
+            # root without evidence.
             selected.add(size - 1)
         root = self.merkle_root(size)
         items = tuple(
@@ -1405,17 +1417,27 @@ def verify_audit_receipt(receipt: Any) -> bool:
 
     Recomputes every item's entry digest from the entry's fields and
     re-verifies every inclusion proof against the receipt's snapshot root;
-    an empty snapshot only accepts the canonical empty-tree root. A
-    structurally valid receipt whose entry content, proofs or root do not
-    match returns False; malformed input raises TypeError or ValueError
+    the last snapshot entry (index ``size - 1``) must be carried with a valid
+    inclusion proof, so a non-empty snapshot can never be attested with zero
+    evidence. An empty snapshot only accepts the canonical empty-tree root.
+    A structurally valid receipt whose entry content, proofs or root do not
+    match — including a size > 0 receipt whose items omit the last entry —
+    returns False; malformed input raises TypeError or ValueError
     (see :class:`AuditReceipt` for the structural rules).
     """
     if not isinstance(receipt, AuditReceipt):
         raise TypeError("receipt must be an AuditReceipt")
     if receipt.size == 0:
+        if receipt.items:
+            return False
         return hmac.compare_digest(
             receipt.root, _hash_parts(receipt.hash_name, _EMPTY_DOMAIN)
         )
+    if not receipt.items or receipt.items[-1][0].index != receipt.size - 1:
+        # A receipt built bypassing the constructor (size > 0, items missing
+        # the last entry) attests nothing; reject it rather than accepting an
+        # arbitrary root on zero evidence.
+        return False
     for entry, proof in receipt.items:
         recomputed = entry_digest(
             entry.index,
@@ -1461,6 +1483,13 @@ def _proof_level_count(index: int, size: int) -> int:
 
 
 def _check_receipt_proofs(receipt: AuditReceipt) -> None:
+    if receipt.size == 0:
+        if receipt.items:
+            raise ValueError("an empty snapshot receipt must carry no items")
+    elif not receipt.items or receipt.items[-1][0].index != receipt.size - 1:
+        raise ValueError(
+            "a receipt for a non-empty snapshot must include the entry at index size - 1"
+        )
     for entry, proof in receipt.items:
         expected = _proof_level_count(entry.index, receipt.size)
         if len(proof) != expected:
@@ -1513,10 +1542,10 @@ def decode_audit_receipt(data: Any) -> AuditReceipt:
     ``data`` must be ``bytes`` (anything else raises TypeError). A bad magic,
     an unsupported version or hash algorithm, invalid UTF-8 in ``hash_name``,
     truncation, trailing bytes, digest-length mismatches, non-ascending or
-    duplicate item indices, a missing last entry and structurally invalid
-    proofs all raise ValueError. The decoded receipt's fields equal the
-    originally encoded ones and satisfy :func:`verify_audit_receipt` whenever
-    the original did.
+    duplicate item indices, a missing last entry — including ``items == ()``
+    for a size > 0 snapshot — and structurally invalid proofs all raise
+    ValueError. The decoded receipt's fields equal the originally encoded
+    ones and satisfy :func:`verify_audit_receipt` whenever the original did.
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")

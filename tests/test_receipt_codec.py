@@ -66,9 +66,9 @@ class EncodeAuditReceiptTest(unittest.TestCase):
 
     def test_integer_overflow(self):
         receipt = self.log.audit_receipt([1])
-        big = AuditReceipt(1, "sha256", 1 << 64, receipt.root, ())
+        # size > 0 with empty items is rejected by the constructor itself.
         with self.assertRaises(ValueError):
-            encode_audit_receipt(big)
+            AuditReceipt(1, "sha256", 1 << 64, receipt.root, ())
         entry = Entry(1 << 64, b"x", receipt.root, receipt.root)
         oversized = AuditReceipt(1, "sha256", (1 << 64) + 1, receipt.root, ((entry, ()),))
         with self.assertRaises(ValueError):
@@ -198,6 +198,24 @@ class DecodeAuditReceiptTest(unittest.TestCase):
         item = (self.log.entry(0), self.log.inclusion_proof(0))
         with self.assertRaises(ValueError):
             decode_audit_receipt(encode_audit_receipt(self.make_bypassed((item,))))
+
+    def test_zero_item_non_empty_snapshot_rejected_on_decode(self):
+        # size > 0 with an item count of 0 is the empty-selection bypass:
+        # decode must refuse it regardless of the claimed root.
+        # Header ends right before the items count: magic + version +
+        # hash_name blob + size + root blob.
+        header = MAGIC + u64(1) + blob(b"sha256") + u64(5) + blob(self.log.merkle_root(5))
+        with self.assertRaises(ValueError):
+            decode_audit_receipt(header + u64(0))
+        # Arbitrary root, zero evidence.
+        forged = MAGIC + u64(1) + blob(b"sha256") + u64(5) + blob(b"X" * 32) + u64(0)
+        with self.assertRaises(ValueError):
+            decode_audit_receipt(forged)
+
+    def test_zero_item_non_empty_snapshot_rejected_on_encode(self):
+        forged = self.make_bypassed((), size=5)
+        with self.assertRaises(ValueError):
+            encode_audit_receipt(forged)
 
     def test_proof_structure_checked(self):
         receipt = self.log.audit_receipt([1])

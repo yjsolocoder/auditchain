@@ -34,11 +34,18 @@ class AuditReceiptIssueTest(unittest.TestCase):
         receipt = self.log.audit_receipt([3, 0, 1])
         self.assertEqual([entry.index for entry, _ in receipt.items], [0, 1, 3, 4])
 
-    def test_empty_indices_give_empty_items(self):
+    def test_empty_selection_still_carries_last_entry(self):
         receipt = self.log.audit_receipt([])
-        self.assertEqual(receipt.items, ())
+        self.assertEqual([entry.index for entry, _ in receipt.items], [4])
         self.assertEqual(receipt.size, 5)
         self.assertEqual(receipt.root, self.log.merkle_root(5))
+        self.assertTrue(verify_audit_receipt(receipt))
+
+    def test_empty_selection_explicit_non_empty_size_carries_last(self):
+        receipt = self.log.audit_receipt([], 3)
+        self.assertEqual([entry.index for entry, _ in receipt.items], [2])
+        self.assertEqual(receipt.size, 3)
+        self.assertTrue(verify_audit_receipt(receipt))
 
     def test_empty_snapshot(self):
         receipt = self.log.audit_receipt((), 0)
@@ -232,11 +239,24 @@ class AuditReceiptValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make(items=((self.log.entry(0), self.log.inclusion_proof(0)),))
 
+    def test_non_empty_snapshot_rejects_empty_items(self):
+        # size > 0 with items == () is the empty-selection bypass: the
+        # constructor must refuse it even for a genuine root.
+        with self.assertRaises(ValueError):
+            self.make(items=())
+
     def test_empty_snapshot_requires_empty_items(self):
         empty = self.log.audit_receipt((), 0)
         self.assertEqual(empty.items, ())
         with self.assertRaises(ValueError):
             self.make(size=0)
+        entry = self.log.entry(0)
+        with self.assertRaises(ValueError):
+            self.make(
+                size=0,
+                root=self.log.merkle_root(0),
+                items=((entry, self.log.inclusion_proof(0, 1)),),
+            )
 
 
 class VerifyAuditReceiptTest(unittest.TestCase):
@@ -262,6 +282,51 @@ class VerifyAuditReceiptTest(unittest.TestCase):
     def test_wrong_root_returns_false(self):
         receipt = self.log.audit_receipt([1])
         forged = AuditReceipt(1, "sha256", receipt.size, b"\x00" * 32, receipt.items)
+        self.assertFalse(verify_audit_receipt(forged))
+
+    @staticmethod
+    def bypass(**fields):
+        """Build a receipt skipping AuditReceipt.__post_init__ validation."""
+        receipt = AuditReceipt.__new__(AuditReceipt)
+        defaults = {
+            "version": 1,
+            "hash_name": "sha256",
+            "size": 5,
+            "root": b"",
+            "items": (),
+        }
+        defaults.update(fields)
+        for name, value in defaults.items():
+            object.__setattr__(receipt, name, value)
+        return receipt
+
+    def test_empty_items_non_empty_snapshot_arbitrary_root_returns_false(self):
+        # The empty-selection bypass: zero evidence must never attest a root.
+        forged = self.bypass(size=5, root=b"X" * 32, items=())
+        self.assertFalse(verify_audit_receipt(forged))
+        # Even the genuine root with no items is rejected.
+        genuine_root_no_evidence = self.bypass(
+            size=5, root=self.log.merkle_root(5), items=()
+        )
+        self.assertFalse(verify_audit_receipt(genuine_root_no_evidence))
+
+    def test_bypassed_missing_last_entry_returns_false(self):
+        entry0 = self.log.entry(0)
+        proof0 = self.log.inclusion_proof(0)
+        forged = self.bypass(
+            size=5,
+            root=self.log.merkle_root(5),
+            items=((entry0, proof0),),
+        )
+        self.assertFalse(verify_audit_receipt(forged))
+
+    def test_bypassed_items_on_empty_snapshot_return_false(self):
+        entry0 = self.log.entry(0)
+        forged = self.bypass(
+            size=0,
+            root=self.log.merkle_root(0),
+            items=((entry0, ()),),
+        )
         self.assertFalse(verify_audit_receipt(forged))
 
     def test_tampered_entry_payload_returns_false(self):

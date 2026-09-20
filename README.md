@@ -234,7 +234,14 @@ python3 -m auditchain
     哈希碰撞不会产生误命中；查询为只读，不改变条目、`head`、认证状态、Merkle 根或证明
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
-  - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段
+  - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于
+    `verify_report().ok`；最终重算摘要还须等于 `head`，尾部截断/改写也会被检出
+  - `verify_report()` — 同一校验的可定位诊断版，返回 `IntegrityReport(ok, issues)`：
+    逐条以期望绝对索引、上一步重算摘要与当前 payload 重算 `entry_digest`，再比较记录的
+    `index`、`previous_hash`、`entry_hash`；每处不匹配追加一个 `IntegrityIssue(code, index)`
+    （同一位置 code 依次为 `"index"`、`"previous_hash"`、`"entry_hash"`，按期望绝对索引升序），
+    末尾可追加 `IntegrityIssue("head", None)`；`ok` 当且仅当 `issues` 为空。调用只读；
+    非法字段沿用 `TypeError`/`ValueError`
   - `verify_entry(index)` — 只校验某条与前驱的连接
   - `auth(index)` — 为保留段中的条目签发不可变 `AuthTag`，返回后立即以
     `H(b"auditchain/key-evolve/v1" + K)` 替换密钥、stage 加一，不保存旧密钥、不追加条目；

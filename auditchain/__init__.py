@@ -1,8 +1,8 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / entry_digest / decrypt_entry / verify_inclusion /
-verify_consistency / verify_auth / verify_audit_receipt /
+Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
+verify_inclusion / verify_consistency / verify_auth / verify_audit_receipt /
 encode_audit_receipt / decode_audit_receipt.
 """
 
@@ -22,6 +22,8 @@ __all__ = [
     "AuditReceipt",
     "AuthTag",
     "Entry",
+    "IntegrityIssue",
+    "IntegrityReport",
     "PruneReceipt",
     "Verifier",
     "GENESIS_HASH",
@@ -309,6 +311,40 @@ class Entry:
     payload: bytes
     previous_hash: bytes
     entry_hash: bytes
+
+
+@dataclass(frozen=True)
+class IntegrityIssue:
+    """One located chain-integrity failure found by :meth:`AuditLog.verify_report`.
+
+    - ``code``: what failed at the position — ``"index"`` (the recorded index
+      is not the expected absolute index), ``"previous_hash"`` (the recorded
+      predecessor link differs from the recomputed chain digest),
+      ``"entry_hash"`` (the recorded entry hash differs from the recomputed
+      digest) or ``"head"`` (the final recomputed digest differs from the
+      log's head).
+    - ``index``: expected absolute index of the failing entry, or ``None``
+      for the trailing ``"head"`` issue.
+    """
+
+    code: str
+    index: int | None
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    """Result of :meth:`AuditLog.verify_report`.
+
+    Carries exactly two fields: ``ok`` and ``issues``, a tuple of
+    :class:`IntegrityIssue`. ``ok`` holds if and only if ``issues`` is empty.
+    Issues are ordered by ascending expected absolute index; at one position
+    the codes appear in the order ``"index"``, ``"previous_hash"``,
+    ``"entry_hash"``, and only a trailing ``"head"`` issue (``index=None``)
+    may follow the last position.
+    """
+
+    ok: bool
+    issues: tuple
 
 
 @dataclass(frozen=True)
@@ -745,19 +781,54 @@ class AuditLog:
             entry.index, entry.previous_hash, entry.payload, hash_name=self._hash_name
         )
 
-    def verify(self) -> bool:
-        """Walk the retained chain forward from the prune checkpoint."""
+    def verify_report(self) -> IntegrityReport:
+        """Walk the retained chain forward from the prune checkpoint.
+
+        Each step recomputes the entry digest as
+        ``H(b"auditchain/entry/v1" || index (u64 big-endian) || previous_hash
+        || payload)`` under the log's ``hash_name`` — via :func:`entry_digest`
+        with the expected absolute index, the previous step's recomputed
+        digest and the entry's payload — then compares the recorded ``index``,
+        ``previous_hash`` and ``entry_hash`` against those expectations, in
+        that order. An empty log starts from the digest-width zero
+        predecessor; a pruned log starts from the checkpoint (the chain hash
+        of the last pruned entry). After the last retained entry the final
+        recomputed digest must equal :attr:`head`, so a truncated or rewritten
+        tail cannot pass unnoticed.
+
+        Every mismatch is recorded as an :class:`IntegrityIssue` — issues come
+        back in ascending expected absolute index order, codes ``"index"``,
+        ``"previous_hash"``, ``"entry_hash"`` at one position, with at most a
+        trailing ``IntegrityIssue("head", None)`` — and makes ``ok`` False.
+        Structurally invalid entry fields (e.g. a non-bytes payload) raise
+        TypeError or ValueError exactly as :func:`entry_digest` does. The call
+        is read-only: entries, head, authentication state, Merkle roots and
+        proofs are left untouched.
+        """
+        issues: list[IntegrityIssue] = []
         previous = self._checkpoint_head
         for offset, entry in enumerate(self._entries):
             index = self._retain_from + offset
-            if entry.index != index or entry.previous_hash != previous:
-                return False
-            if entry.entry_hash != entry_digest(
+            digest = entry_digest(
                 index, previous, entry.payload, hash_name=self._hash_name
-            ):
-                return False
-            previous = entry.entry_hash
-        return True
+            )
+            if entry.index != index:
+                issues.append(IntegrityIssue("index", index))
+            if entry.previous_hash != previous:
+                issues.append(IntegrityIssue("previous_hash", index))
+            if entry.entry_hash != digest:
+                issues.append(IntegrityIssue("entry_hash", index))
+            previous = digest
+        if previous != self._head:
+            issues.append(IntegrityIssue("head", None))
+        return IntegrityReport(ok=not issues, issues=tuple(issues))
+
+    def verify(self) -> bool:
+        """Walk the retained chain forward from the prune checkpoint.
+
+        Equivalent to ``self.verify_report().ok``.
+        """
+        return self.verify_report().ok
 
     def _resolve_size(self, size: int | None) -> int:
         if size is None:

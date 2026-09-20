@@ -7,6 +7,19 @@
 Python 3.10+。只依赖标准库（`hashlib` / `hmac` / `os`）与
 [`cryptography`](https://cryptography.io/)（加密追加使用其中的 `AESGCM`）。
 
+### 摘要算法与宽度
+
+所有带 `hash_name` 的构造与函数默认 `"sha256"`，并接受任意 **固定输出长度** 的
+`hashlib` 算法（如 `"sha512"`、`"sha3-256"`）。日志的前驱、条目摘要、Merkle
+节点、包含/一致性证明、认证标签以及两种回执中的每个摘要均为
+`hashlib.new(hash_name).digest_size` 字节（sha256 为 32，sha512 为 64）。日志的
+创世前驱是 `digest_size` 个 `0x00`；公开常量 `GENESIS_HASH` 保持 `bytes(32)`
+（sha256 的创世前驱）。空前缀回执的 `chain_hash` 用日志自身宽度的零摘要。
+`hash_name` 非字符串抛 `TypeError`；未知算法或无固定输出长度的算法（如
+`shake_128` / `shake_256`，其 `digest_size` 为 0）以及任何摘要长度不符均抛
+`ValueError`。结构合法但摘要/证明/标签互不匹配（含跨算法宽度不匹配）返回
+`False`，绝不抛异常。
+
 ## 使用
 
 ```python
@@ -72,9 +85,10 @@ log.merkle_root()              # 与持有全部内容的日志重建出的根�
 log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证明
 ```
 
-空前缀回执（`seal(0)`，`chain_hash == GENESIS_HASH`）匹配创世条目：
+空前缀回执（`seal(0)`，`chain_hash` 为日志摘要宽度个 `0x00`；sha256 下即
+`GENESIS_HASH`）匹配创世条目：
 `receipt.matches(entry)` 当且仅当 `entry.index == 0` 且
-`entry.previous_hash == GENESIS_HASH`。
+`entry.previous_hash == receipt.chain_hash`。
 
 #### 一步封存并裁剪（保留策略）
 
@@ -187,15 +201,15 @@ python3 -m auditchain
 - `Verifier(key, hash_name)` — 不可变验证材料，由 `export_verifier()` 导出；
   `key` 只接受非空 `bytes`
 - `PruneReceipt(hash_name, size, merkle_root, chain_hash)` — 不可变的前缀封存回执
-  - `merkle_root` 为该前缀的 Merkle 根，`chain_hash` 为末条摘要（空前缀为 `GENESIS_HASH`）
+  - `merkle_root` 为该前缀的 Merkle 根，二者均为 `hash_name` 摘要宽度；`chain_hash` 为末条摘要（空前缀为该宽度的零摘要，sha256 下即 `GENESIS_HASH`）
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
-    是返回 `True`，否则 `False`；空前缀回执匹配索引为 0、前驱为 `GENESIS_HASH` 的创世条目；
+    是返回 `True`，否则 `False`；空前缀回执匹配索引为 0、前驱为该宽度零摘要的创世条目；
     入参不是 `Entry` 抛 `TypeError`
 - `AuditReceipt(version, hash_name, size, root, items)` — 不可变的离线审计回执，
   按字段相等、支持位置构造；`version` 恒为 `1`，`root` 为快照 Merkle 根，
   `items` 为按绝对索引升序的 `(Entry, 证明元组)` 元组，非空回执必含 `index == size - 1`
   的末条；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或条目结构非法抛 `ValueError`
-- `GENESIS_HASH` — 全零的起始前驱摘要
+- `GENESIS_HASH` — `bytes(32)` 全零起始前驱摘要（sha256 创世前驱；其他宽度日志用其自身 `digest_size` 个零）
 - `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
   空 `key` 抛 `ValueError`
@@ -233,7 +247,7 @@ python3 -m auditchain
   - `consistency_proof(old_size, new_size=None)` — 两个前缀快照之间的一致性证明，不可变元组；
     要求 `0 <= old_size <= new_size <= len(log)`，后续追加不改变同一前缀对的证明
   - `seal(size=None)` — 为前 `size` 条（默认当前长度）生成 `PruneReceipt`，记录前缀根与末条摘要，
-    空前缀记录 `GENESIS_HASH`
+    空前缀记录该宽度的零摘要（sha256 下为 `GENESIS_HASH`）
   - `audit_receipt(indices, size=None)` — 为快照中选定条目生成离线 `AuditReceipt`：
     `indices` 为可迭代的互异非 `bool` 整数，须满足 `retain_from <= index < size`；
     `size` 默认当前长度，快照须可重建；非空选择自动并入末条（`index == size - 1`），

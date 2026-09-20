@@ -1,10 +1,11 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
-verify_inclusion / verify_batch_inclusion / verify_consistency / verify_auth /
-verify_audit_receipt / verify_audit_batch / encode_audit_receipt /
-decode_audit_receipt / encode_audit_batch / decode_audit_batch.
+Verifier / SignedRoot / IntegrityIssue / IntegrityReport / entry_digest /
+decrypt_entry / verify_inclusion / verify_batch_inclusion /
+verify_consistency / verify_auth / verify_audit_receipt / verify_audit_batch /
+verify_signed_root / encode_audit_receipt / decode_audit_receipt /
+encode_audit_batch / decode_audit_batch.
 """
 
 from __future__ import annotations
@@ -15,8 +16,16 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidSignature, InvalidTag
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+)
 
 __all__ = [
     "AuditLog",
@@ -26,6 +35,7 @@ __all__ = [
     "IntegrityIssue",
     "IntegrityReport",
     "PruneReceipt",
+    "SignedRoot",
     "Verifier",
     "GENESIS_HASH",
     "decode_audit_batch",
@@ -40,6 +50,7 @@ __all__ = [
     "verify_batch_inclusion",
     "verify_consistency",
     "verify_inclusion",
+    "verify_signed_root",
 ]
 
 GENESIS_HASH = bytes(32)
@@ -78,6 +89,14 @@ _BATCH_MAGIC = b"auditchain/batch/v1\0"
 _BATCH_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
+
+# Signed snapshot-root checkpoint of AuditLog.sign_root / verify_signed_root.
+# An Ed25519 signature over the hash algorithm, snapshot size, Merkle root and
+# chain head; the signing seed is supplied per call and never stored.
+_SIGNED_ROOT_DOMAIN = b"auditchain/signed-root/v1\0"
+_SIGNED_ROOT_VERSION = 1
+_ED25519_KEY_BYTES = 32
+_ED25519_SIGNATURE_BYTES = 64
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -128,6 +147,44 @@ def _check_nonce(nonce: Any) -> bytes:
     if len(nonce) != _NONCE_BYTES:
         raise ValueError(f"nonce must be {_NONCE_BYTES} bytes")
     return nonce
+
+
+def _load_ed25519_seed(private_key: Any) -> Ed25519PrivateKey:
+    """Load a 32-byte Ed25519 private key seed; the seed is never stored."""
+    if not isinstance(private_key, bytes):
+        raise TypeError("private_key must be a 32-byte Ed25519 seed")
+    if len(private_key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"private_key must be {_ED25519_KEY_BYTES} bytes (an Ed25519 seed)"
+        )
+    return Ed25519PrivateKey.from_private_bytes(private_key)
+
+
+def _load_ed25519_public(public_key: Any) -> Ed25519PublicKey:
+    if not isinstance(public_key, bytes):
+        raise TypeError("public_key must be a 32-byte Ed25519 public key")
+    if len(public_key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"public_key must be {_ED25519_KEY_BYTES} bytes (an Ed25519 public key)"
+        )
+    return Ed25519PublicKey.from_public_bytes(public_key)
+
+
+def _signed_root_message(hash_name: str, size: int, root: bytes, head: bytes) -> bytes:
+    """M of sign_root / verify_signed_root.
+
+    ``D || 0x01 || B(UTF-8(hash_name)) || U(size) || B(root) || B(head)``
+    with ``D = b"auditchain/signed-root/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``.
+    """
+    return (
+        _SIGNED_ROOT_DOMAIN
+        + bytes((0x01,))
+        + _encode_blob(hash_name.encode("utf-8"))
+        + _encode_u64(size, "size")
+        + _encode_blob(root)
+        + _encode_blob(head)
+    )
 
 
 def _seal_aad(index: int, previous_hash: bytes) -> bytes:
@@ -472,6 +529,64 @@ class AuditReceipt:
                 "a receipt for a non-empty snapshot must include the entry "
                 "at index size - 1"
             )
+
+
+@dataclass(frozen=True)
+class SignedRoot:
+    """Ed25519-signed snapshot-root checkpoint.
+
+    Issued by :meth:`AuditLog.sign_root` and verified entirely offline by
+    :func:`verify_signed_root` against a pre-trusted 32-byte Ed25519 public
+    key, so a receipt can cross processes and storage media without anyone
+    re-holding the log:
+
+    - ``version``: format version, always ``1``,
+    - ``hash_name``: hash algorithm of the signing log,
+    - ``size``: number of entries in the attested prefix,
+    - ``root``: Merkle root of that prefix,
+    - ``head``: chain head at that prefix (the entry hash of its last record,
+      the digest-width zero value for an empty prefix),
+    - ``signature``: the 64-byte Ed25519 signature over the fields.
+
+    Instances are immutable, may be built positionally and compare by all six
+    fields.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    head: bytes
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != _SIGNED_ROOT_VERSION:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if not 0 <= self.size < _U64_LIMIT:
+            raise ValueError("size must satisfy 0 <= size < 2**64")
+        for name in ("root", "head"):
+            value = getattr(self, name)
+            if not isinstance(value, (bytes, bytearray)):
+                raise TypeError(f"{name} must be bytes")
+            if len(value) != digest_size:
+                raise ValueError(f"{name} must be {digest_size} bytes")
+            if not isinstance(value, bytes):
+                object.__setattr__(self, name, bytes(value))
+        if not isinstance(self.signature, (bytes, bytearray)):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
+        if not isinstance(self.signature, bytes):
+            object.__setattr__(self, "signature", bytes(self.signature))
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1416,47 @@ class AuditLog:
             size=size,
             merkle_root=root,
             chain_hash=self._chain_head_at(size),
+        )
+
+    def sign_root(self, private_key: Any, size: int | None = None) -> SignedRoot:
+        """Sign a snapshot root and chain head with an Ed25519 seed.
+
+        Produces a :class:`SignedRoot` over the first ``size`` entries
+        (defaulting to the current log length): ``root`` is the prefix Merkle
+        root and ``head`` is the entry hash of the last prefix entry — the
+        digest-width zero chain head for an empty prefix — so a receiver with
+        only a pre-trusted public key can authenticate a snapshot checkpoint
+        offline and across storage media.
+
+        ``private_key`` is a 32-byte Ed25519 private key seed; it is used for
+        this one signature and is never stored, copied into log state or
+        returned. The signed message is
+        ``D || 0x01 || B(UTF-8(hash_name)) || U(size) || B(root) || B(head)``
+        with ``D = b"auditchain/signed-root/v1\\0"``, ``U`` an unsigned 8-byte
+        big-endian integer and ``B(x) = U(len(x)) || x``; ``signature`` is the
+        64-byte Ed25519 signature over it and ``version`` is always 1. The call
+        is read-only: entries, head, authentication state, Merkle roots and
+        proofs are all left untouched. A non-``bytes`` seed raises TypeError;
+        a seed that is not 32 bytes, an out-of-range ``size`` or a pruned,
+        unrebuildable snapshot raises ValueError.
+        """
+        signing_key = _load_ed25519_seed(private_key)
+        size = self._resolve_size(size)
+        if size == 0:
+            root = _hash_parts(self._hash_name, _EMPTY_DOMAIN)
+        else:
+            self._require_retained_snapshot(size)
+            root = self._fold_occupied(self._occupied_at(size))
+        head = self._chain_head_at(size)
+        message = _signed_root_message(self._hash_name, size, root, head)
+        signature = signing_key.sign(message)
+        return SignedRoot(
+            version=_SIGNED_ROOT_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            head=head,
+            signature=signature,
         )
 
     def audit_receipt(self, indices: Iterable[int], size: int | None = None) -> AuditReceipt:
@@ -2330,3 +2486,48 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
         key = _evolve_key(key, verifier.hash_name)
     expected = _auth_tag(tag.stage, entry.entry_hash, key, verifier.hash_name)
     return hmac.compare_digest(expected, tag.tag)
+
+
+def verify_signed_root(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedRoot` against a pre-trusted Ed25519 public key.
+
+    Rebuilds the exact message :meth:`AuditLog.sign_root` signed —
+    ``D || 0x01 || B(UTF-8(hash_name)) || U(size) || B(root) || B(head)``
+    with ``D = b"auditchain/signed-root/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x`` — and checks the
+    receipt's 64-byte Ed25519 signature with the 32-byte ``public_key``,
+    entirely without holding the log. A genuine receipt from that key returns
+    True; a structurally valid receipt signed by another key, or whose root,
+    chain head or signature has been altered, returns False. Input that is not
+    a :class:`SignedRoot` or whose key is not ``bytes`` raises TypeError; an
+    unsupported version, an unknown hash algorithm, a size outside the u64
+    range, a root/head of the wrong digest width, a signature that is not 64
+    bytes or a public key that is not 32 bytes raises ValueError. The call is
+    read-only and never mutates the receipt.
+    """
+    if not isinstance(receipt, SignedRoot):
+        raise TypeError("receipt must be a SignedRoot")
+    # Re-validate every field even for a receipt built with object.__setattr__
+    # bypassing the frozen constructor, so structural corruption raises
+    # exactly as the constructor would and only genuine mismatches return
+    # False below.
+    checked = SignedRoot(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.head,
+        receipt.signature,
+    )
+    verification_key = _load_ed25519_public(public_key)
+    message = _signed_root_message(
+        checked.hash_name,
+        checked.size,
+        checked.root,
+        checked.head,
+    )
+    try:
+        verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True

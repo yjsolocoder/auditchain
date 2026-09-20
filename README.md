@@ -5,7 +5,8 @@
 ## 环境
 
 Python 3.10+。只依赖标准库（`hashlib` / `hmac` / `os`）与
-[`cryptography`](https://cryptography.io/)（加密追加使用其中的 `AESGCM`）。
+[`cryptography`](https://cryptography.io/)（加密追加使用其中的 `AESGCM`，
+可信签名检查点使用其中的 Ed25519）。
 
 ### 摘要算法与宽度
 
@@ -230,6 +231,56 @@ blob 均为 u64 字节长度后接原始字节（零长度也是全零 u64）。
 证明不匹配的结构合法回执仍可正常编解码，仅 `verify_audit_batch` 返回 `False`。
 编解码均为只读，不改变五元组与日志的任何状态。
 
+### 可信签名快照检查点（Ed25519）
+
+`sign_root` 用日志持有者按次提供的 Ed25519 私钥种子为某个快照（Merkle 根
+与链头）签发一个不可变 `SignedRoot`；接收方凭**预先信任**的 32 字节 Ed25519
+公钥即可离线核验该快照根与链头确由日志持有者签发，回执因此可以跨进程、跨
+存储介质传递与验真，私钥从不落盘：
+
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from auditchain import verify_signed_root
+
+seed = bytes(range(1, 33))               # 32 字节 Ed25519 私钥种子
+public_key = (
+    Ed25519PrivateKey.from_private_bytes(seed)
+    .public_key()
+    .public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+)  # 32 字节公钥，预先交给验证方
+
+receipt = log.sign_root(seed)            # size 默认 len(log)
+receipt.root == log.merkle_root()        # True：快照 Merkle 根
+receipt.head == log.head                 # True：快照链头（末条摘要）
+verify_signed_root(receipt, public_key)  # True：无需持有日志
+verify_signed_root(receipt, other_key)   # False：未信任的公钥
+log.sign_root(seed, 0)                   # 空前缀：规范空树根 + 同宽零链头
+```
+
+- 回执为冻结的
+  `SignedRoot(version, hash_name, size, root, head, signature)`，支持位置构造、
+  按全部字段相等；`version` 恒为 `1`，`root` 为前 `size` 条的 Merkle 根，
+  `head` 为该前缀末条摘要（空前缀为日志摘要宽度的零链头，sha256 下即
+  `GENESIS_HASH`），`signature` 为 64 字节 Ed25519 签名
+- 签名原文依次为
+  `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`，
+  其中 `D = b"auditchain/signed-root/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；Ed25519 对该消息确定性签名
+- `sign_root(private_key, size=None)` 的 `size` 默认 `len(log)`，须满足
+  `0 <= size <= len(log)` 且快照仍可重建（已裁剪前缀抛 `ValueError`，空快照
+  `size=0` 是内容无关常量，始终可签）；`private_key` 仅用于这一次签名，日志
+  从不保存、返回或写入它；签发为只读，不改变条目、`head`、认证状态、Merkle
+  根或证明
+- `verify_signed_root(receipt, public_key)` 只凭回执与预信任公钥离线验真：
+  重建同一签名原文并用公钥校验 64 字节签名。公钥不是对应签发方，或结构合法但
+  `root` / `head` / `signature` / `size` / `hash_name` 任一字段被改，均返回
+  `False`（绝不抛异常）
+- 类型边界只接受 `bytes`：私钥种子、公钥传入 `str` / `bytearray` /
+  `memoryview` 等抛 `TypeError`；私钥种子或公钥不是 32 字节、`version` 非
+  `1`、未知摘要算法、`size` 超出 `0 <= size < 2**64`、`root` / `head` 宽度
+  与算法不符、`signature` 不是 64 字节抛 `ValueError`；两个入口均为只读
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -300,6 +351,12 @@ python3 -m auditchain
   必含 `index == size - 1` 的末条（在 items 末尾）及其包含证明**，`size == 0` 时
   `items` 必须为 `()`；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或
   条目结构非法（含非空回执缺失末条、空回执携带条目）抛 `ValueError`
+- `SignedRoot(version, hash_name, size, root, head, signature)` — 不可变的 Ed25519
+  可信签名快照检查点，按全部字段相等、支持位置构造；`version` 恒为 `1`，`root`
+  为前 `size` 条的 Merkle 根，`head` 为该前缀末条摘要（空前缀为该摘要宽度的零
+  链头，sha256 下即 `GENESIS_HASH`），`signature` 为 64 字节 Ed25519 签名；
+  `size` 须满足 `0 <= size < 2**64`。类型非法抛 `TypeError`，版本非 1、未知算法、
+  `size` 越界、`root`/`head` 摘要宽度不符或 `signature` 不是 64 字节抛 `ValueError`
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -390,6 +447,15 @@ python3 -m auditchain
     规范空树根、空 `entries` 与空 `proof`。调用只读；类型非法抛 `TypeError`，重复、
     越界或快照不可重建抛 `ValueError`，任何失败都不改变日志状态；离线用
     `verify_audit_batch` 核验
+  - `sign_root(private_key, size=None)` — 用按次传入的 32 字节 Ed25519 私钥种子
+    为前 `size` 条（默认 `len(log)`）的快照根与链头签发不可变 `SignedRoot`：
+    `root` 为该前缀 Merkle 根，`head` 为末条摘要（空前缀为同宽零链头）。签名原文为
+    `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`
+    （`D = b"auditchain/signed-root/v1\0"`，`U` 为 8 字节无符号大端，
+    `B(x) = U(len(x)) || x`），`signature` 为其 64 字节 Ed25519 签名、
+    `version` 恒为 1。私钥种子只用于这一次签名、从不保存或返回；`size` 越界或快照
+    已裁剪抛 `ValueError`（空快照 `size=0` 始终可签），种子类型错抛 `TypeError`、
+    长度非 32 抛 `ValueError`；调用只读，离线用 `verify_signed_root` 凭预信任公钥验真
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -434,6 +500,15 @@ python3 -m auditchain
   顺序/重复、缺末条（含 `size>0 且 entries==()`）、空快照携带条目或证明节点数与
   `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容、证明或根不匹配返回
   `False`，匹配返回 `True`
+- `verify_signed_root(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
+  离线验证 `AuditLog.sign_root` 签发的 `SignedRoot`：重建同一签名原文
+  `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`
+  （`D = b"auditchain/signed-root/v1\0"`，`U` 为 8 字节无符号大端，
+  `B(x) = U(len(x)) || x`）并校验其 64 字节签名，无需持有日志；公钥不是对应
+  签发方，或结构合法但 `root`、`head`、`signature` 等被改返回 `False`，匹配
+  返回 `True`。入参不是 `SignedRoot` 或公钥不是 `bytes` 抛 `TypeError`；版本、
+  未知算法、`size` 范围、摘要宽度、签名长度或公钥长度（非 32 字节）非法抛
+  `ValueError`；调用只读
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；

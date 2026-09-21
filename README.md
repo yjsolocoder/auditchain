@@ -581,6 +581,54 @@ len(restored) == len(log) + 2                # 原日志不受影响
   验签失败或重算的链头 / Merkle 根与检查点不一致均抛 `ValueError`；恢复为
   只读校验，不改变入参
 
+### 加密日志的签名导出与恢复（Ed25519）
+
+`dump_log` 拒绝任何含加密历史的日志；`dump_secure_log(log, private_key)` 正是为
+**混合普通与 AES-256-GCM 加密条目**的日志准备的导出器：资格要求与 `dump_log`
+相同（`retain_from == 0`、构造未传 `key`、无任何认证状态或历史），但允许加密
+条目。字节流不携带任何密钥——只有各条目的密文封装与 keyed 定位 HMAC，二者都不
+泄露明文或密钥。`load_secure_log(data, public_key)` 仅凭预置信任的 32 字节
+Ed25519 公钥离线验真后，恢复出一条**独立、可变、无密钥**的 `AuditLog`：`find`
+索引、加密定位索引、nonce 历史、Merkle frontier、链头、长度与保留点都与同进程
+逐条构建完全一致，可继续追加、用新密钥 `encrypt`、用原密钥 `find_encrypted`、
+`prune` 并使用全部既有接口：
+
+```python
+from auditchain import dump_secure_log, load_secure_log
+
+log = AuditLog()
+log.append("agent started")
+log.encrypt("position claim", key)             # 普通与加密条目混合
+
+data = dump_secure_log(log, seed)              # bytes，可落盘/跨进程/跨介质传递
+restored = load_secure_log(data, public_key)   # 全新、独立、可变的 AuditLog
+restored.head == log.head                      # True：链头一致
+restored.find_encrypted("position claim", key) # (1,)：加密定位索引已重建
+restored.append("new event")                   # 恢复后照常追加、加密、裁剪
+```
+
+- 导出**只读**且确定：不改变日志任何状态；同状态、同种子的两次导出逐字节
+  相同（Ed25519 确定性签名）；私钥种子只用于末尾一次签名，从不保存、不写入
+  字节流
+- 字节流以魔数 `b"auditchain/secure-log/v1\0"` 开头，随后**严格依次**写
+  `U(1)`（版本）、`B(hash_name 的 UTF-8)`、`U(n)`、`B(root)`、`B(head)` 与
+  `E1…En`；每个 `Ei = U(index) || B(payload) || B(previous_hash) ||
+  B(entry_hash) || B(locator)`，其中 `U` 为 8 字节无符号大端、`B(x) =
+  U(len(x)) || x`；`locator` 对普通条目为空 blob，对加密条目为与 `hash_name`
+  同宽的既有加密定位 HMAC。末尾追加 64 字节 Ed25519 签名，**覆盖此前全部
+  字节**，不允许省略、换序或附加字节
+- `load_secure_log` **先验签**，再按 `hash_name` 指定的算法与摘要宽度从创世
+  零摘要逐条重算 `entry_digest` 链、`head` 与 Merkle 根并逐项匹配；每个带
+  locator 的条目必须携带结构合法的密文封装，加载从封装恢复 12 字节 nonce 并
+  **拒绝重复**；最后经正常 `append` 路径重放重建并恢复加密定位索引与 nonce
+  历史
+- `dump_secure_log` 入参不是 `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`；
+  私钥不是 32 字节，或日志已裁剪 / 带认证状态或历史抛 `ValueError`
+- `load_secure_log` 的 `data` 只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`），公钥类型错抛 `TypeError`；公钥长度非 32、魔数 / 版本 /
+  UTF-8 / 算法、截断、尾随、索引顺序、摘要或 locator 宽度、密文封装、重复
+  nonce、重算链 / 根不符或验签失败均抛 `ValueError`
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -973,6 +1021,8 @@ python3 -m auditchain
   `memoryview`），公钥类型错抛 `TypeError`；公钥长度非 32、魔数 / 版本 /
   嵌套检查点算法与宽度 / 条目宽度 / 索引顺序 / `C.size` 不符、截断、尾随、
   blob 长度溢出、验签失败或重算链头 / Merkle 根与检查点不一致抛 `ValueError`
+- `dump_secure_log(log, private_key)` / `load_secure_log(data, public_key)` —
+  含加密条目的完整日志的签名导出与离线恢复（详见下文「加密日志的签名导出与恢复」）
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

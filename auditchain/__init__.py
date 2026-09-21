@@ -14,7 +14,8 @@ encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
-dump_log / load_log.
+dump_log / load_log /
+dump_secure_log / load_secure_log.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ __all__ = [
     "decode_signed_root",
     "decrypt_entry",
     "dump_log",
+    "dump_secure_log",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_prune_receipt",
@@ -68,6 +70,7 @@ __all__ = [
     "encode_signed_root",
     "entry_digest",
     "load_log",
+    "load_secure_log",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -159,6 +162,16 @@ _SIGNED_PRUNE_VERSION = 1
 # entry_hash blobs), in that order and with nothing else.
 _LOG_STATE_MAGIC = b"auditchain/log-state/v1\0"
 _LOG_STATE_VERSION = 1
+
+# Binary framing of dump_secure_log / load_secure_log: a fixed magic, then
+# the envelope version as a u64, the hash algorithm name as a UTF-8 blob, the
+# entry count as a u64, the Merkle root and chain head as blobs and one
+# encoded record per entry (index u64, then payload / previous_hash /
+# entry_hash / locator blobs; an empty locator blob marks a plain entry, a
+# digest-width one the keyed HMAC locator of an encrypted entry), closed by a
+# 64-byte Ed25519 signature over every preceding byte.
+_SECURE_LOG_MAGIC = b"auditchain/secure-log/v1\0"
+_SECURE_LOG_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -3842,4 +3855,228 @@ def load_log(data: Any, public_key: Any) -> AuditLog:
         raise ValueError(
             "recomputed Merkle root does not match the signed checkpoint"
         )
+    return log
+
+
+def dump_secure_log(log: Any, private_key: Any) -> bytes:
+    """Export a complete, qualified log — encrypted entries included — as one
+    self-certifying byte string.
+
+    Unlike :func:`dump_log`, which refuses any log that has ever held an
+    encrypted entry, this exporter exists precisely for logs mixing plain and
+    AES-256-GCM encrypted entries. Only an :class:`AuditLog` holding its
+    **complete, unpruned** history (``retain_from == 0``), constructed without
+    an authentication key and with no authentication state or history (no
+    :meth:`AuditLog.auth` / :meth:`AuditLog.auth_batch` /
+    :meth:`AuditLog.rotate_key` / :meth:`AuditLog.export_verifier` and no
+    residual tags) is eligible: the dump carries no prune checkpoints and no
+    authentication tags or key-evolution state. It also carries no encryption
+    keys — only the per-entry ciphertext envelopes and their keyed locator
+    digests, neither of which reveals a plaintext or a key.
+
+    The encoding starts with the magic ``b"auditchain/secure-log/v1\\0"`` and
+    then writes, strictly in order, the envelope version (always ``1``) as an
+    unsigned 8-byte big-endian integer, the hash algorithm name as a UTF-8
+    blob, the entry count ``n`` as a u64, the Merkle ``root`` blob, the chain
+    ``head`` blob and the ``n`` entries; entry ``Ei`` is encoded as
+    ``U(index)``, ``B(payload)``, ``B(previous_hash)``, ``B(entry_hash)`` and
+    ``B(locator)`` in that order, where ``U`` is an unsigned 8-byte big-endian
+    integer and ``B(x) = U(len(x)) || x``. ``locator`` is the empty blob for a
+    plain entry and the hash-width keyed locator HMAC
+    (``HMAC(key, b"auditchain/encrypted-locate/v1\\0" || plaintext)`` recorded
+    at append time) for an encrypted one. A 64-byte Ed25519 signature over
+    every preceding byte, made with the 32-byte seed ``private_key``, closes
+    the stream; the seed is used for that one signature and is never stored,
+    copied into the dump or added as a separate signing input.
+
+    The call is read-only and deterministic: it never mutates the log, and two
+    dumps of logs in the same state signed with the same seed are byte-for-byte
+    identical (Ed25519 signatures are deterministic). A non-:class:`AuditLog`
+    value or a non-``bytes`` seed raises TypeError; a seed that is not 32 bytes
+    or a log that is pruned or keyed/authenticated raises ValueError.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, so type/value errors
+    # surface in the same order as dump_log. The loaded key is used only for
+    # the one signature below and never stored on the log.
+    signing_key = _load_ed25519_seed(private_key)
+    # The format restores an independent keyless log and carries no prune or
+    # authentication material, so only a complete, unauthenticated history is
+    # eligible; encrypted entries are exactly what this format exists for.
+    if log._retain_from != 0:
+        raise ValueError(
+            "only an unpruned log holding its complete history can be dumped"
+        )
+    if log._key is not None or log._stage != 0 or log._tags or log._verifier_exported:
+        raise ValueError("a log with authentication state or history cannot be dumped")
+    size = len(log)
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _SECURE_LOG_MAGIC,
+        _encode_u64(_SECURE_LOG_VERSION, "version"),
+        _encode_blob(log._hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+        _encode_blob(root),
+        _encode_blob(head),
+    ]
+    for entry in log._entries:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        # The keyed plaintext locator recorded at encrypt() time; the empty
+        # blob marks a plain entry. It leaks neither plaintext nor key.
+        parts.append(_encode_blob(log._encrypted_locators.get(entry.index, b"")))
+    body = b"".join(parts)
+    return body + signing_key.sign(body)
+
+
+def load_secure_log(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable, keyless :class:`AuditLog` from
+    :func:`dump_secure_log`, encrypted entries included.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). After the
+    magic ``b"auditchain/secure-log/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the hash
+    algorithm name as a UTF-8 blob, a u64 entry count, the Merkle ``root`` and
+    chain ``head`` blobs, exactly that many entries encoded as ``U(index)``,
+    ``B(payload)``, ``B(previous_hash)``, ``B(entry_hash)`` and ``B(locator)``
+    (an empty locator blob marks a plain entry; otherwise it must be exactly
+    the hash width), and finally a 64-byte Ed25519 signature over every
+    preceding byte, with no trailing bytes.
+
+    Verification is entirely offline against the 32-byte ``public_key``: the
+    trailing signature is verified first; then, using the named ``hash_name``
+    and its digest width, every :func:`entry_digest` and predecessor link is
+    recomputed from genesis and must match the recorded entries, and the
+    recomputed chain head and Merkle root must match the signed ``head`` and
+    ``root`` fields. Every encrypted entry's envelope is parsed and its
+    12-byte nonce recovered; a nonce repeated anywhere in the stream is
+    rejected. Only then is a fresh keyless :class:`AuditLog` built by
+    replaying the payloads through the normal append path and repopulating
+    the keyed locator index and nonce history, so the restored log's find
+    index, encrypted-locator index, Merkle frontier, head, length and retain
+    point are exactly those of a log built from the same records in this
+    process — it is fully mutable and supports every existing operation
+    (append, encrypt with a fresh key, :meth:`AuditLog.find_encrypted` with
+    the original append keys, prune, ...), sharing no state with the caller's
+    buffers.
+
+    A non-``bytes`` ``data`` or ``public_key`` raises TypeError; a public key
+    that is not 32 bytes, a bad magic, version, UTF-8 or hash algorithm,
+    truncation, trailing bytes, an out-of-order index, a digest or locator of
+    the wrong width, a malformed ciphertext envelope, a repeated nonce, any
+    recomputed chain/root inconsistency or a signature that does not verify
+    raises ValueError.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verifying_key = _load_ed25519_public(public_key)
+    if not data.startswith(_SECURE_LOG_MAGIC):
+        raise ValueError("not an auditchain secure-log encoding")
+    if len(data) < len(_SECURE_LOG_MAGIC) + _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing the trailing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify before any further trust is placed in the stream.
+    try:
+        verifying_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError("secure-log signature does not verify") from error
+    offset = len(_SECURE_LOG_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = body[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SECURE_LOG_VERSION:
+        raise ValueError(f"unsupported secure-log version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    count = read_u64("entries count")
+    root = read_blob("root")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    head = read_blob("head")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    records: list[tuple[bytes, bytes, bytes, bytes]] = []
+    for position in range(count):
+        index = read_u64("entry.index")
+        if index != position:
+            raise ValueError("entries must occupy indices 0..n-1 in order")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        if len(previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        entry_hash = read_blob("entry.entry_hash")
+        if len(entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        locator = read_blob("entry.locator")
+        if locator and len(locator) != digest_size:
+            raise ValueError(f"entry.locator must be empty or {digest_size} bytes")
+        records.append((payload, previous_hash, entry_hash, locator))
+    if offset != len(body):
+        raise ValueError("trailing bytes after the secure-log state")
+
+    # Recompute the whole chain from genesis under the named algorithm and
+    # recover every encrypted entry's nonce from its envelope, rejecting a
+    # nonce that repeats anywhere in the stream.
+    previous = bytes(digest_size)
+    used_nonces: set[bytes] = set()
+    encrypted_index: dict[bytes, list[int]] = {}
+    encrypted_locators: dict[int, bytes] = {}
+    for position, (payload, previous_hash, entry_hash, locator) in enumerate(records):
+        if not hmac.compare_digest(previous_hash, previous):
+            raise ValueError(f"entry chain is broken at index {position}")
+        recomputed = entry_digest(position, previous, payload, hash_name=hash_name)
+        if not hmac.compare_digest(recomputed, entry_hash):
+            raise ValueError(f"entry digest mismatch at index {position}")
+        if locator:
+            # A located entry must carry a well-formed encrypted-entry
+            # envelope; its nonce joins the log's never-reuse history.
+            _, nonce, _ = _parse_envelope(payload)
+            if nonce in used_nonces:
+                raise ValueError(f"nonce repeats at index {position}")
+            used_nonces.add(nonce)
+            encrypted_index.setdefault(locator, []).append(position)
+            encrypted_locators[position] = locator
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the signed head")
+
+    # Replay the verified payloads through the normal append path so the find
+    # index, Merkle frontier and head are rebuilt exactly as in-process
+    # appends build them, then restore the keyed locator index and nonce
+    # history the envelopes imply.
+    log = AuditLog(hash_name=hash_name)
+    for payload, _, _, _ in records:
+        log.append(payload)
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the signed root")
+    log._encrypted_index = encrypted_index
+    log._encrypted_locators = encrypted_locators
+    log._used_nonces = used_nonces
     return log

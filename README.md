@@ -461,6 +461,77 @@ verify_signed_consistency(restored, public_key)    # True：无需持有日志
   恢复后的既有验真契约判定），结构合法但验真不匹配仍可解码，
   `verify_signed_consistency` 返回 `False`；两个入口均为只读且确定。
 
+### 可信签名裁剪授权（Ed25519）
+
+`sign_prune` 在一个不可变 `SignedPrune` 中同时打包 `seal` 的前缀裁剪回执
+`PruneReceipt` 与 `sign_root` 对**同一前缀**签发的 `SignedRoot` 检查点；持有
+**预置信任** 32 字节 Ed25519 公钥的一方可先离线确认裁剪授权（摘要算法、`size`、
+Merkle 根、链头）确由日志持有者签发，核验通过后才真正释放前缀负载，核验失败
+绝不改变日志状态：
+
+```python
+from auditchain import verify_signed_prune
+
+item = log.sign_prune(seed, 2)             # size 默认 len(log)
+item.receipt == log.seal(2)                # True：前缀裁剪回执
+item.checkpoint == log.sign_root(seed, 2)  # True：同一前缀的签名检查点
+verify_signed_prune(item, public_key)      # True：无需持有日志
+verify_signed_prune(item, other_key)       # False：未信任的公钥
+log.prune_signed(2, item, public_key)      # 核验通过才裁剪，等价于 prune(2, item.receipt)
+```
+
+- 包为冻结的 `SignedPrune(receipt:PruneReceipt, checkpoint:SignedRoot)`，字段
+  顺序即签名顺序，支持位置构造、按两个字段相等；`receipt` 必须是
+  `PruneReceipt`、`checkpoint` 必须是 `SignedRoot`，字段类型错抛 `TypeError`
+  （两部分是否描述同一前缀、签名是否有效由 `verify_signed_prune` 判定）
+- `AuditLog.sign_prune(seed, size=None)` 是只读签发入口，`size` 默认当前日志
+  长度：先调用 `seal(size)`，再调用 `sign_root(seed, size)`，据其结果构造
+  `SignedPrune`；两部分天然同 `hash_name`、同 `size`，且
+  `merkle_root == root`、`chain_hash == head`。任何失败都在构造前抛出，不改变
+  日志状态，也不新增签名原文（检查点签的仍是 `sign_root` 的原文）
+- `verify_signed_prune(item, key)` 完全离线核验：用 `verify_signed_root` 以
+  32 字节公钥校验检查点签名，并要求回执与检查点字段一致——`hash_name` 相等、
+  `size` 相等、`merkle_root == checkpoint.root`、
+  `chain_hash == checkpoint.head`。公钥不受信任、两部分描述不同前缀，或回执 /
+  根 / 链头 / 签名被改，均返回 `False`（绝不抛异常）。入参不是 `SignedPrune`
+  （含绕过冻结构造器写入的容器字段类型错）抛 `TypeError`；嵌套结构非法沿用
+  `PruneReceipt` / `SignedRoot` / `verify_signed_root` 的既有异常
+  （`TypeError` / `ValueError`）；公钥不是 `bytes` 抛 `TypeError`、不是 32
+  字节抛 `ValueError`；核验为只读
+- `AuditLog.prune_signed(n, item, key) -> None` 先经
+  `verify_signed_prune(item, key)` 核验，通过后等价于 `prune(n, item.receipt)`
+  （后者仍重新核对 `n == receipt.size` 并自行从日志重算前缀根与链摘要）。
+  `n` 必须是非 `bool` 整数（类型错抛 `TypeError`）；授权不匹配（未信任公钥、
+  字段不一致、签名被改）或 `prune` 的既有校验失败（越界、保留点回退、回执与
+  日志不一致等）均抛 `ValueError`，且失败不改变任何日志、认证、索引、nonce
+  历史、frontier 检查点状态；其余异常沿用各既有入口
+- `encode_signed_prune(x)` / `decode_signed_prune(y)` 把整个签名裁剪授权序列化
+  为规范二进制并原样还原，使其可落盘、跨进程传输后继续凭预置信任的 Ed25519
+  公钥验真并用于裁剪，且不引入任何新的签名原文：
+
+```python
+from auditchain import encode_signed_prune, decode_signed_prune
+
+data = encode_signed_prune(item)          # bytes，可写文件/发网络
+restored = decode_signed_prune(data)      # 冻结 SignedPrune
+restored == item                          # True：字段相等
+encode_signed_prune(restored) == data     # True：重编码逐字节相同
+verify_signed_prune(restored, public_key) # True
+fresh_log.prune_signed(2, restored, public_key)  # 跨进程恢复后直接授权裁剪
+```
+
+  字节流为 `D || U(1) || B(P) || B(R)`，其中
+  `D = b"auditchain/signed-prune/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则）；`P` 与 `R` 分别是
+  既有 `encode_prune_receipt(receipt)` 与
+  `encode_signed_root(checkpoint)` 输出的完整规范字节，顺序固定为回执在前、
+  检查点在后，解码精确消费两个 blob 且**禁止尾随字节**。`encode_signed_prune`
+  只接受 `SignedPrune`（其余类型抛 `TypeError`，嵌套错误沿用既有编码器的
+  `TypeError` / `ValueError`），`decode_signed_prune` 只接受 `bytes`（含拒绝
+  `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度或任一嵌套
+  格式非法抛 `ValueError`；结构合法但两部分不一致或签名不匹配仍可解码，
+  `verify_signed_prune` 返回 `False`；两个入口均为只读且确定
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -543,6 +614,11 @@ python3 -m auditchain
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
   抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
+- `SignedPrune(receipt, checkpoint)` — 不可变的可信签名裁剪授权，按两个字段
+  相等、支持位置构造；`receipt` 为 `seal` 的前缀裁剪回执（必须是
+  `PruneReceipt`），`checkpoint` 为同一前缀的 `SignedRoot`（必须是
+  `SignedRoot`）；容器字段类型错抛 `TypeError`，两部分是否描述同一前缀、
+  签名是否有效由 `verify_signed_prune` 判定
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -649,10 +725,24 @@ python3 -m auditchain
     失败（非法选择、种子或 `size`）在构造前抛出，不改变日志状态；异常类型沿用
     `audit_batch` / `sign_root`（`TypeError` / `ValueError`）；离线用
     `verify_signed_audit_batch` 凭预信任公钥验真
+  - `sign_prune(private_key, size=None)` — 只读签发可信签名裁剪授权，返回不可变
+    `SignedPrune`：先调用 `seal(size)`，再调用 `sign_root(private_key, size)`
+    （`size` 默认当前长度），据此构造 `SignedPrune(receipt, checkpoint)`，两部分
+    描述同一前缀（同 `hash_name` / `size`，`merkle_root == root`、
+    `chain_hash == head`），且不新增签名原文。失败（非法种子或 `size`）在构造前
+    抛出，不改变日志状态；异常类型沿用 `seal` / `sign_root`
+    （`TypeError` / `ValueError`）；离线用 `verify_signed_prune` 凭预信任公钥验真
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
     回执不匹配或无有效回执抛 `ValueError`
+  - `prune_signed(retain_from, item, public_key)` — 先以
+    `verify_signed_prune(item, public_key)` 离线核验签名裁剪授权，通过后等价于
+    `prune(retain_from, item.receipt)`（仍自行重算前缀根与链摘要）。
+    `retain_from` 必须是非 `bool` 整数（类型错抛 `TypeError`）；授权不匹配
+    （未信任公钥、两部分字段不一致、签名被改）返回核验失败并抛 `ValueError`，
+    `prune` 的既有越界 / 回退 / 不匹配同样抛 `ValueError`；任何失败都不改变日志、
+    认证、索引、nonce 历史与 frontier 检查点状态，其余异常沿用既有入口
   - `apply_retention(value, *, mode="retain_from")` — 按保留策略计算保留点并原子完成封存与裁剪，
     返回 `PruneReceipt`：`mode="retain_from"` 时目标为 `value`（要求
     `retain_from <= value <= len(log)`），`mode="keep_last"` 时目标为
@@ -713,6 +803,15 @@ python3 -m auditchain
   `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
   `verify_signed_root` 的既有异常（`TypeError` / `ValueError`），公钥长度非
   32 字节抛 `ValueError`；调用只读
+- `verify_signed_prune(item, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
+  离线验证 `AuditLog.sign_prune` 签发的 `SignedPrune` 裁剪授权，无需持有日志：
+  先用 `verify_signed_root` 校验检查点签名，再要求回执与检查点描述同一前缀——
+  `hash_name` 相等、`size` 相等、`merkle_root == root`、`chain_hash == head`。
+  公钥不受信任、两部分不一致或回执 / 根 / 链头 / 签名被改返回 `False`，匹配
+  返回 `True`。入参不是 `SignedPrune`（含绕过构造器的容器字段类型错）或公钥
+  不是 `bytes` 抛 `TypeError`；嵌套结构非法沿用 `PruneReceipt` /
+  `SignedRoot` / `verify_signed_root` 的既有异常（`TypeError` /
+  `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head
@@ -749,6 +848,21 @@ python3 -m auditchain
   `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码均不校验
   签名、两端关联及证明内容，结构合法但验真不匹配仍可解码（验真返回 `False`）；
   两个入口均为只读且确定
+- `encode_signed_prune(item)` / `decode_signed_prune(data)` — 可信签名裁剪
+  授权的规范二进制编码与解码，使 `SignedPrune` 可落盘、跨进程恢复后继续凭
+  预置信任的 Ed25519 公钥验真并用于 `AuditLog.prune_signed`，且不新增签名
+  原文：字节流为 `D || U(1) || B(P) || B(R)`，其中
+  `D = b"auditchain/signed-prune/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则）；`P` 与 `R` 分别
+  是既有 `encode_prune_receipt(receipt)` 与 `encode_signed_root(checkpoint)`
+  的完整规范字节，顺序为回执在前、检查点在后，解码精确消费两个 blob 并禁止
+  尾随字节，分别交给既有 `decode_prune_receipt` 与 `decode_signed_root`。
+  前者只接受 `SignedPrune`（其余类型抛 `TypeError`，嵌套错误沿用既有编码器
+  的 `TypeError` / `ValueError`），后者只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、截断、尾随、blob 长度或任一嵌套格式非法抛
+  `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码不校验签名
+  及两部分关联，结构合法但两部分不一致或签名不匹配仍可解码（
+  `verify_signed_prune` 返回 `False`）；两个入口均为只读且确定
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

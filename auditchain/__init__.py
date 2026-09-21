@@ -10,7 +10,8 @@ verify_signed_consistency / encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_signed_root / decode_signed_root /
-encode_signed_audit_batch / decode_signed_audit_batch.
+encode_signed_audit_batch / decode_signed_audit_batch /
+encode_signed_consistency / decode_signed_consistency.
 """
 
 from __future__ import annotations
@@ -49,12 +50,14 @@ __all__ = [
     "decode_audit_receipt",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
+    "decode_signed_consistency",
     "decode_signed_root",
     "decrypt_entry",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
+    "encode_signed_consistency",
     "encode_signed_root",
     "entry_digest",
     "verify_audit_receipt",
@@ -123,6 +126,14 @@ _ED25519_SIGNATURE_BYTES = 64
 # encode_signed_root bytes, in that order and with nothing else.
 _SIGNED_AUDIT_BATCH_MAGIC = b"auditchain/signed-audit-batch/v1\0"
 _SIGNED_AUDIT_BATCH_VERSION = 1
+
+# Binary framing of encode_signed_consistency / decode_signed_consistency:
+# a fixed magic, then the envelope version as a u64, two u64-length-prefixed
+# blobs holding the complete canonical encode_signed_root bytes of the old
+# and new checkpoints, and the consistency proof as a u64 node count followed
+# by one u64-length-prefixed blob per digest, in proof order, nothing else.
+_SIGNED_CONSISTENCY_MAGIC = b"auditchain/signed-consistency/v1\0"
+_SIGNED_CONSISTENCY_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -3101,3 +3112,121 @@ def decode_signed_audit_batch(data: Any) -> SignedAuditBatch:
     batch = decode_audit_batch(batch_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
+
+
+def encode_signed_consistency(receipt: Any) -> bytes:
+    """Encode a :class:`SignedConsistency` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-consistency/v1\\0"``; it then writes, strictly in
+    order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the ``old`` checkpoint blob, the ``new`` checkpoint
+    blob, the proof node count and one blob per proof digest in tuple order —
+    nothing may be omitted, reordered or appended. Each checkpoint blob is a
+    u64 byte length followed by the complete canonical output of
+    :func:`encode_signed_root` over that checkpoint; each proof blob is a u64
+    byte length followed by the raw digest bytes. No new signing message is
+    introduced: encoding is read-only and only re-uses the existing canonical
+    signed-root encoding.
+
+    ``receipt`` must be a :class:`SignedConsistency` — anything else, or a
+    container whose fields have been bypassed to wrong types, raises
+    TypeError; nested checkpoint problems raise exactly the exceptions of
+    :func:`encode_signed_root` (TypeError or ValueError). Encoding is
+    deterministic: re-encoding a decoded receipt reproduces the original
+    bytes exactly, and a structurally valid receipt whose signatures or proof
+    do not verify encodes just as well — encoding never inspects signatures,
+    the linkage of the two checkpoints or the proof content.
+    """
+    if not isinstance(receipt, SignedConsistency):
+        raise TypeError("receipt must be a SignedConsistency")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedConsistency(receipt.old, receipt.new, receipt.proof)
+    old_blob = encode_signed_root(checked.old)
+    new_blob = encode_signed_root(checked.new)
+    parts = [
+        _SIGNED_CONSISTENCY_MAGIC,
+        _encode_u64(_SIGNED_CONSISTENCY_VERSION, "version"),
+        _encode_blob(old_blob),
+        _encode_blob(new_blob),
+        _encode_u64(len(checked.proof), "proof count"),
+    ]
+    for node in checked.proof:
+        parts.append(_encode_blob(node))
+    return b"".join(parts)
+
+
+def decode_signed_consistency(data: Any) -> SignedConsistency:
+    """Decode bytes produced by :func:`encode_signed_consistency`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-consistency/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the
+    length-prefixed ``old`` checkpoint blob, the length-prefixed ``new``
+    checkpoint blob, the u64 proof node count and one length-prefixed blob
+    per proof digest, with no trailing bytes. Each checkpoint blob is handed
+    whole to :func:`decode_signed_root`, so every nested framing and
+    structural rule is theirs, and every proof digest must be exactly the
+    digest width of the ``old`` checkpoint's hash algorithm — the same width
+    :func:`verify_signed_consistency` requires of the proof. A bad magic or
+    version, truncation, an oversized blob length, trailing bytes, an illegal
+    nested encoding or a proof digest of the wrong width raises ValueError.
+
+    The returned object is a frozen :class:`SignedConsistency` whose fields
+    equal the originally encoded ones, and re-encoding reproduces the
+    original bytes exactly. Decoding never verifies the signatures, the
+    linkage of the two checkpoints or the proof content: a structurally sound
+    encoding that simply does not verify still decodes, and
+    :func:`verify_signed_consistency` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_CONSISTENCY_MAGIC):
+        raise ValueError("not an auditchain signed-consistency encoding")
+    offset = len(_SIGNED_CONSISTENCY_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_CONSISTENCY_VERSION:
+        raise ValueError(
+            f"unsupported signed-consistency version {version}"
+        )
+    old_blob = read_blob("old")
+    new_blob = read_blob("new")
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed consistency")
+    # Decode both checkpoint blobs with the existing decoder; its own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    old = decode_signed_root(old_blob)
+    new = decode_signed_root(new_blob)
+    # Proof digests must be exactly the digest width verify_consistency
+    # requires under the old checkpoint's hash algorithm; the proof content
+    # itself is left to the verification contract.
+    digest_size = _digest_size(old.hash_name)
+    for node in proof:
+        if len(node) != digest_size:
+            raise ValueError(f"proof element must be {digest_size} bytes")
+    return SignedConsistency(old=old, new=new, proof=proof)

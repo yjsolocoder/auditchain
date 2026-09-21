@@ -682,6 +682,40 @@ verify_auth_batch(items, verifier)               # (True, True)，空 tuple 返�
   认证或日志状态
 - 裁剪时同步删除已释放前缀的标签，保留段标签与后续演进不受影响
 
+`auth_batch` 的结果可编码为规范字节形式落盘，跨进程恢复为同一不可变项元组后继续
+由 `verify_auth_batch` 凭另行走带外信任通道的 `Verifier`（stage-0 密钥）离线核验；
+字节流只含算法名与各项，**不含任何验证材料 / 密钥**，编解码均为只读、确定，旧认证
+接口不变：
+
+```python
+from auditchain import encode_auth_batch, decode_auth_batch
+
+data = encode_auth_batch(items)             # bytes，可写文件/发网络
+hash_name, restored = decode_auth_batch(data)
+hash_name                                   # "sha256"
+restored == items                           # True：不可变 (Entry, AuthTag) 项元组相等
+encode_auth_batch(restored) == data         # True：解码后重编码逐字节相同
+verify_auth_batch(restored, verifier)       # (True, ...)：恢复后继续离线逐项核验
+decode_auth_batch(encode_auth_batch(()))    # ("sha256", ())：空批次
+```
+
+- 签名为 `encode_auth_batch(items, *, hash_name="sha256") -> bytes`，`items` 只收
+  既有 `auth_batch` 项元组 `tuple[tuple[Entry, AuthTag], ...]` 并复用其结构约束；
+  `hash_name` 必须与签发日志及验证材料一致（默认 `"sha256"`，可任意固定输出长度算法）
+- `decode_auth_batch(data) -> tuple[str, tuple[tuple[Entry, AuthTag], ...]]` 只收
+  `bytes`（拒绝 `bytearray` / `memoryview`），返回算法名与不可变项元组（空批次为
+  `()`），重编码逐字节相同
+- 字节流以魔数 `b"auditchain/auth-batch/v1\0"` 开头，随后**严格依次**写 `version`
+  （恒为 `1`，u64 大端）、`hash_name` 的 UTF-8 blob、项数（u64）与各项；整数均为
+  u64 大端，blob 均为 u64 字节长度前缀加原始字节（零长度也写全零 u64）。各项依次写
+  `index`（u64）、`payload` blob、`previous_hash` blob、`entry_hash` blob、
+  `stage`（u64）、`tag` blob，不允许省略、换序或附加字节
+- 容器或字段类型错抛 `TypeError`；魔数、版本、非法 UTF-8、未知或非固定输出算法、
+  截断、尾随字节、blob 长度溢出、计数不符、u64 范围、摘要 / 标签宽度、索引顺序（须
+  严格升序、无重复）或 stage 连续性（相邻项 stage 恰差 1，首项可非 0）错误均抛
+  `ValueError`；结构合法但标签 / 条目不匹配仍可正常编解码，仅
+  `verify_auth_batch` 在对应位置返回 `False`
+
 裁剪只释放内容、不改变逻辑：
 
 - `len(log)` 仍是累计条数；索引始终为绝对值（下一条仍接在原末尾之后）；`head`、`append`
@@ -1060,6 +1094,20 @@ python3 -m auditchain
   `items` 只接受 `tuple`，且 `Entry.index` 严格升序、`AuthTag.stage` 连续；
   容器或元素类型错抛 `TypeError`，重复、范围、顺序、容量（index/stage 达到 `2**64`）
   或摘要结构错抛 `ValueError`；结构合法但不匹配仅令对应位置为 `False`
+- `encode_auth_batch(items, *, hash_name="sha256")` /
+  `decode_auth_batch(data)` — 前向安全批量认证材料的规范二进制编码与解码，使
+  `auth_batch` 结果可落盘、跨进程恢复后继续由 `verify_auth_batch` 离线核验（编解码
+  只读、确定，旧接口不变；字节流不含 verifier / 密钥）：魔数
+  `b"auditchain/auth-batch/v1\0"` 开头，依次写 version=1（u64）、`hash_name` 的
+  UTF-8 blob、项数（u64）与各项；整数为 u64 大端，blob 为 u64 长度前缀加原始字节
+  （零长度也写全零 u64）。各项依次写 `index`、`payload`、`previous_hash`、
+  `entry_hash`（index 为 u64，其余 blob）、`stage`（u64）、`tag`（blob）。
+  `encode_auth_batch` 只收既有批量项元组（容器 / 字段类型错抛 `TypeError`；u64
+  范围、算法、摘要 / 标签宽度、索引顺序或 stage 连续性错误抛 `ValueError`），
+  `decode_auth_batch` 只接受 `bytes`（其他类型抛 `TypeError`），魔数、版本、UTF-8、
+  算法、截断、尾随、计数、宽度、u64 范围、索引顺序或 stage 连续性错误抛
+  `ValueError`；返回 `(hash_name, items)`，`items` 为不可变项元组，重编码逐字节
+  相同；结构合法但认证不匹配仍可解码，`verify_auth_batch` 逐项返回 `False`
 
 Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry_hash)`，父节点为
 `H("auditchain/merkle-node/v1" + left + right)`，奇数层末节点原样提升；空树根为

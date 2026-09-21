@@ -10,6 +10,7 @@ verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
+encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
@@ -53,6 +54,7 @@ __all__ = [
     "GENESIS_HASH",
     "decode_audit_batch",
     "decode_audit_receipt",
+    "decode_auth_batch",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
     "decode_signed_consistency",
@@ -63,6 +65,7 @@ __all__ = [
     "dump_secure_log",
     "encode_audit_batch",
     "encode_audit_receipt",
+    "encode_auth_batch",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
     "encode_signed_consistency",
@@ -122,6 +125,12 @@ _PRUNE_RECEIPT_VERSION = 1
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
 _BATCH_VERSION = 1
+# Binary framing of encode_auth_batch / decode_auth_batch: same u64/blob
+# rules, persisting the (Entry, AuthTag) item tuple minted by
+# AuditLog.auth_batch together with the hash algorithm verify_auth_batch
+# needs, with no verifier material of any kind.
+_AUTH_BATCH_MAGIC = b"auditchain/auth-batch/v1\0"
+_AUTH_BATCH_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
 
@@ -2892,6 +2901,204 @@ def decode_audit_batch(data: Any) -> tuple[str, int, bytes, tuple[Entry, ...], t
     # algorithm, ranges, digest widths, ordering, last entry and node count.
     _unpack_audit_batch(receipt)
     return receipt
+
+
+def _unpack_auth_batch(
+    items: Any, hash_name: str
+) -> tuple[tuple[Entry, AuthTag], ...]:
+    """Validate the ``(Entry, AuthTag)`` item shape shared by
+    :func:`encode_auth_batch`, :func:`decode_auth_batch` and
+    :func:`verify_auth_batch`.
+
+    ``items`` must be a tuple of exactly-two-element ``(Entry, AuthTag)``
+    pairs with strictly ascending, non-bool, u64-range entry indices, fields
+    whose digest width matches ``hash_name`` and consecutive (not merely
+    ascending) tag stages starting at any value — the output of
+    :meth:`AuditLog.auth_batch`. Returns the canonicalized items
+    (``bytes``/``bytearray`` entry fields copied to ``bytes``); the verifier
+    tuple of :func:`verify_auth_batch` applies the same checks itself. Only
+    structural properties are checked: whether a tag authenticates is left to
+    :func:`verify_auth_batch`.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
+    digest_size = _digest_size(hash_name)
+    checked_items: list[tuple[Entry, AuthTag]] = []
+    previous_index: int | None = None
+    previous_stage: int | None = None
+    for item in items:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("each item must be an (Entry, AuthTag) tuple")
+        entry, tag = item
+        if not isinstance(entry, Entry):
+            raise TypeError("item entry must be an Entry")
+        if not isinstance(tag, AuthTag):
+            raise TypeError("item tag must be an AuthTag")
+        if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+            raise TypeError("entry.index must be an integer")
+        if not 0 <= entry.index < _MAX_STAGE:
+            raise ValueError("entry.index must satisfy 0 <= index < 2**64")
+        if previous_index is not None and entry.index <= previous_index:
+            raise ValueError(
+                "item entries must be in strictly ascending index order with no duplicates"
+            )
+        for name in ("payload", "previous_hash", "entry_hash"):
+            if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                raise TypeError(f"entry.{name} must be bytes")
+        if len(entry.previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        if len(entry.entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        # Re-validate even against a tag built with object.__setattr__, the
+        # same defensive ordering verify_auth_batch uses.
+        if not isinstance(tag.stage, int) or isinstance(tag.stage, bool):
+            raise TypeError("tag.stage must be an integer")
+        if not 0 <= tag.stage < _MAX_STAGE:
+            raise ValueError("tag.stage must satisfy 0 <= stage < 2**64")
+        if not isinstance(tag.tag, bytes):
+            raise TypeError("tag.tag must be bytes")
+        if len(tag.tag) != digest_size:
+            raise ValueError(f"tag.tag must be {digest_size} bytes")
+        if previous_stage is not None and tag.stage != previous_stage + 1:
+            raise ValueError("item tag stages must be consecutive")
+        previous_index = entry.index
+        previous_stage = tag.stage
+        checked_items.append(
+            (
+                Entry(
+                    entry.index,
+                    bytes(entry.payload),
+                    bytes(entry.previous_hash),
+                    bytes(entry.entry_hash),
+                ),
+                AuthTag(tag.stage, tag.tag),
+            )
+        )
+    return tuple(checked_items)
+
+
+def encode_auth_batch(items: Any, *, hash_name: str = "sha256") -> bytes:
+    """Encode an :meth:`AuditLog.auth_batch` result into canonical bytes.
+
+    Persists the forward-secure authentication material so it can be written
+    to disk and restored in another process, then checked entirely offline by
+    :func:`verify_auth_batch` — the verifier (stage-0 key) is never part of
+    the encoding and must travel through a separate trust channel.
+
+    The encoding starts with the magic ``b"auditchain/auth-batch/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear in the order ``version`` (1), ``hash_name`` (UTF-8
+    blob) and item count; each item is written exactly as
+    ``index`` (u64), ``payload`` blob, ``previous_hash`` blob,
+    ``entry_hash`` blob, ``stage`` (u64), ``tag`` blob — the entry first, then
+    the tag — with nothing omitted, reordered or appended.
+
+    ``items`` must be the ``(Entry, AuthTag)`` tuple produced by
+    :meth:`AuditLog.auth_batch` and accepted by :func:`verify_auth_batch` —
+    anything else, or a field of the wrong type, raises TypeError; an unknown
+    or non-fixed-output ``hash_name``, an index or stage outside the u64
+    range, non-ascending or duplicate entry indices, non-consecutive tag
+    stages or digest/tag widths that do not match the named algorithm raise
+    ValueError. Encoding is read-only and deterministic: it never mutates an
+    item, and re-encoding the decoded items reproduces the original bytes
+    exactly. A structurally valid item whose tag does not authenticate
+    encodes just as well; :func:`verify_auth_batch` reports False per item.
+    """
+    checked = _unpack_auth_batch(items, hash_name)
+    parts = [
+        _AUTH_BATCH_MAGIC,
+        _encode_u64(_AUTH_BATCH_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(len(checked), "items count"),
+    ]
+    for entry, tag in checked:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        parts.append(_encode_u64(tag.stage, "tag.stage"))
+        parts.append(_encode_blob(tag.tag))
+    return b"".join(parts)
+
+
+def decode_auth_batch(data: Any) -> tuple[str, tuple[tuple[Entry, AuthTag], ...]]:
+    """Decode bytes produced by :func:`encode_auth_batch`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, an item
+    count or integer outside the u64 range, ``previous_hash`` /
+    ``entry_hash`` / ``tag`` widths that do not match the named digest,
+    non-ascending or duplicate entry indices, or non-consecutive tag stages
+    raise ValueError. Returns ``(hash_name, items)`` where ``items`` is the
+    immutable tuple of frozen ``(Entry, AuthTag)`` pairs in their original
+    order — ``()`` for an empty batch — and re-encoding it with the same
+    ``hash_name`` reproduces the original bytes exactly. A structurally sound
+    encoding whose entries or tags simply do not authenticate decodes fine;
+    :func:`verify_auth_batch` then returns False per item rather than
+    raising.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_AUTH_BATCH_MAGIC):
+        raise ValueError("not an auditchain auth-batch encoding")
+    offset = len(_AUTH_BATCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _AUTH_BATCH_VERSION:
+        raise ValueError(f"unsupported auth-batch version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    # Resolve the algorithm and its digest width before reading any item so a
+    # non-fixed-output or unknown hash_name reports ValueError up front.
+    _digest_size(hash_name)
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        stage = read_u64("tag.stage")
+        tag_bytes = read_blob("tag.tag")
+        items.append(
+            (
+                Entry(index, payload, previous_hash, entry_hash),
+                AuthTag(stage, tag_bytes),
+            )
+        )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the auth batch")
+    # Apply the same structural contract as auth_batch / verify_auth_batch:
+    # ranges, digest widths, ascending indices and consecutive stages. The
+    # Entry/AuthTag constructors cover field types and u64 ranges; the shared
+    # check covers ordering, continuity and widths for the named algorithm.
+    items = _unpack_auth_batch(tuple(items), hash_name)
+    return hash_name, items
 
 
 def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:

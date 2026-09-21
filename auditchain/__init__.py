@@ -1,17 +1,19 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / SignedRoot / SignedAuditBatch / SignedConsistency /
+Verifier / SignedRoot / SignedAuditBatch / SignedConsistency / SignedPrune /
 IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
 verify_inclusion / verify_batch_inclusion / verify_consistency /
 verify_auth / verify_audit_receipt / verify_audit_batch /
 verify_signed_root / verify_signed_audit_batch /
-verify_signed_consistency / encode_audit_receipt / decode_audit_receipt /
+verify_signed_consistency / verify_signed_prune /
+encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
-encode_signed_consistency / decode_signed_consistency.
+encode_signed_consistency / decode_signed_consistency /
+encode_signed_prune / decode_signed_prune.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ __all__ = [
     "PruneReceipt",
     "SignedAuditBatch",
     "SignedConsistency",
+    "SignedPrune",
     "SignedRoot",
     "Verifier",
     "GENESIS_HASH",
@@ -51,6 +54,7 @@ __all__ = [
     "decode_prune_receipt",
     "decode_signed_audit_batch",
     "decode_signed_consistency",
+    "decode_signed_prune",
     "decode_signed_root",
     "decrypt_entry",
     "encode_audit_batch",
@@ -58,6 +62,7 @@ __all__ = [
     "encode_prune_receipt",
     "encode_signed_audit_batch",
     "encode_signed_consistency",
+    "encode_signed_prune",
     "encode_signed_root",
     "entry_digest",
     "verify_audit_receipt",
@@ -68,6 +73,7 @@ __all__ = [
     "verify_inclusion",
     "verify_signed_audit_batch",
     "verify_signed_consistency",
+    "verify_signed_prune",
     "verify_signed_root",
 ]
 
@@ -134,6 +140,13 @@ _SIGNED_AUDIT_BATCH_VERSION = 1
 # length-prefixed blob per proof node in tuple order, with nothing else.
 _SIGNED_CONSISTENCY_MAGIC = b"auditchain/signed-consistency/v1\0"
 _SIGNED_CONSISTENCY_VERSION = 1
+
+# Binary framing of encode_signed_prune / decode_signed_prune: a fixed magic,
+# then the envelope version as a u64 and two u64-length-prefixed blobs holding
+# the complete canonical encode_prune_receipt and encode_signed_root bytes, in
+# that order and with nothing else.
+_SIGNED_PRUNE_MAGIC = b"auditchain/signed-prune/v1\0"
+_SIGNED_PRUNE_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -695,6 +708,38 @@ class SignedConsistency:
         for node in self.proof:
             if not isinstance(node, bytes):
                 raise TypeError("proof element must be bytes")
+
+
+@dataclass(frozen=True)
+class SignedPrune:
+    """Ed25519-authorized prune authorization: a sealed receipt plus its signed checkpoint.
+
+    Bundles the :class:`PruneReceipt` of :meth:`AuditLog.seal` with the
+    :class:`SignedRoot` checkpoint of :meth:`AuditLog.sign_root` for the very
+    same prefix, so a log holder may release a sealed prefix against an
+    artifact an offline receiver holding only a pre-trusted 32-byte Ed25519
+    public key can authenticate — without holding the :class:`AuditLog`:
+
+    - ``receipt``: the :class:`PruneReceipt` produced by
+      :meth:`AuditLog.seal` for the prefix to be released,
+    - ``checkpoint``: the :class:`SignedRoot` produced by
+      :meth:`AuditLog.sign_root` for that same prefix.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``receipt`` must be a
+    :class:`PruneReceipt` and ``checkpoint`` a :class:`SignedRoot`; whether the
+    two describe the same prefix is left to :func:`verify_signed_prune`, so a
+    field of the wrong type raises TypeError.
+    """
+
+    receipt: PruneReceipt
+    checkpoint: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, PruneReceipt):
+            raise TypeError("receipt must be a PruneReceipt")
+        if not isinstance(self.checkpoint, SignedRoot):
+            raise TypeError("checkpoint must be a SignedRoot")
 
 
 @dataclass(frozen=True)
@@ -1754,6 +1799,34 @@ class AuditLog:
         new = self.sign_root(private_key, new_size)
         return SignedConsistency(old=old, new=new, proof=proof)
 
+    def sign_prune(
+        self,
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedPrune:
+        """Issue a :class:`SignedPrune`: a prune receipt sealed by a
+        pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``receipt = seal(size)``
+        followed by ``checkpoint = sign_root(private_key, size)`` (``size``
+        defaulting to the current log length), bundled as one
+        :class:`SignedPrune`. The receipt captures the prefix hash algorithm,
+        size, Merkle root and chain head that :meth:`prune` must agree with,
+        and the checkpoint lets the same receiver confirm — using only a
+        pre-trusted 32-byte Ed25519 public key — that the root and chain head
+        were issued by the log holder; no new signing message is introduced,
+        the checkpoint signs exactly the :meth:`sign_root` message. The call
+        is read-only: it never changes entries, head, authentication state,
+        Merkle roots or proofs, and a failure (an invalid seed or size) raises
+        before the bundle is constructed, leaving all state unchanged.
+        """
+        # seal(size) validates size and rebuildability first, exactly as the
+        # public method does; sign_root() is read-only as well, so either
+        # failure leaves the log untouched and nothing is ever signed.
+        receipt = self.seal(size)
+        checkpoint = self.sign_root(private_key, size)
+        return SignedPrune(receipt=receipt, checkpoint=checkpoint)
+
     def prune(self, retain_from: int, receipt: PruneReceipt) -> None:
         """Release payloads of the sealed prefix, retaining entries from ``retain_from``.
 
@@ -1813,6 +1886,33 @@ class AuditLog:
             self._tags.pop(released_index, None)
         self._retain_from = retain_from
         self._checkpoint_head = expected_chain
+
+    def prune_signed(self, retain_from: int, item: Any, public_key: Any) -> None:
+        """Release a prefix only against a verified :class:`SignedPrune`.
+
+        Offline counterpart of :meth:`prune`: the signed prune is first
+        authenticated entirely without trusting the sender —
+        :func:`verify_signed_prune` checks the checkpoint Ed25519 signature
+        with the 32-byte pre-trusted ``public_key`` and requires the bundled
+        receipt and checkpoint to describe the very same prefix (equal
+        ``hash_name`` and ``size``, ``receipt.merkle_root == checkpoint.root``
+        and ``receipt.chain_hash == checkpoint.head``) — and only then does
+        the call behave exactly as ``prune(retain_from, item.receipt)``.
+
+        A prune that fails verification (an untrusted key, a mismatched
+        receipt/checkpoint pair, or any altered field) raises ValueError
+        before the log is touched, so on failure every entry, authentication
+        tag/stage/key, locator index, frontier checkpoint and nonce history
+        stays exactly as it was. ``item`` that is not a :class:`SignedPrune`
+        or a key that is not ``bytes`` raises TypeError; every other error is
+        exactly that of :func:`verify_signed_prune` and :meth:`prune`
+        (TypeError or ValueError).
+        """
+        if not isinstance(item, SignedPrune):
+            raise TypeError("item must be a SignedPrune")
+        if not verify_signed_prune(item, public_key):
+            raise ValueError("signed prune failed verification")
+        self.prune(retain_from, item.receipt)
 
     def apply_retention(self, value: int, *, mode: str = "retain_from") -> PruneReceipt:
         """Seal and prune atomically at a retention point derived from ``value``.
@@ -2915,6 +3015,61 @@ def verify_signed_consistency(receipt: Any, public_key: Any) -> bool:
     )
 
 
+def verify_signed_prune(item: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedPrune` against a pre-trusted Ed25519 key.
+
+    Confirms the prune authorization entirely offline, without holding the
+    log: :func:`verify_signed_root` verifies the bundled checkpoint signature
+    with the 32-byte ``public_key``, and the bundled :class:`PruneReceipt`
+    must describe exactly the prefix the checkpoint attests — equal
+    ``hash_name`` and ``size``, ``receipt.merkle_root == checkpoint.root``
+    and ``receipt.chain_hash == checkpoint.head``. A genuine authorization
+    from the trusted key returns True; a structurally valid authorization
+    signed by another key, whose receipt and checkpoint disagree, or whose
+    fields have been altered returns False.
+
+    Input that is not a :class:`SignedPrune` (or whose container fields have
+    been bypassed to wrong types) raises TypeError; nested structural
+    violations raise exactly the exceptions of the :class:`PruneReceipt`
+    constructor and :func:`verify_signed_root` (TypeError or ValueError), and
+    a public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the item.
+    """
+    if not isinstance(item, SignedPrune):
+        raise TypeError("item must be a SignedPrune")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would; reconstructing the receipt
+    # re-runs its own structural contract, while verify_signed_root below
+    # re-validates the checkpoint.
+    checked = SignedPrune(item.receipt, item.checkpoint)
+    # Reconstructing the receipt re-runs its own structural contract even when
+    # its fields were set bypassing the frozen constructor; verify_signed_root
+    # re-validates the checkpoint the same way.
+    receipt = PruneReceipt(
+        checked.receipt.hash_name,
+        checked.receipt.size,
+        checked.receipt.merkle_root,
+        checked.receipt.chain_hash,
+    )
+    checkpoint = checked.checkpoint
+    if not verify_signed_root(checkpoint, public_key):
+        return False
+    # The signed checkpoint must attest exactly the prefix the receipt seals:
+    # same hash algorithm and size, with its signed root/head equal to the
+    # root/chain hash the receipt carries. A disagreement on the hash
+    # algorithm is a linkage failure, not a structural error.
+    if receipt.hash_name != checkpoint.hash_name:
+        return False
+    if receipt.size != checkpoint.size:
+        return False
+    if not hmac.compare_digest(receipt.merkle_root, checkpoint.root):
+        return False
+    if not hmac.compare_digest(receipt.chain_hash, checkpoint.head):
+        return False
+    return True
+
+
 def encode_signed_root(receipt: Any) -> bytes:
     """Encode a :class:`SignedRoot` into its canonical binary form.
 
@@ -3243,3 +3398,105 @@ def decode_signed_consistency(data: Any) -> SignedConsistency:
         if len(node) != digest_size:
             raise ValueError(f"proof element must be {digest_size} bytes")
     return SignedConsistency(old=old, new=new, proof=proof)
+
+
+def encode_signed_prune(item: Any) -> bytes:
+    """Encode a :class:`SignedPrune` into its canonical binary form.
+
+    The encoding is exactly
+    ``D || U(1) || B(P) || B(R)`` with
+    ``D = b"auditchain/signed-prune/v1\\0"``; ``U`` is an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x`` (a zero length is an
+    all-zero u64). After the magic it writes, strictly in order, the envelope
+    ``version`` (always 1), the receipt blob and the checkpoint blob — nothing
+    may be omitted, reordered or appended. The receipt blob is the complete
+    canonical output of :func:`encode_prune_receipt` over ``item.receipt`` and
+    the checkpoint blob is the complete canonical output of
+    :func:`encode_signed_root` over ``item.checkpoint``. No new signing
+    message is introduced: encoding is read-only and only re-uses the
+    existing canonical encodings.
+
+    ``item`` must be a :class:`SignedPrune` — anything else, or an item whose
+    fields have been bypassed to wrong types, raises TypeError; nested
+    structural problems raise exactly the exceptions of
+    :func:`encode_prune_receipt` and :func:`encode_signed_root` (TypeError or
+    ValueError). Encoding is deterministic: re-encoding a decoded item
+    reproduces the original bytes exactly, and a structurally valid item whose
+    checkpoint signature does not match encodes just as well.
+    """
+    if not isinstance(item, SignedPrune):
+        raise TypeError("item must be a SignedPrune")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedPrune(item.receipt, item.checkpoint)
+    receipt_blob = encode_prune_receipt(checked.receipt)
+    checkpoint_blob = encode_signed_root(checked.checkpoint)
+    return b"".join((
+        _SIGNED_PRUNE_MAGIC,
+        _encode_u64(_SIGNED_PRUNE_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        _encode_blob(checkpoint_blob),
+    ))
+
+
+def decode_signed_prune(data: Any) -> SignedPrune:
+    """Decode bytes produced by :func:`encode_signed_prune`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). The encoding is exactly
+    ``D || U(1) || B(P) || B(R)`` with
+    ``D = b"auditchain/signed-prune/v1\\0"``: after the magic it must contain,
+    strictly in order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed receipt blob and one length-prefixed checkpoint blob, with
+    no trailing bytes. The receipt blob is handed whole to
+    :func:`decode_prune_receipt` and the checkpoint blob whole to
+    :func:`decode_signed_root`, so every nested framing and structural rule
+    is theirs. A bad magic or version, truncation, an oversized blob length,
+    trailing bytes or an illegal nested encoding raises ValueError.
+
+    The association between the receipt and the checkpoint and the checkpoint
+    signature are not checked here. The returned object is a frozen
+    :class:`SignedPrune` whose fields equal the originally encoded ones
+    (positionally constructed, compared by both fields), and re-encoding
+    reproduces the original bytes exactly. A structurally sound encoding whose
+    receipt and checkpoint disagree or whose checkpoint signature simply does
+    not verify still decodes; :func:`verify_signed_prune` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_PRUNE_MAGIC):
+        raise ValueError("not an auditchain signed-prune encoding")
+    offset = len(_SIGNED_PRUNE_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_PRUNE_VERSION:
+        raise ValueError(f"unsupported signed-prune version {version}")
+    receipt_blob = read_blob("receipt")
+    checkpoint_blob = read_blob("checkpoint")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed prune")
+    # Decode both nested blobs with their existing decoders; their own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    receipt = decode_prune_receipt(receipt_blob)
+    checkpoint = decode_signed_root(checkpoint_blob)
+    return SignedPrune(receipt=receipt, checkpoint=checkpoint)

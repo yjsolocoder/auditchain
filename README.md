@@ -532,6 +532,41 @@ fresh_log.prune_signed(2, restored, public_key)  # 跨进程恢复后直接授�
   格式非法抛 `ValueError`；结构合法但两部分不一致或签名不匹配仍可解码，
   `verify_signed_prune` 返回 `False`；两个入口均为只读且确定
 
+### 签名日志状态转储（Ed25519）
+
+`dump_log(log, private_key)` 把一份**未裁剪、无认证、无加密历史**的
+`AuditLog` 连同其签名快照检查点序列化为规范二进制；`load_log(data,
+public_key)` 在仅凭预置信任的 Ed25519 公钥验真后，重建一份独立、可变的
+`AuditLog`，全部既有接口（`append` / `find` / `verify` / Merkle 证明等）
+照常可用：
+
+```python
+from auditchain import dump_log, load_log
+
+data = dump_log(log, private_key)          # bytes，可写文件/发网络
+restored = load_log(data, public_key)      # 独立可变 AuditLog
+restored.entries() == log.entries()        # True：条目逐字节相同
+restored.head == log.head                  # True
+restored.find(b"alpha") == log.find(b"alpha")  # find 索引已重建
+restored.append("next")                    # 恢复后可继续追加，与原日志互不影响
+```
+
+  字节流为 `D || U(1) || B(C) || U(n) || E1…En`，其中
+  `D = b"auditchain/log-state/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`C` 是既有 `encode_signed_root` 对
+  `log.sign_root(private_key)` 检查点输出的完整规范字节（不引入任何新的
+  签名原文，私钥只用一次、绝不落盘），`n` 为条目数，`Ei` 按
+  `U(index) || B(payload) || B(previous_hash) || B(entry_hash)` 依次编码。
+  `dump_log` 只接受未裁剪（`retain_from == 0`）、无密钥认证、无加密历史的
+  `AuditLog`——裁剪点、认证密钥/阶段与 nonce 历史都无法随状态迁移，故拒绝
+  导出；导出为只读且确定（同状态同种子字节相同）。`load_log` 先以公钥核验
+  `C` 的签名，再要求条目索引恰为 `0..n-1` 且 `C.size == n`，随后按
+  `C.hash_name` 重算每条 `entry_digest`、链头与 Merkle 根，全部与 `C`
+  一致才重建日志与 find 索引。两入口类型错抛 `TypeError`；导出遇种子长度
+  或非限定日志抛 `ValueError`；加载遇公钥长度、魔数/版本/算法/摘要宽度/
+  索引顺序、截断/尾随、验签失败或状态不一致抛 `ValueError`，且绝不凭未验
+  数据建日志
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -882,6 +917,17 @@ python3 -m auditchain
   `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码不校验签名
   及两部分关联，结构合法但两部分不一致或签名不匹配仍可解码（
   `verify_signed_prune` 返回 `False`）；两个入口均为只读且确定
+- `dump_log(log, private_key)` / `load_log(data, public_key)` — 签名日志状态
+  转储与恢复：把未裁剪、无认证、无加密历史的 `AuditLog` 连同其
+  `sign_root` 检查点序列化（不存密钥、不新增签名原文，同状态同种子字节
+  相同），字节流为 `b"auditchain/log-state/v1\0" || U(1) || B(C) || U(n)
+  || E1…En`，`C` 为完整 `encode_signed_root` 输出，`Ei` 按
+  `U(index) || B(payload) || B(previous_hash) || B(entry_hash)` 编码；
+  加载以公钥验签 `C`，要求索引为 `0..n-1` 且 `C.size == n`，按
+  `C.hash_name` 重算 `entry_digest` 链头与 Merkle 根并须匹配 `C`，随后
+  重建独立可变日志与 find 索引。两入口类型错抛 `TypeError`；导出遇种子
+  长度或非限定日志抛 `ValueError`；加载遇公钥长度、魔数/版本/算法/宽度/
+  顺序、截断/尾随、验签或状态不一致抛 `ValueError`；导出只读
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

@@ -13,7 +13,8 @@ encode_audit_batch / decode_audit_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
-encode_signed_prune / decode_signed_prune.
+encode_signed_prune / decode_signed_prune /
+dump_log / load_log.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ __all__ = [
     "decode_signed_prune",
     "decode_signed_root",
     "decrypt_entry",
+    "dump_log",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_prune_receipt",
@@ -65,6 +67,7 @@ __all__ = [
     "encode_signed_prune",
     "encode_signed_root",
     "entry_digest",
+    "load_log",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -148,6 +151,15 @@ _SIGNED_CONSISTENCY_VERSION = 1
 # that order and with nothing else.
 _SIGNED_PRUNE_MAGIC = b"auditchain/signed-prune/v1\0"
 _SIGNED_PRUNE_VERSION = 1
+
+# Binary framing of dump_log / load_log: a fixed magic, then the envelope
+# version as a u64, the complete canonical encode_signed_root bytes of the
+# snapshot checkpoint as one length-prefixed blob, the entry count as a u64
+# and each entry in chain order as U(index) || B(payload) ||
+# B(previous_hash) || B(entry_hash), with nothing else. No new signing
+# message is introduced: the checkpoint signs exactly the sign_root message.
+_LOG_STATE_MAGIC = b"auditchain/log-state/v1\0"
+_LOG_STATE_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -3623,3 +3635,190 @@ def decode_signed_prune(data: Any) -> SignedPrune:
     receipt = decode_prune_receipt(receipt_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedPrune(receipt=receipt, checkpoint=checkpoint)
+
+
+def dump_log(log: Any, private_key: Any) -> bytes:
+    """Dump a pristine :class:`AuditLog` into its signed canonical binary form.
+
+    The whole log state — every entry plus a checkpoint attesting the chain
+    head and Merkle root — is encoded so :func:`load_log` can later rebuild
+    an independent, mutable copy anywhere the corresponding 32-byte Ed25519
+    public key is trusted. The encoding starts with the magic
+    ``b"auditchain/log-state/v1\\0"``; it then writes, strictly in order, the
+    envelope ``version`` (always 1) as an unsigned 8-byte big-endian integer,
+    the checkpoint blob ``C``, the entry count ``n`` as a u64 and the ``n``
+    entries in chain order — nothing may be omitted, reordered or appended.
+    ``C`` is the complete canonical output of :func:`encode_signed_root` over
+    ``log.sign_root(private_key)``; each entry is framed as ``U(index) ||
+    B(payload) || B(previous_hash) || B(entry_hash)`` with ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``.
+
+    Only a pristine log can be dumped: one that was never pruned
+    (``retain_from == 0``), carries no authentication state (constructed
+    without a key, so no tag, stage or verifier history exists) and has no
+    encryption history (no :meth:`AuditLog.encrypt` call, whose nonce history
+    could not be restored). Anything else loses state silently across a
+    dump/load round trip and is rejected. ``private_key`` is a 32-byte
+    Ed25519 private key seed used for this one checkpoint signature; it is
+    never stored, copied into log state or returned, and no new signing
+    message is introduced — the checkpoint signs exactly the
+    :meth:`AuditLog.sign_root` message.
+
+    ``log`` must be an :class:`AuditLog` and ``private_key`` must be
+    ``bytes`` — anything else raises TypeError; a seed that is not 32 bytes
+    or a log that fails the pristine-log requirements raises ValueError. The
+    call is read-only: entries, head, authentication state, Merkle roots and
+    proofs are all left untouched. Encoding is deterministic: the same log
+    state dumped with the same seed produces the same bytes.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before inspecting the log, so a type error in the key
+    # surfaces exactly as elsewhere; sign_root below re-loads it read-only.
+    _load_ed25519_seed(private_key)
+    if log.retain_from != 0:
+        raise ValueError(
+            f"only an unpruned log can be dumped (retain_from is {log.retain_from})"
+        )
+    if log._key is not None:
+        raise ValueError(
+            "only a log without authentication can be dumped "
+            "(this log was constructed with a key)"
+        )
+    if log._used_nonces:
+        raise ValueError(
+            "only a log without encryption history can be dumped "
+            "(this log has encrypted entries)"
+        )
+    checkpoint = log.sign_root(private_key)
+    parts = [
+        _LOG_STATE_MAGIC,
+        _encode_u64(_LOG_STATE_VERSION, "version"),
+        _encode_blob(encode_signed_root(checkpoint)),
+        _encode_u64(len(log), "entry count"),
+    ]
+    for entry in log:
+        parts.append(_encode_u64(entry.index, "index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+    return b"".join(parts)
+
+
+def load_log(data: Any, public_key: Any) -> AuditLog:
+    """Rebuild an independent mutable :class:`AuditLog` from :func:`dump_log` bytes.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) holding exactly the framing of
+    :func:`dump_log`: the magic ``b"auditchain/log-state/v1\\0"``, the u64
+    envelope version (only ``1`` is supported), the length-prefixed
+    checkpoint blob ``C`` (a complete :func:`encode_signed_root` output),
+    the u64 entry count ``n`` and ``n`` entries framed as ``U(index) ||
+    B(payload) || B(previous_hash) || B(entry_hash)``, with no trailing
+    bytes. ``public_key`` must be 32 ``bytes`` — a non-``bytes`` value raises
+    TypeError and a wrong length raises ValueError.
+
+    Loading verifies before it builds: the checkpoint signature must verify
+    against ``public_key``; the entries must carry the indices ``0..n-1`` in
+    order and ``C.size`` must equal ``n``; and, recomputed under
+    ``C.hash_name``, every entry digest, the chain head and the Merkle root
+    must match the recorded fields and the checkpoint. A bad magic, version
+    or hash algorithm, a digest of the wrong width, an out-of-order index, a
+    size mismatch, truncation, trailing bytes, a signature that does not
+    verify or any such state inconsistency raises ValueError; nothing is
+    ever built from unchecked bytes.
+
+    On success the returned log holds exactly the dumped entries under the
+    checkpoint's hash algorithm, with the find index rebuilt; it is keyless,
+    fully independent of the original log and freely mutable through the
+    ordinary interface (``append``, ``find``, ``verify`` and so on).
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    # Validate the key before parsing, so a key type or length error surfaces
+    # exactly as elsewhere; verify_signed_root below re-checks it read-only.
+    _load_ed25519_public(public_key)
+    if not data.startswith(_LOG_STATE_MAGIC):
+        raise ValueError("not an auditchain log-state encoding")
+    offset = len(_LOG_STATE_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _LOG_STATE_VERSION:
+        raise ValueError(f"unsupported log-state version {version}")
+    checkpoint_blob = read_blob("checkpoint")
+    count = read_u64("entry count")
+    records: list[tuple[bytes, bytes, bytes]] = []
+    for position in range(count):
+        index = read_u64("index")
+        if index != position:
+            raise ValueError(
+                f"entry indices must be 0..n-1 in order (expected {position}, got {index})"
+            )
+        payload = read_blob("payload")
+        previous_hash = read_blob("previous_hash")
+        entry_hash = read_blob("entry_hash")
+        records.append((payload, previous_hash, entry_hash))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the log state")
+    # The nested decoder applies its own magic, version, UTF-8, algorithm,
+    # width and structural rules to the checkpoint blob.
+    checkpoint = decode_signed_root(checkpoint_blob)
+    if not verify_signed_root(checkpoint, public_key):
+        raise ValueError("checkpoint signature does not verify")
+    if checkpoint.size != count:
+        raise ValueError(
+            f"checkpoint size ({checkpoint.size}) does not match the entry count ({count})"
+        )
+    hash_name = checkpoint.hash_name
+    digest_size = _digest_size(hash_name)
+    previous = bytes(digest_size)
+    leaves: list[bytes] = []
+    for position, (payload, previous_hash, entry_hash) in enumerate(records):
+        if len(previous_hash) != digest_size:
+            raise ValueError(
+                f"entry {position}: previous_hash must be {digest_size} bytes"
+            )
+        if len(entry_hash) != digest_size:
+            raise ValueError(
+                f"entry {position}: entry_hash must be {digest_size} bytes"
+            )
+        if not hmac.compare_digest(previous_hash, previous):
+            raise ValueError(
+                f"entry {position}: previous_hash does not match the recomputed chain"
+            )
+        recomputed = entry_digest(position, previous, payload, hash_name=hash_name)
+        if not hmac.compare_digest(entry_hash, recomputed):
+            raise ValueError(
+                f"entry {position}: entry_hash does not match the recomputed digest"
+            )
+        leaves.append(_leaf_hash(entry_hash, hash_name))
+        previous = recomputed
+    if not hmac.compare_digest(previous, checkpoint.head):
+        raise ValueError("chain head does not match the checkpoint")
+    if not hmac.compare_digest(_root_of(leaves, hash_name), checkpoint.root):
+        raise ValueError("Merkle root does not match the checkpoint")
+    # Everything verified; replaying the payloads through the ordinary
+    # append path rebuilds the entries, the chain head and the find index.
+    restored = AuditLog(hash_name=hash_name)
+    for payload, _, _ in records:
+        restored.append(payload)
+    return restored

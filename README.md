@@ -431,6 +431,35 @@ verify_signed_consistency(receipt, other_key)        # False：未信任的公�
   `verify_signed_root` / `verify_consistency` 的既有异常（`TypeError` /
   `ValueError`）；公钥不是 `bytes` 抛 `TypeError`、不是 32 字节抛
   `ValueError`；核验为只读
+- `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)`
+  把整个可信跨快照一致性凭据序列化为规范二进制并原样还原，使其可落盘、跨进程
+  恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不引入任何新的签名原文：
+
+```python
+from auditchain import encode_signed_consistency, decode_signed_consistency
+
+data = encode_signed_consistency(receipt)          # bytes，可写文件/发网络
+restored = decode_signed_consistency(data)         # 冻结 SignedConsistency
+restored == receipt                                # True：字段相等
+encode_signed_consistency(restored) == data        # True：重编码逐字节相同
+verify_signed_consistency(restored, public_key)    # True：无需持有日志
+```
+
+  字节流以魔数 `b"auditchain/signed-consistency/v1\0"` 开头，随后**严格依次**
+  写 `version`（恒为 `1`，8 字节无符号大端）、old blob、new blob、proof
+  节点计数（u64 大端）以及按元组顺序排列的节点 blob，不允许省略、换序或附加
+  字段；所有 blob 均为 u64 字节长度前缀加原始字节（零长度也写全零 u64），
+  old 与 new blob 的内容分别就是既有 `encode_signed_root` 输出的完整规范字节，
+  解码时精确消费并分别原样交给 `decode_signed_root`。
+  `encode_signed_consistency` 只接受 `SignedConsistency`（其余类型抛
+  `TypeError`，含绕过冻结构造器写入的字段类型错；嵌套检查点错误沿用
+  `encode_signed_root` 的 `TypeError` / `ValueError`），
+  `decode_signed_consistency` 只接受 `bytes`（含拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、截断、尾随、blob 长度、嵌套检查点格式或 proof
+  节点宽度（须等于 old 检查点所命名算法的摘要宽度）非法抛 `ValueError`；编解码
+  均不校验签名、两端关联及证明内容（节点计数与尺寸是否相称、是否连接两根留给
+  恢复后的既有验真契约判定），结构合法但验真不匹配仍可解码，
+  `verify_signed_consistency` 返回 `False`；两个入口均为只读且确定。
 
 ### 前向安全认证
 
@@ -705,6 +734,20 @@ python3 -m auditchain
   既有编码器），后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、
   版本、截断、尾随、blob 长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、
   冻结且重编码逐字节相同，结构合法但验真不匹配仍可解码（验包返回 `False`）；
+  两个入口均为只读且确定
+- `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —
+  可信跨快照一致性凭据的规范二进制编码与解码，使 `SignedConsistency` 可落盘、
+  跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
+  `b"auditchain/signed-consistency/v1\0"` 开头，严格依次写 version=1（u64）、
+  old blob、new blob、proof 节点计数（u64）与按元组顺序的节点 blob（不允许
+  省略、换序或附加字段）；每个 blob 为 u64 字节长度前缀加原始字节，old 与
+  new 的内容分别是既有 `encode_signed_root` 的完整规范字节，解码精确消费后
+  分别交给既有 `decode_signed_root`。前者只接受 `SignedConsistency`（外层或
+  字段类型错抛 `TypeError`，嵌套检查点错误沿用既有编码器），后者只接受
+  `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob
+  长度、嵌套格式或 proof 节点宽度（须为 old 检查点算法的摘要宽度）非法抛
+  `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码均不校验
+  签名、两端关联及证明内容，结构合法但验真不匹配仍可解码（验真返回 `False`）；
   两个入口均为只读且确定
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于

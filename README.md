@@ -344,6 +344,31 @@ AuditLog().signed_audit_batch((), seed)               # 空快照：规范空树
   `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
   `verify_signed_root` 的既有异常（`TypeError` / `ValueError`）；公钥不是
   `bytes` 抛 `TypeError`、不是 32 字节抛 `ValueError`；核验为只读
+- `encode_signed_audit_batch(receipt)` / `decode_signed_audit_batch(data)`
+  把整个可信紧凑批量审计包序列化为规范二进制并原样还原，使其可落盘、跨进程
+  传输后继续凭预置信任的 Ed25519 公钥离线验真，且不引入任何新的签名原文：
+
+```python
+from auditchain import encode_signed_audit_batch, decode_signed_audit_batch
+
+data = encode_signed_audit_batch(receipt)          # bytes，可写文件/发网络
+restored = decode_signed_audit_batch(data)         # 冻结 SignedAuditBatch
+restored == receipt                                # True：字段相等
+encode_signed_audit_batch(restored) == data        # True：重编码逐字节相同
+verify_signed_audit_batch(restored, public_key)    # True：无需持有日志
+```
+
+  字节流以魔数 `b"auditchain/signed-audit-batch/v1\0"` 开头，随后**严格依次**
+  写 `version`（恒为 `1`，8 字节无符号大端）、batch blob、checkpoint blob，
+  不允许省略、换序或附加字段；两个 blob 均为 u64 字节长度前缀加原始字节，
+  内容依次就是既有 `encode_audit_batch` 与 `encode_signed_root` 输出的完整
+  规范字节。解码精确消费两个 blob，分别原样交给 `decode_audit_batch` 与
+  `decode_signed_root`。`encode_signed_audit_batch` 只接受
+  `SignedAuditBatch`（其余类型抛 `TypeError`，嵌套错误沿用既有编码器的
+  `TypeError` / `ValueError`），`decode_signed_audit_batch` 只接受 `bytes`
+  （含拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度
+  或任一嵌套格式非法抛 `ValueError`；结构合法但验真不匹配仍可解码，
+  `verify_signed_audit_batch` 返回 `False`。两个入口均为只读且确定
 
 ### 前向安全认证
 
@@ -607,6 +632,18 @@ python3 -m auditchain
   冻结构造器的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、blob
   长度、`size` 范围、摘要宽度或签名宽度非法抛 `ValueError`；结构合法但签名不匹配
   仍可解码，验签返回 `False`；两个入口均为只读
+- `encode_signed_audit_batch(receipt)` / `decode_signed_audit_batch(data)` —
+  可信紧凑批量审计包的规范二进制编码与解码，使 `SignedAuditBatch` 可落盘、跨进程
+  传输后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
+  `b"auditchain/signed-audit-batch/v1\0"` 开头，严格依次写 version=1（u64）、
+  batch blob、checkpoint blob（不允许省略、换序或附加字段）；每个 blob 为 u64
+  字节长度前缀加原始字节，内容分别是既有 `encode_audit_batch` 与
+  `encode_signed_root` 的完整规范字节，解码精确消费两个 blob 并分别交给既有
+  解码器。前者只接受 `SignedAuditBatch`（外层类型错抛 `TypeError`，嵌套错误沿用
+  既有编码器），后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、
+  版本、截断、尾随、blob 长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、
+  冻结且重编码逐字节相同，结构合法但验真不匹配仍可解码（验包返回 `False`）；
+  两个入口均为只读且确定
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；

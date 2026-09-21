@@ -551,6 +551,26 @@ verify_auth(log.entry(0), tag0, verifier)  # True：无需持有日志即可验�
 verify_auth(log.entry(1), tag1, verifier)  # True
 ```
 
+需要一次为多条保留记录签发认证材料交给离线方批量核验时，用
+`auth_batch` / `verify_auth_batch`：
+
+```python
+items = log.auth_batch([3, 1])          # 按绝对索引升序签发，返回 ((Entry, AuthTag), ...)
+[entry.index for entry, _ in items]     # [1, 3]
+results = verify_auth_batch(items, verifier)  # (True, True)，与 items 同序
+```
+
+- `auth_batch(indices)` 先校验全部索引与保留范围并要求 `stage + 条数 < 2**64`，
+  再连续计算标签、一次提交；空选择返回 `()` 且不演进密钥；失败不改变密钥、
+  stage、标签或日志，成功恰演进所选条数次
+- 每项严格沿用 `auth` 的 HMAC 域、stage 的 8 字节大端编码与 key-evolve 域；
+  第 j 项使用初始 `stage + j`，结果逐项等于按升序连续调用 `auth`；不追加条目，
+  也不改变哈希链、Merkle 根、检索索引或既有公开对象；无密钥模式抛 `ValueError`
+- `verify_auth_batch(items, verifier)` 逐项调用既有 `verify_auth` 并返回同序真假
+  元组，空 tuple 返回 `()`；`items` 只收 `tuple`，其中 `Entry.index` 须严格升序、
+  `AuthTag.stage` 须连续；类型错抛 `TypeError`，重复、范围、顺序、容量或摘要
+  结构错抛 `ValueError`，结构合法但不匹配仅令对应项为 `False`
+
 - `export_verifier()` 只可在首次演进（`auth` / `rotate_key`）之前调用，且只能
   调用一次；返回的不可变 `Verifier(key, hash_name)` 内含 stage-0 密钥，
   `verify_auth` 会自行把它演进到标签所在 stage
@@ -679,6 +699,15 @@ python3 -m auditchain
   - `auth(index)` — 为保留段中的条目签发不可变 `AuthTag`，返回后立即以
     `H(b"auditchain/key-evolve/v1" + K)` 替换密钥、stage 加一，不保存旧密钥、不追加条目；
     无密钥模式调用抛 `ValueError`
+  - `auth_batch(indices)` — 一次为多条保留记录签发批量前向安全认证材料，返回
+    按绝对索引升序的 `(Entry, AuthTag)` 元组的元组，空选择返回 `()`。`indices`
+    为可迭代的互异非 `bool` 整数，须全部落在保留段内；先校验全部索引、保留范围
+    与容量（`stage + 条数 < 2**64`），再连续计算标签、一次提交，失败不改变密钥、
+    stage、标签或日志，成功恰演进所选条数次。第 j 项使用初始 `stage + j`，严格沿用
+    `auth` 的 HMAC 域、stage 的 8 字节大端编码与 key-evolve 域，结果逐项等于按升序
+    连续调用 `auth`；不追加条目，也不改变哈希链、Merkle 根、检索索引或既有公开对象。
+    不可迭代或非整数索引抛 `TypeError`，重复索引抛 `ValueError`，保留范围外索引
+    抛 `IndexError`，stage 容量不足抛 `ValueError`；无密钥模式抛 `ValueError`
   - `rotate_key()` — 只演进密钥一次（stage 加一），不签发标签、不追加条目；无密钥模式抛 `ValueError`
   - `export_verifier()` — 仅可在首次演进前调用一次，返回不可变 `Verifier`；
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
@@ -895,6 +924,16 @@ python3 -m auditchain
   结构合法但内容不符（含篡改条目、错误标签、错误 stage、错误密钥）返回 `False`；
   入参类型错误抛 `TypeError`，负 stage/index、stage 达到 `2**64`、摘要长度不符、
   未知算法等抛 `ValueError`
+- `verify_auth_batch(items, verifier)` — 供离线方一次核验多条 `(Entry, AuthTag)`
+  认证材料，逐项调用既有 `verify_auth`，返回与 `items` 同序的真假元组，空 tuple
+  返回 `()`。`items` 只接受 `tuple`：每项必须是 `(Entry, AuthTag)` 对，
+  `Entry.index` 严格升序（无重复），`AuthTag.stage` 连续（逐项加一，起点任意）；
+  全部结构检查先于逐项核验完成。非 tuple 容器、非 `Verifier`、成员不是二元组、
+  字段类型错（非 `Entry`/`AuthTag`、index/stage 不是非 `bool` 整数、条目字段非
+  `bytes`、tag 非 `bytes`）抛 `TypeError`；重复、越界或乱序 index，负数、
+  达到 `2**64` 或不连续的 stage，摘要/tag 宽度与验证方哈希不符抛 `ValueError`；
+  结构合法但某项内容不匹配（篡改条目、错误标签、错误密钥等）仅令对应位置为
+  `False`，不影响其余项
 
 Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry_hash)`，父节点为
 `H("auditchain/merkle-node/v1" + left + right)`，奇数层末节点原样提升；空树根为

@@ -669,6 +669,18 @@ items = log.auth_batch([4, 1])                    # 升序签发索引 1、4
 verify_auth_batch(items, verifier)               # (True, True)，空 tuple 返回 ()
 ```
 
+批量认证材料可用 `encode_auth_batch` / `decode_auth_batch` 落盘并在另一进程恢复，
+恢复结果直接交给 `verify_auth_batch` 离线核验：
+
+```python
+from auditchain import encode_auth_batch, decode_auth_batch
+
+data = encode_auth_batch(items)                   # bytes，可写文件/发网络
+hash_name, restored = decode_auth_batch(data)     # 项元组与原批次相等
+verify_auth_batch(restored, verifier)            # (True, True)
+encode_auth_batch(restored, hash_name=hash_name) == data   # True：重编码逐字节相同
+```
+
 - `export_verifier()` 只可在首次演进（`auth` / `rotate_key`）之前调用，且只能
   调用一次；返回的不可变 `Verifier(key, hash_name)` 内含 stage-0 密钥，
   `verify_auth` 会自行把它演进到标签所在 stage
@@ -1015,6 +1027,18 @@ python3 -m auditchain
   非五元组、非 bytes 或字段类型错抛 `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、
   范围、宽度、顺序、缺末条或节点数不符抛 `ValueError`；内容、根或证明不匹配仍可解码，
   但 `verify_audit_batch` 返回 `False`
+- `encode_auth_batch(items, *, hash_name="sha256")` / `decode_auth_batch(data)` —
+  前向安全批量认证材料 `((Entry, AuthTag), ...)` 的规范二进制编码与解码，使
+  `auth_batch` 结果可落盘、跨进程恢复并继续由 `verify_auth_batch` 离线核验：魔数
+  `b"auditchain/auth-batch/v1\0"` 开头，后接 version=1、hash_name 的 UTF-8 blob、
+  项数；每项依次写 `index`、`payload`、`previous_hash`、`entry_hash`、`stage`、`tag`，
+  其中 `index` 与 `stage` 为 u64 大端，其余为 u64 长度前缀 blob（零长度也是全零 u64）。
+  解码返回 `(hash_name, items)`，`items` 为不可变项元组且重编码逐字节相同。
+  前者只接受满足 `verify_auth_batch` 结构约束的项元组（容器或字段类型错抛
+  `TypeError`，算法、范围、宽度、索引顺序或 stage 连续性非法抛 `ValueError`），
+  编码只读且确定；后者只接受 `bytes`，魔数、版本、UTF-8、算法、截断、尾随、计数、
+  摘要宽度、u64 范围、索引顺序或 stage 连续性非法抛 `ValueError`；认证不匹配仍可解码，
+  由 `verify_auth_batch` 返回逐项布尔值
 - `dump_log(log, private_key)` / `load_log(data, public_key)` — 完整日志状态的
   签名导出与离线恢复，使一份完整、未裁剪、无认证、无加密历史的日志可落盘、跨进程
   恢复为独立、可变的普通无密钥 `AuditLog`：字节流为

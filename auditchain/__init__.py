@@ -10,6 +10,7 @@ verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
+encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
@@ -53,6 +54,7 @@ __all__ = [
     "GENESIS_HASH",
     "decode_audit_batch",
     "decode_audit_receipt",
+    "decode_auth_batch",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
     "decode_signed_consistency",
@@ -63,6 +65,7 @@ __all__ = [
     "dump_secure_log",
     "encode_audit_batch",
     "encode_audit_receipt",
+    "encode_auth_batch",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
     "encode_signed_consistency",
@@ -124,6 +127,13 @@ _BATCH_MAGIC = b"auditchain/batch/v1\0"
 _BATCH_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
+
+# Binary framing of encode_auth_batch / decode_auth_batch: same u64/blob
+# rules; each item carries its entry fields followed by the tag's stage (u64)
+# and tag digest (blob), so a persisted batch can be re-verified offline by
+# verify_auth_batch in another process.
+_AUTH_BATCH_MAGIC = b"auditchain/auth-batch/v1\0"
+_AUTH_BATCH_VERSION = 1
 
 # Signed snapshot-root checkpoint of AuditLog.sign_root / verify_signed_root.
 # An Ed25519 signature over the hash algorithm, snapshot size, Merkle root and
@@ -2953,37 +2963,20 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
     return hmac.compare_digest(expected, tag.tag)
 
 
-def verify_auth_batch(items: Any, verifier: Any) -> tuple[bool, ...]:
-    """Verify many ``(Entry, AuthTag)`` pairs without holding the log.
+def _check_auth_batch_items(items: Any, digest_size: int) -> None:
+    """Structural contract shared by :func:`verify_auth_batch`,
+    :func:`encode_auth_batch` and :func:`decode_auth_batch`.
 
-    The batch counterpart of :func:`verify_auth`: every pair is checked with
-    exactly that routine and the results come back as a tuple of booleans in
-    the same order, ``()`` for an empty tuple. Before any per-item
-    verification the whole batch is validated structurally: ``items`` must be
-    a tuple of ``(Entry, AuthTag)`` pairs, the entry indices must be strictly
-    ascending (distinct and ordered) and the tag stages must be consecutive,
-    matching the output of :meth:`AuditLog.auth_batch`.
-
-    A wrong container or element type raises TypeError; duplicate,
-    out-of-range or out-of-order entry indices, non-consecutive stages, a
-    stage/index at or beyond ``2**64`` or a wrong digest width raise
-    ValueError. Such structural failures abort the call before anything is
-    verified; a structurally valid pair whose content simply does not
-    authenticate contributes only ``False`` at its position, never an
-    exception.
+    ``items`` must be a tuple of ``(Entry, AuthTag)`` pairs with strictly
+    ascending entry indices and consecutive tag stages, matching the output of
+    :meth:`AuditLog.auth_batch`. Only structural properties are checked;
+    whether the content authenticates is left to :func:`verify_auth_batch`.
     """
     if not isinstance(items, tuple):
         raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
-    if not isinstance(verifier, Verifier):
-        raise TypeError("verifier must be a Verifier")
-    digest_size = _digest_size(verifier.hash_name)
-
-    # One structural pass over the whole batch first: any malformed pair (or a
-    # broken ordering/continuity relationship) must raise before per-item
-    # verification, exactly as a malformed single argument raises in
-    # verify_auth before its content checks.
     previous_index: int | None = None
-    for position, item in enumerate(items):
+    previous_stage: int | None = None
+    for item in items:
         if not isinstance(item, tuple) or len(item) != 2:
             raise TypeError("each item must be an (Entry, AuthTag) tuple")
         entry, tag = item
@@ -3017,12 +3010,160 @@ def verify_auth_batch(items: Any, verifier: Any) -> tuple[bool, ...]:
             raise TypeError("tag.tag must be bytes")
         if len(tag.tag) != digest_size:
             raise ValueError(f"tag.tag must be {digest_size} bytes")
-        if position > 0 and tag.stage != items[position - 1][1].stage + 1:
+        if previous_stage is not None and tag.stage != previous_stage + 1:
             raise ValueError("item tag stages must be consecutive")
+        previous_stage = tag.stage
+
+
+def verify_auth_batch(items: Any, verifier: Any) -> tuple[bool, ...]:
+    """Verify many ``(Entry, AuthTag)`` pairs without holding the log.
+
+    The batch counterpart of :func:`verify_auth`: every pair is checked with
+    exactly that routine and the results come back as a tuple of booleans in
+    the same order, ``()`` for an empty tuple. Before any per-item
+    verification the whole batch is validated structurally: ``items`` must be
+    a tuple of ``(Entry, AuthTag)`` pairs, the entry indices must be strictly
+    ascending (distinct and ordered) and the tag stages must be consecutive,
+    matching the output of :meth:`AuditLog.auth_batch`.
+
+    A wrong container or element type raises TypeError; duplicate,
+    out-of-range or out-of-order entry indices, non-consecutive stages, a
+    stage/index at or beyond ``2**64`` or a wrong digest width raise
+    ValueError. Such structural failures abort the call before anything is
+    verified; a structurally valid pair whose content simply does not
+    authenticate contributes only ``False`` at its position, never an
+    exception.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
+    if not isinstance(verifier, Verifier):
+        raise TypeError("verifier must be a Verifier")
+    digest_size = _digest_size(verifier.hash_name)
+
+    # One structural pass over the whole batch first: any malformed pair (or a
+    # broken ordering/continuity relationship) must raise before per-item
+    # verification, exactly as a malformed single argument raises in
+    # verify_auth before its content checks.
+    _check_auth_batch_items(items, digest_size)
 
     return tuple(
         verify_auth(entry, tag, verifier) for entry, tag in items  # type: ignore[misc]
     )
+
+
+def encode_auth_batch(items: Any, *, hash_name: str = "sha256") -> bytes:
+    """Encode an :meth:`AuditLog.auth_batch` items tuple into canonical bytes.
+
+    The encoding starts with the magic ``b"auditchain/auth-batch/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear in the order ``version`` (1), ``hash_name`` (UTF-8
+    blob) and item count; each item is written as ``Entry.index`` (u64),
+    ``payload`` blob, ``previous_hash`` blob, ``entry_hash`` blob,
+    ``AuthTag.stage`` (u64) and ``tag`` blob, with nothing omitted, reordered
+    or appended.
+
+    ``items`` must be a tuple of ``(Entry, AuthTag)`` pairs satisfying the
+    structural contract of :func:`verify_auth_batch` — anything else, or a
+    field of the wrong type, raises TypeError, and structural violations (an
+    unknown hash algorithm, out-of-range or non-ascending indices,
+    non-consecutive stages, wrong digest widths, ...) raise ValueError.
+    ``hash_name`` names the digest algorithm the batch was minted with; it is
+    recorded so a decoding process can rebuild the matching
+    :class:`Verifier`. Encoding is read-only and deterministic: it never
+    mutates the items, and re-encoding a decoded tuple reproduces the
+    original bytes exactly. A structurally valid batch whose content does not
+    authenticate encodes just as well; :func:`verify_auth_batch` reports the
+    per-item booleans.
+    """
+    if not isinstance(hash_name, str):
+        raise TypeError("hash_name must be a string")
+    digest_size = _digest_size(hash_name)
+    _check_auth_batch_items(items, digest_size)
+    parts = [
+        _AUTH_BATCH_MAGIC,
+        _encode_u64(_AUTH_BATCH_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(len(items), "items count"),
+    ]
+    for entry, tag in items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+        parts.append(_encode_u64(tag.stage, "tag.stage"))
+        parts.append(_encode_blob(tag.tag))
+    return b"".join(parts)
+
+
+def decode_auth_batch(data: Any) -> tuple[str, tuple[tuple[Entry, AuthTag], ...]]:
+    """Decode bytes produced by :func:`encode_auth_batch`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad magic,
+    a version other than 1, invalid UTF-8 in ``hash_name``, an unknown or
+    non-fixed-output hash algorithm, truncation, trailing bytes, an oversized
+    blob length, digest-width mismatches, non-ascending or duplicate entry
+    indices or non-consecutive tag stages all raise ValueError. The result is
+    the ``(hash_name, items)`` pair with ``items`` an immutable tuple of
+    ``(Entry, AuthTag)`` pairs equal to the originally encoded ones, so a
+    batch persisted in one process can be restored in another and handed
+    straight to :func:`verify_auth_batch`; a structurally sound encoding
+    whose content does not authenticate decodes fine, and batch verification
+    of the result returns the per-item booleans.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_AUTH_BATCH_MAGIC):
+        raise ValueError("not an auditchain auth-batch encoding")
+    offset = len(_AUTH_BATCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _AUTH_BATCH_VERSION:
+        raise ValueError(f"unsupported auth-batch version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        stage = read_u64("tag.stage")
+        tag = read_blob("tag.tag")
+        items.append(
+            (Entry(index, payload, previous_hash, entry_hash), AuthTag(stage, tag))
+        )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the auth batch")
+    result = tuple(items)
+    # Apply the same structural contract as auth_batch / verify_auth_batch:
+    # digest widths, ascending indices and consecutive stages.
+    _check_auth_batch_items(result, digest_size)
+    return hash_name, result
 
 
 def verify_signed_root(receipt: Any, public_key: Any) -> bool:

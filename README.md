@@ -551,6 +551,17 @@ verify_auth(log.entry(0), tag0, verifier)  # True：无需持有日志即可验�
 verify_auth(log.entry(1), tag1, verifier)  # True
 ```
 
+需要一次为多条保留记录准备认证材料时，用 `auth_batch(indices)` 批量签发：
+`indices` 为互异非 `bool` 整数的可迭代对象，按绝对索引升序连续计算标签并一次
+提交，返回 `((Entry, AuthTag), ...)`（空选择返回 `()`，不演进密钥）。第 j 项
+使用初始 `stage+j`，逐项等于按升序连续调用 `auth`，成功恰演进所选条数次；
+离线方用 `verify_auth_batch(items, verifier)` 批量核验，返回同序 `tuple[bool, ...]`：
+
+```python
+items = log.auth_batch([4, 1])                    # 升序签发索引 1、4
+verify_auth_batch(items, verifier)               # (True, True)，空 tuple 返回 ()
+```
+
 - `export_verifier()` 只可在首次演进（`auth` / `rotate_key`）之前调用，且只能
   调用一次；返回的不可变 `Verifier(key, hash_name)` 内含 stage-0 密钥，
   `verify_auth` 会自行把它演进到标签所在 stage
@@ -679,6 +690,14 @@ python3 -m auditchain
   - `auth(index)` — 为保留段中的条目签发不可变 `AuthTag`，返回后立即以
     `H(b"auditchain/key-evolve/v1" + K)` 替换密钥、stage 加一，不保存旧密钥、不追加条目；
     无密钥模式调用抛 `ValueError`
+  - `auth_batch(indices)` — 一次为多条保留记录批量签发：`indices` 为互异非 `bool`
+    整数的可迭代对象，先校验全部索引、保留范围与 `stage + 条数 < 2**64`，再按绝对
+    索引升序连续计算标签后一次提交，返回 `tuple[tuple[Entry, AuthTag], ...]`（空选择
+    返回 `()`）；第 j 项使用初始 `stage+j`，严格沿用 `auth` 的 HMAC 域、stage 的
+    8 字节大端编码与 key-evolve 域，逐项等于按升序连续调用 `auth`，成功恰演进所选
+    条数次；失败不改密钥、stage、标签或日志；不追加条目，也不改变哈希链、Merkle 根、
+    检索索引或既有公开对象；索引类型错抛 `TypeError`，重复或容量不足抛 `ValueError`，
+    非保留索引抛 `IndexError`，无密钥模式抛 `ValueError`
   - `rotate_key()` — 只演进密钥一次（stage 加一），不签发标签、不追加条目；无密钥模式抛 `ValueError`
   - `export_verifier()` — 仅可在首次演进前调用一次，返回不可变 `Verifier`；
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
@@ -895,6 +914,11 @@ python3 -m auditchain
   结构合法但内容不符（含篡改条目、错误标签、错误 stage、错误密钥）返回 `False`；
   入参类型错误抛 `TypeError`，负 stage/index、stage 达到 `2**64`、摘要长度不符、
   未知算法等抛 `ValueError`
+- `verify_auth_batch(items, verifier)` — 逐项调用 `verify_auth` 核验
+  `(Entry, AuthTag)` 对，返回同序 `tuple[bool, ...]`（空 tuple 返回 `()`）。
+  `items` 只接受 `tuple`，且 `Entry.index` 严格升序、`AuthTag.stage` 连续；
+  容器或元素类型错抛 `TypeError`，重复、范围、顺序、容量（index/stage 达到 `2**64`）
+  或摘要结构错抛 `ValueError`；结构合法但不匹配仅令对应位置为 `False`
 
 Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry_hash)`，父节点为
 `H("auditchain/merkle-node/v1" + left + right)`，奇数层末节点原样提升；空树根为

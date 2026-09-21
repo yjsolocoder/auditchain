@@ -4,7 +4,7 @@ Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / SignedRoot / SignedAuditBatch / SignedConsistency /
 SignedPrune / IntegrityIssue / IntegrityReport / entry_digest /
 decrypt_entry / verify_inclusion / verify_batch_inclusion /
-verify_consistency / verify_auth / verify_audit_receipt /
+verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
 verify_audit_batch / verify_signed_root / verify_signed_audit_batch /
 verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
@@ -68,6 +68,7 @@ __all__ = [
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
+    "verify_auth_batch",
     "verify_batch_inclusion",
     "verify_consistency",
     "verify_inclusion",
@@ -1065,6 +1066,73 @@ class AuditLog:
         self._key = new_key
         self._stage += 1
         return tag
+
+    def auth_batch(
+        self, indices: Iterable[int]
+    ) -> tuple[tuple[Entry, AuthTag], ...]:
+        """Mint forward-secure tags for many retained entries in one call.
+
+        The batch equivalent of :meth:`auth`: ``indices`` is an iterable of
+        distinct non-bool integers; the selected entries are issued in
+        ascending absolute index order and returned as ``(Entry, AuthTag)``
+        pairs in that order, an empty selection yielding ``()``. The j-th tag
+        (j from 0) is minted at the initial stage plus j, reusing exactly the
+        HMAC domain, 8-byte big-endian stage encoding and key-evolution of
+        :meth:`auth`, so each item is byte-for-byte what j consecutive
+        ascending :meth:`auth` calls would have produced; on success the key
+        has evolved and the stage advanced exactly once per selected entry.
+
+        Every index and the retained range, and the requirement that
+        ``stage + count < 2**64``, are validated before any tag is computed:
+        a failure leaves the key, stage, stored tags and log untouched. The
+        call never appends an entry and never changes the hash chain, Merkle
+        roots, search indexes or any other public object. Wrong index types
+        raise TypeError; duplicate or out-of-range indices or exhausting the
+        u64 stage space raise ValueError (a non-retained index raises
+        IndexError, exactly as :meth:`auth`); keyless mode raises ValueError.
+        """
+        key = self._require_key()
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        ordered: list[int] = []
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            # entry() also type- and range-checks, but resolve every entry up
+            # front so a bad index aborts before the key evolves even once.
+            if not self._retain_from <= index < len(self):
+                raise IndexError(f"no retained entry at index {index}")
+            selected.add(index)
+            ordered.append(index)
+        ordered.sort()
+        count = len(ordered)
+        if self._stage + count >= _MAX_STAGE:
+            raise ValueError("stage limit reached; cannot evolve the key that far")
+        # All validation passed; compute tags against the current key and
+        # commit the whole batch in one step, so the only mutation below is
+        # the final state swap.
+        current_key = key
+        items: list[tuple[Entry, AuthTag]] = []
+        new_tags: dict[int, AuthTag] = {}
+        for position, index in enumerate(ordered):
+            stage = self._stage + position
+            entry = self._entries[index - self._retain_from]
+            tag = AuthTag(
+                stage=stage,
+                tag=_auth_tag(stage, entry.entry_hash, current_key, self._hash_name),
+            )
+            items.append((entry, tag))
+            new_tags[index] = tag
+            current_key = _evolve_key(current_key, self._hash_name)
+        self._tags.update(new_tags)
+        self._key = current_key
+        self._stage += count
+        return tuple(items)
 
     def rotate_key(self) -> None:
         """Evolve the authentication key once without minting a tag."""
@@ -2858,6 +2926,78 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
         key = _evolve_key(key, verifier.hash_name)
     expected = _auth_tag(tag.stage, entry.entry_hash, key, verifier.hash_name)
     return hmac.compare_digest(expected, tag.tag)
+
+
+def verify_auth_batch(items: Any, verifier: Any) -> tuple[bool, ...]:
+    """Verify many ``(Entry, AuthTag)`` pairs without holding the log.
+
+    The batch counterpart of :func:`verify_auth`: every pair is checked with
+    exactly that routine and the results come back as a tuple of booleans in
+    the same order, ``()`` for an empty tuple. Before any per-item
+    verification the whole batch is validated structurally: ``items`` must be
+    a tuple of ``(Entry, AuthTag)`` pairs, the entry indices must be strictly
+    ascending (distinct and ordered) and the tag stages must be consecutive,
+    matching the output of :meth:`AuditLog.auth_batch`.
+
+    A wrong container or element type raises TypeError; duplicate,
+    out-of-range or out-of-order entry indices, non-consecutive stages, a
+    stage/index at or beyond ``2**64`` or a wrong digest width raise
+    ValueError. Such structural failures abort the call before anything is
+    verified; a structurally valid pair whose content simply does not
+    authenticate contributes only ``False`` at its position, never an
+    exception.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
+    if not isinstance(verifier, Verifier):
+        raise TypeError("verifier must be a Verifier")
+    digest_size = _digest_size(verifier.hash_name)
+
+    # One structural pass over the whole batch first: any malformed pair (or a
+    # broken ordering/continuity relationship) must raise before per-item
+    # verification, exactly as a malformed single argument raises in
+    # verify_auth before its content checks.
+    previous_index: int | None = None
+    for position, item in enumerate(items):
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("each item must be an (Entry, AuthTag) tuple")
+        entry, tag = item
+        if not isinstance(entry, Entry):
+            raise TypeError("item entry must be an Entry")
+        if not isinstance(tag, AuthTag):
+            raise TypeError("item tag must be an AuthTag")
+        if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+            raise TypeError("entry.index must be an integer")
+        if not 0 <= entry.index < _MAX_STAGE:
+            raise ValueError("entry.index must satisfy 0 <= index < 2**64")
+        if previous_index is not None and entry.index <= previous_index:
+            raise ValueError(
+                "item entries must be in strictly ascending index order with no duplicates"
+            )
+        previous_index = entry.index
+        for name in ("payload", "previous_hash", "entry_hash"):
+            if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                raise TypeError(f"entry.{name} must be bytes")
+        if len(entry.previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        if len(entry.entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        # Re-validate even against a tag built with object.__setattr__, the
+        # same defensive ordering verify_auth uses.
+        if not isinstance(tag.stage, int) or isinstance(tag.stage, bool):
+            raise TypeError("tag.stage must be an integer")
+        if not 0 <= tag.stage < _MAX_STAGE:
+            raise ValueError("tag.stage must satisfy 0 <= stage < 2**64")
+        if not isinstance(tag.tag, bytes):
+            raise TypeError("tag.tag must be bytes")
+        if len(tag.tag) != digest_size:
+            raise ValueError(f"tag.tag must be {digest_size} bytes")
+        if position > 0 and tag.stage != items[position - 1][1].stage + 1:
+            raise ValueError("item tag stages must be consecutive")
+
+    return tuple(
+        verify_auth(entry, tag, verifier) for entry, tag in items  # type: ignore[misc]
+    )
 
 
 def verify_signed_root(receipt: Any, public_key: Any) -> bool:

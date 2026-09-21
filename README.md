@@ -532,6 +532,55 @@ fresh_log.prune_signed(2, restored, public_key)  # 跨进程恢复后直接授�
   格式非法抛 `ValueError`；结构合法但两部分不一致或签名不匹配仍可解码，
   `verify_signed_prune` 返回 `False`；两个入口均为只读且确定
 
+### 完整日志状态的签名导出与恢复（Ed25519）
+
+`dump_log(log, private_key)` 把一份**完整、未裁剪、无认证、无加密历史**的
+日志导出为自证其真的字节流：状态快照（摘要算法、条目数、Merkle 根、链头）
+以 `sign_root(private_key)` 同一签名原文、同一 Ed25519 种子按次签发，私钥
+从不保存、不写入字节流，也不新增任何签名原文。`load_log(data, public_key)`
+仅凭**预置信任**的 32 字节 Ed25519 公钥离线验真后，重放全部条目，恢复出一条
+**独立、可变**的普通无密钥日志——`find` 索引、Merkle frontier、链头、长度与
+保留点都与同进程逐条 `append` 构建完全一致，可继续追加、`encrypt`、`prune`
+并使用全部既有接口，与调用方缓冲区不共享任何状态：
+
+```python
+from auditchain import dump_log, load_log
+
+data = dump_log(log, seed)                   # bytes，可落盘/跨进程/跨介质传递
+restored = load_log(data, public_key)        # 全新、独立、可变的 AuditLog
+restored.head == log.head                    # True：链头一致
+restored.merkle_root() == log.merkle_root()  # True：Merkle 根一致
+restored.find(b"agent started")              # find 索引已重建
+restored.append("new event")                 # 恢复后照常追加与加密
+restored.encrypt("secret", key)
+len(restored) == len(log) + 2                # 原日志不受影响
+```
+
+- 导出**只读**且确定：不改变日志任何状态；同状态、同种子的两次导出逐字节
+  相同（Ed25519 确定性签名）
+- 仅接受完整的普通追加日志：`retain_from == 0`（未裁剪）、构造时未传
+  `key` 且没有任何认证历史（未 `auth` / `auth_batch` / `rotate_key` /
+  `export_verifier`，无残留标签）、从未 `encrypt` 过条目（无密文与 nonce
+  历史）。字节流不携带任何裁剪检查点、认证 / 演进状态、密钥或 nonce
+- 字节流以魔数 `b"auditchain/log-state/v1\0"` 开头，随后**严格依次**写
+  `version`（恒为 `1`，u64）、一个 blob `C`、条目数 `n`（u64）与 `E1…En`；
+  `C` 是既有 `encode_signed_root(log.sign_root(private_key))` 输出的**完整**
+  规范字节，按 `B(C)` 编码；每个 `Ei` 依次为 `U(index)`、`B(payload)`、
+  `B(previous_hash)`、`B(entry_hash)`。整数均为 8 字节无符号大端（`U`），
+  blob 均为 `B(x) = U(len(x)) || x`，不允许省略、换序或附加字节
+- `load_log` 先把 `C` 交给既有 `decode_signed_root` 并以公钥验签（沿用
+  `verify_signed_root` 的全部规则），再要求条目索引恰为 `0..n-1` 且
+  `C.size == n`；然后按 `C.hash_name` 指定的算法与摘要宽度，从创世零摘要起
+  逐条重算 `entry_digest` 链头并重建 Merkle 根，二者必须与 `C` 匹配，最后
+  通过正常 `append` 路径重放重建并返回新日志
+- `dump_log` 入参不是 `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`；私钥不是
+  32 字节，或日志已裁剪 / 带认证状态 / 含加密历史抛 `ValueError`
+- `load_log` 的 `data` 只接受 `bytes`（拒绝 `bytearray` / `memoryview`），
+  公钥类型错抛 `TypeError`；公钥长度非 32、魔数 / 版本 / 嵌套检查点算法与
+  宽度 / 条目宽度 / 索引顺序 / `C.size` 不符、截断、尾随字节、blob 长度溢出、
+  验签失败或重算的链头 / Merkle 根与检查点不一致均抛 `ValueError`；恢复为
+  只读校验，不改变入参
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -908,6 +957,22 @@ python3 -m auditchain
   非五元组、非 bytes 或字段类型错抛 `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、
   范围、宽度、顺序、缺末条或节点数不符抛 `ValueError`；内容、根或证明不匹配仍可解码，
   但 `verify_audit_batch` 返回 `False`
+- `dump_log(log, private_key)` / `load_log(data, public_key)` — 完整日志状态的
+  签名导出与离线恢复，使一份完整、未裁剪、无认证、无加密历史的日志可落盘、跨进程
+  恢复为独立、可变的普通无密钥 `AuditLog`：字节流为
+  `b"auditchain/log-state/v1\0" || U(1) || B(C) || U(n) || E1…En`，其中
+  `C` 是既有 `encode_signed_root(log.sign_root(private_key))` 的完整规范字节，
+  `n` 为条目数，每个 `Ei = U(index) || B(payload) || B(previous_hash) ||
+  B(entry_hash)`；`U` 为 8 字节无符号大端，`B(x) = U(len(x)) || x`。恢复时以
+  公钥验签 `C`，要求索引恰为 `0..n-1`、`C.size == n`，并按 `C.hash_name` 从
+  创世零摘要重算 `entry_digest` 链头与 Merkle 根且与 `C` 一致，再以正常
+  `append` 路径重放（`find` 索引等随之重建）。导出只读且确定（同状态同种子
+  字节相同，私钥不存储、不新增签名原文）；`log` 不是 `AuditLog` 或私钥不是
+  `bytes` 抛 `TypeError`，私钥长度非 32 或日志已裁剪 / 带认证状态 / 含加密
+  历史抛 `ValueError`。`data` 只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`），公钥类型错抛 `TypeError`；公钥长度非 32、魔数 / 版本 /
+  嵌套检查点算法与宽度 / 条目宽度 / 索引顺序 / `C.size` 不符、截断、尾随、
+  blob 长度溢出、验签失败或重算链头 / Merkle 根与检查点不一致抛 `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

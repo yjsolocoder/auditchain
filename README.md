@@ -639,6 +639,62 @@ restored.encrypt("again", key, nonce=b"0" * 12)  # ValueError：nonce 历史已�
   摘要 / locator 宽度不符、密文封装非法、nonce 重复、重算链 / 根不符、签名
   不符均抛 `ValueError`；恢复为只读校验，不改变入参
 
+### 已裁剪日志的签名导出与恢复（Ed25519）
+
+`dump_pruned_log(log, private_key)` 与 `load_pruned_log(data, public_key)`
+是 `dump_log` / `load_log` 的已裁剪版本：把一份 **`retain_from > 0`（已裁剪）、
+构造时未传 `key` 且从无认证与加密历史** 的日志导出为自证其真的字节流，仅凭
+**预置信任** 的 32 字节 Ed25519 公钥离线验真后，恢复出一条**独立、可变**的无
+密钥 `AuditLog`——长度、绝对索引、`retain_from`、Merkle 根与包含证明都与原
+日志完全一致。字节流携带裁剪检查点（被释放前缀的链头）与覆盖 `[0, r)` 的
+frontier 完美子树，因此无需任何已释放的 payload 即可重建全部可重建快照：
+
+```python
+from auditchain import dump_pruned_log, load_pruned_log
+
+log.prune(3, log.seal(3))                    # 释放前 3 条，retain_from == 3
+data = dump_pruned_log(log, seed)            # bytes，可落盘/跨进程/跨介质传递
+restored = load_pruned_log(data, public_key) # 全新、独立、可变的 AuditLog
+restored.retain_from == 3                    # True：保留点一致
+restored.head == log.head                    # True：链头一致
+restored.merkle_root() == log.merkle_root()  # True：Merkle 根一致
+restored.inclusion_proof(4) == log.inclusion_proof(4)  # True：证明一致
+restored.append("new event")                 # 恢复后照常追加、加密、再裁剪
+```
+
+- 导出**只读**且确定：不改变日志任何状态；同状态、同种子的两次导出逐字节
+  相同（Ed25519 确定性签名），私钥从不保存、不写入字节流
+- 仅接受 `retain_from > 0` 的已裁剪日志，且构造时未传 `key`、没有任何认证
+  历史（未 `auth` / `auth_batch` / `rotate_key` / `export_verifier`，无残留
+  标签）、从未 `encrypt` 过条目（含已被裁剪释放的密文：nonce 历史仍在即
+  拒绝）。字节流不携带任何裁剪回执、认证 / 演进状态、密钥或 nonce
+- 字节流以魔数 `b"auditchain/pruned-log/v1\0"` 开头，随后**严格依次**写
+  `version`（恒为 `1`，u64）、`B(hash_name 的 UTF-8)`、总条目数 `n`（u64）、
+  保留点 `r`（u64）、`B(checkpoint)`（前 `r` 条末条的链摘要，与算法摘要
+  等宽）、frontier 子树计数（u64）、按**高度升序**每棵子树一对
+  `U(height) || B(digest)`（高度恰为 `r` 的置位，子树覆盖 `[0, r)`）、保留
+  条目计数（u64，恰为 `n - r`）与索引 `r..n-1` 的条目；每个条目按
+  `dump_log` 格式依次为 `U(index)`、`B(payload)`、`B(previous_hash)`、
+  `B(entry_hash)`。随后写 `B(root)`、`B(head)`（完整 size-`n` 快照的
+  Merkle 根与链头），末尾追加覆盖此前全部字节的 **64 字节 Ed25519 签名**。
+  `U` 为 8 字节无符号大端，`B(x) = U(len(x)) || x`，不允许省略、换序或
+  附加字节
+- `load_pruned_log` **先验签**（对签名之前的全部字节用公钥校验末尾 64 字节
+  签名），通过后才解析并复核上述结构：要求 `0 < r <= n`、frontier 高度恰为
+  `r` 的置位、保留条目数恰为 `n - r`、索引恰为 `r..n-1`；随后按 `hash_name`
+  从检查点起逐条重算 `entry_digest` 链，链头必须等于 `head`，由 frontier 与
+  保留条目重建的 Merkle 根必须等于 `root`，最后经正常 `append` 路径重放
+  （`find` 索引、frontier、链头、长度与保留点随之重建）
+- `dump_pruned_log` 入参不是 `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`；
+  私钥不是 32 字节，或日志未裁剪 / 带认证状态或历史 / 含加密历史抛
+  `ValueError`
+- `load_pruned_log` 的 `data` 只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`），公钥类型错抛 `TypeError`；公钥非 32 字节，或魔数、版本、
+  非法 UTF-8、未知 / 非固定输出算法、截断、尾随、保留点越界、检查点 /
+  frontier / 摘要宽度不符、frontier 高度非 `r` 的置位、条目数与 `n - r`
+  不符、索引顺序、断链、重算链头 / Merkle 根不符、签名不符均抛
+  `ValueError`；恢复为只读校验，不改变入参
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -1083,6 +1139,24 @@ python3 -m auditchain
   `memoryview`），公钥类型错抛 `TypeError`；公钥非 32 字节，或魔数、版本、
   UTF-8、算法、截断、尾随、索引、摘要 / locator 宽度、密文封装、重复 nonce、
   重算链 / 根、签名不符均抛 `ValueError`
+- `dump_pruned_log(log, private_key)` / `load_pruned_log(data, public_key)` —
+  已裁剪日志（`retain_from > 0`、无认证、无加密历史）的签名导出与离线恢复，
+  使一份已裁剪的普通日志可落盘、跨进程恢复为独立、可变的无密钥 `AuditLog`
+  （长度、绝对索引、`retain_from`、Merkle 根与证明均与原日志一致）：字节流为
+  `b"auditchain/pruned-log/v1\0" || U(1) || B(hash_name 的 UTF-8) || U(n) ||
+  U(r) || B(checkpoint)`，随后是 frontier 计数与按高度升序的
+  `U(height) || B(digest)`（高度恰为 `r` 的置位，覆盖 `[0, r)`）、保留条目
+  计数与索引 `r..n-1` 的条目（`U(index) || B(payload) || B(previous_hash) ||
+  B(entry_hash)`，同 `dump_log`），再写 `B(root)`、`B(head)`，末尾追加覆盖
+  此前全部字节的 64 字节 Ed25519 签名；`checkpoint` 为前 `r` 条末条的链摘要，
+  与算法摘要等宽。加载先验签，再复核结构、`0 < r <= n`、frontier 高度、条目
+  数与索引顺序，从检查点重算链头与 Merkle 根并逐项匹配后重放。导出只读且
+  确定（同状态同种子字节相同，私钥不存储）；`log` 不是 `AuditLog` 或私钥
+  不是 `bytes` 抛 `TypeError`，私钥长度非 32 或日志未裁剪 / 带认证状态或
+  历史 / 含加密历史抛 `ValueError`。`data` 只接受 `bytes`（拒绝
+  `bytearray` / `memoryview`），公钥类型错抛 `TypeError`；公钥非 32 字节，
+  或魔数、版本、UTF-8、算法、截断、尾随、保留点越界、宽度、frontier 结构、
+  条目数、索引顺序、断链、重算链 / 根、签名不符均抛 `ValueError`
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

@@ -16,7 +16,8 @@ encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
-dump_secure_log / load_secure_log.
+dump_secure_log / load_secure_log /
+dump_pruned_log / load_pruned_log.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ __all__ = [
     "decode_signed_root",
     "decrypt_entry",
     "dump_log",
+    "dump_pruned_log",
     "dump_secure_log",
     "encode_audit_batch",
     "encode_audit_receipt",
@@ -73,6 +75,7 @@ __all__ = [
     "encode_signed_root",
     "entry_digest",
     "load_log",
+    "load_pruned_log",
     "load_secure_log",
     "verify_audit_receipt",
     "verify_audit_batch",
@@ -182,6 +185,19 @@ _LOG_STATE_VERSION = 1
 # on load and must never repeat.
 _SECURE_LOG_MAGIC = b"auditchain/secure-log/v1\0"
 _SECURE_LOG_VERSION = 1
+
+# Binary framing of dump_pruned_log / load_pruned_log. Like the secure-log
+# framing (same u64/blob rules, inline snapshot fields and a trailing 64-byte
+# Ed25519 signature over every preceding byte), but for a pruned plain log:
+# after the version, hash name, total length n and retain point r the stream
+# carries the sealed checkpoint (the chain head of the released prefix
+# [0, r)) and the perfect-subtree frontier covering that prefix — one
+# U(height) || B(digest) pair per set bit of r, in ascending height order —
+# then the retained entries r..n-1 in the dump_log entry framing, and finally
+# B(root) and B(head) of the full size-n snapshot. No prune receipts,
+# authentication material or encryption state is carried.
+_PRUNED_LOG_MAGIC = b"auditchain/pruned-log/v1\0"
+_PRUNED_LOG_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -4334,6 +4350,295 @@ def load_secure_log(data: Any, public_key: Any) -> AuditLog:
                 raise ValueError(
                     f"entry chain is inconsistent at index {position}"
                 )
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError(
+            "recomputed chain head does not match the signed snapshot"
+        )
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError(
+            "recomputed Merkle root does not match the signed snapshot"
+        )
+    return log
+
+
+def dump_pruned_log(log: Any, private_key: Any) -> bytes:
+    """Export a pruned, plain log (``retain_from > 0``) as one self-certifying
+    byte string.
+
+    The pruned counterpart of :func:`dump_log`: only an :class:`AuditLog`
+    that has been pruned (``retain_from > 0``), was constructed without an
+    authentication key and has never held authentication or encryption state
+    or history is accepted. The byte stream carries everything needed to
+    restore the log offline without any pruned payload: the retain point
+    ``r``, the sealed checkpoint (the chain head of the released prefix
+    ``[0, r)``), the perfect-subtree frontier covering that prefix and the
+    retained entries ``r..n-1`` — no prune receipts, authentication tags or
+    key-evolution state, encryption keys, nonces or locators.
+
+    The encoding starts with the magic ``b"auditchain/pruned-log/v1\\0"`` and
+    then writes, strictly in order, the envelope version (always ``1``) as an
+    unsigned 8-byte big-endian integer, ``B(UTF-8(hash_name))``, the total
+    entry count ``n`` as a u64, the retain point ``r`` as a u64,
+    ``B(checkpoint)`` where ``checkpoint`` is the chain digest of the last of
+    the first ``r`` entries (exactly the hash algorithm's digest width), the
+    frontier subtree count as a u64, one ``U(height) || B(digest)`` pair per
+    frontier subtree in ascending height order (the heights are exactly the
+    set bits of ``r`` and the subtrees cover ``[0, r)``), the retained entry
+    count as a u64 and the retained entries; entry ``Ei`` is encoded as
+    ``U(index)``, ``B(payload)``, ``B(previous_hash)`` and ``B(entry_hash)``
+    in that order, exactly as in :func:`dump_log`. Then come ``B(root)`` and
+    ``B(head)`` of the full size-``n`` snapshot, and a 64-byte Ed25519
+    signature over every preceding byte closes the stream. ``U`` is an
+    unsigned 8-byte big-endian integer and ``B(x) = U(len(x)) || x``. Nothing
+    is omitted, reordered or appended.
+
+    ``private_key`` is a 32-byte Ed25519 private key seed; it is used for the
+    one signature and is never stored, copied into the dump or added as a
+    separate signing input. The call is read-only and deterministic: it never
+    mutates the log, and two dumps of logs in the same state signed with the
+    same seed are byte-for-byte identical (Ed25519 signatures are
+    deterministic). A non-:class:`AuditLog` value or a non-``bytes`` seed
+    raises TypeError; a seed that is not 32 bytes, or a log that is unpruned
+    (``retain_from == 0``), keyed/authenticated or has encryption history
+    raises ValueError.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, mirroring dump_log /
+    # dump_secure_log; the key is used only for the one signature below and
+    # is never stored on the log.
+    signing_key = _load_ed25519_seed(private_key)
+    # The format restores an independent keyless log from the prune
+    # checkpoint, the frontier and the retained entries only, so a pruned,
+    # plain, append-only history is required.
+    if log._retain_from == 0:
+        raise ValueError(
+            "only a pruned log (retain_from > 0) can be dumped as a pruned log"
+        )
+    if log._key is not None or log._stage != 0 or log._tags or log._verifier_exported:
+        raise ValueError("a log with authentication state or history cannot be dumped")
+    if log._encrypted_index or log._encrypted_locators or log._used_nonces:
+        raise ValueError("a log with encrypted entries cannot be dumped")
+    hash_name = log._hash_name
+    size = len(log)
+    retain_from = log._retain_from
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _PRUNED_LOG_MAGIC,
+        _encode_u64(_PRUNED_LOG_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+        _encode_u64(retain_from, "retain_from"),
+        _encode_blob(log._checkpoint_head),
+        _encode_u64(len(log._frontier), "frontier count"),
+    ]
+    for height in sorted(log._frontier):
+        parts.append(_encode_u64(height, "frontier height"))
+        parts.append(_encode_blob(log._frontier[height]))
+    parts.append(_encode_u64(len(log._entries), "retained entries count"))
+    for entry in log._entries:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    body = b"".join(parts)
+    # Sign every byte written so far; the signature is the trailing field, so
+    # the wire format verifies without knowing any inner framing offset.
+    signature = signing_key.sign(body)
+    if len(signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    return body + signature
+
+
+def load_pruned_log(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable :class:`AuditLog` from
+    :func:`dump_pruned_log`, verifying entirely offline.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/pruned-log/v1\\0"`` it must contain, strictly in order,
+    the u64 envelope version (only ``1`` is supported),
+    ``B(UTF-8(hash_name))``, the total entry count ``n`` as a u64, the retain
+    point ``r`` as a u64 (with ``0 < r <= n``), ``B(checkpoint)`` (the chain
+    digest of the last of the first ``r`` entries, exactly the digest width),
+    the u64 frontier subtree count, one ``U(height) || B(digest)`` pair per
+    subtree in strictly ascending height order (the heights must be exactly
+    the set bits of ``r``, covering ``[0, r)``), the u64 retained entry count
+    (exactly ``n - r``), that many entries encoded as ``U(index)``,
+    ``B(payload)``, ``B(previous_hash)`` and ``B(entry_hash)``, and finally
+    ``B(root)`` and ``B(head)``, followed by a closing 64-byte Ed25519
+    signature, with no truncation or trailing bytes.
+
+    Verification happens before any state is built: the trailing signature is
+    checked against every preceding byte with the 32-byte ``public_key``;
+    only then is the stream parsed and re-checked. Under the named
+    ``hash_name`` the retained entries must occupy indices ``r..n-1`` in
+    order, and every :func:`entry_digest` and predecessor link is recomputed
+    starting from the signed checkpoint; the resulting chain head must equal
+    ``head`` and the Merkle root rebuilt from the frontier and the retained
+    entries must equal ``root``. Only then is a fresh keyless
+    :class:`AuditLog` materialized with ``retain_from == r``, the checkpoint
+    and frontier installed and the payloads replayed through the normal
+    append path, so its find index, Merkle frontier, head, length, retain
+    point, Merkle roots and inclusion proofs are exactly those of the
+    original pruned log — it is fully mutable and supports every existing
+    operation (append, encrypt with a fresh key, further pruning, ...),
+    sharing no state with the caller's buffers.
+
+    A non-``bytes`` ``data`` or ``public_key`` raises TypeError; a public key
+    that is not 32 bytes, a bad magic, version, UTF-8, hash algorithm,
+    truncation, trailing bytes, an out-of-range retain point, a
+    checkpoint/frontier/digest width mismatch, a frontier that is not exactly
+    the set bits of ``r``, an entry count that disagrees with ``n - r``, an
+    index ordering violation, a broken recomputed chain, a root/head mismatch
+    or a signature that does not verify raises ValueError.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verification_key = _load_ed25519_public(public_key)
+    if not data.startswith(_PRUNED_LOG_MAGIC):
+        raise ValueError("not an auditchain pruned-log encoding")
+    if len(data) < _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify the signature over the entire body before parsing any of it, so
+    # a forged or corrupted stream never reaches the chain-replay logic.
+    try:
+        verification_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError("pruned-log signature does not verify") from error
+    offset = len(_PRUNED_LOG_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = body[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _PRUNED_LOG_VERSION:
+        raise ValueError(f"unsupported pruned-log version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    size = read_u64("entries count")
+    retain_from = read_u64("retain_from")
+    checkpoint = read_blob("checkpoint")
+    if not 0 < retain_from <= size:
+        raise ValueError(
+            "retain_from must satisfy 0 < retain_from <= entries count"
+        )
+    if len(checkpoint) != digest_size:
+        raise ValueError(f"checkpoint must be {digest_size} bytes")
+    frontier_count = read_u64("frontier count")
+    frontier: dict[int, bytes] = {}
+    previous_height = -1
+    for _ in range(frontier_count):
+        height = read_u64("frontier height")
+        digest = read_blob("frontier digest")
+        if height <= previous_height:
+            raise ValueError("frontier heights must be in strictly ascending order")
+        if len(digest) != digest_size:
+            raise ValueError(f"frontier digest must be {digest_size} bytes")
+        frontier[height] = digest
+        previous_height = height
+    # The frontier is exactly the set of maximal perfect subtrees covering
+    # [0, retain_from): one subtree of height h per set bit h of retain_from.
+    expected_heights = [
+        height for height in range(64) if (retain_from >> height) & 1
+    ]
+    if sorted(frontier) != expected_heights:
+        raise ValueError(
+            "frontier heights must be exactly the set bits of retain_from"
+        )
+    count = read_u64("retained entries count")
+    if count != size - retain_from:
+        raise ValueError(
+            "retained entries count must equal entries count minus retain_from"
+        )
+    raw_entries: list[tuple[int, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        raw_entries.append((index, payload, previous_hash, entry_hash))
+    root = read_blob("root")
+    head = read_blob("head")
+    if offset != len(body):
+        raise ValueError("trailing bytes before the pruned-log signature")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+
+    # Re-derive the retained chain from the signed checkpoint under the named
+    # hash algorithm, and simultaneously replay the payloads into a fresh
+    # keyless log with the checkpoint, frontier and retain point installed,
+    # so the find index and every other auxiliary structure are rebuilt
+    # exactly as the normal append path builds them. Seeding the head with
+    # the checkpoint makes the first retained append link to it exactly as
+    # the live log did.
+    log = AuditLog(hash_name=hash_name)
+    log._retain_from = retain_from
+    log._checkpoint_head = checkpoint
+    log._frontier = dict(frontier)
+    log._head = checkpoint
+    previous = checkpoint
+    for position, (index, payload, recorded_previous, recorded_hash) in enumerate(
+        raw_entries
+    ):
+        expected_index = retain_from + position
+        if index != expected_index:
+            raise ValueError("entries must occupy indices r..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {expected_index}")
+        recomputed = entry_digest(
+            expected_index,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {expected_index}")
+        replayed = log.append(payload)
+        if (
+            replayed.index != index
+            or replayed.previous_hash != recorded_previous
+            or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+        ):
+            raise ValueError(
+                f"entry chain is inconsistent at index {expected_index}"
+            )
         previous = recomputed
     if not hmac.compare_digest(previous, head):
         raise ValueError(

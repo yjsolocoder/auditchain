@@ -6,6 +6,7 @@ IntegrityReport / entry_digest / decrypt_entry / verify_inclusion /
 verify_batch_inclusion / verify_consistency / verify_auth /
 verify_audit_receipt / verify_audit_batch / verify_signed_root /
 verify_signed_audit_batch / encode_audit_receipt / decode_audit_receipt /
+encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch.
@@ -44,11 +45,13 @@ __all__ = [
     "GENESIS_HASH",
     "decode_audit_batch",
     "decode_audit_receipt",
+    "decode_prune_receipt",
     "decode_signed_audit_batch",
     "decode_signed_root",
     "decrypt_entry",
     "encode_audit_batch",
     "encode_audit_receipt",
+    "encode_prune_receipt",
     "encode_signed_audit_batch",
     "encode_signed_root",
     "entry_digest",
@@ -92,6 +95,10 @@ _ENC_LOCATE_DOMAIN = b"auditchain/encrypted-locate/v1\0"
 # Binary framing of encode_audit_receipt / decode_audit_receipt: a fixed
 # magic, then unsigned 8-byte big-endian integers and length-prefixed blobs.
 _RECEIPT_MAGIC = b"auditchain/audit-receipt/v1\0"
+# Binary framing of encode_prune_receipt / decode_prune_receipt: same u64/blob
+# rules; a sealed prefix checkpoint with no per-entry payload.
+_PRUNE_RECEIPT_MAGIC = b"auditchain/prune-receipt/v1\0"
+_PRUNE_RECEIPT_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -2392,6 +2399,106 @@ def decode_audit_receipt(data: Any) -> AuditReceipt:
     )
     _check_receipt_proofs(receipt)
     return receipt
+
+
+def encode_prune_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`PruneReceipt` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/prune-receipt/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear strictly in the order ``version`` (always 1),
+    ``hash_name`` (UTF-8 blob), ``size``, ``merkle_root`` blob and
+    ``chain_hash`` blob, with nothing omitted, reordered or appended.
+    ``receipt`` must be a :class:`PruneReceipt` — anything else, or a receipt
+    whose fields have been bypassed to wrong types, raises TypeError; a size
+    outside the u64 range, a non-fixed-output hash algorithm, or digests whose
+    width does not match the named algorithm (so the two digests cannot differ
+    in width) raise ValueError. The call is read-only and deterministic: it
+    never mutates the receipt, and re-encoding a decoded one reproduces the
+    original bytes exactly, so a receipt can be persisted and restored in
+    another process and handed straight to :meth:`AuditLog.prune`.
+    """
+    if not isinstance(receipt, PruneReceipt):
+        raise TypeError("receipt must be a PruneReceipt")
+    # Re-validate every field even for a receipt built with object.__setattr__
+    # bypassing the frozen constructor, so structural corruption raises
+    # exactly as the constructor would.
+    checked = PruneReceipt(
+        receipt.hash_name,
+        receipt.size,
+        receipt.merkle_root,
+        receipt.chain_hash,
+    )
+    return b"".join((
+        _PRUNE_RECEIPT_MAGIC,
+        _encode_u64(_PRUNE_RECEIPT_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(checked.merkle_root),
+        _encode_blob(checked.chain_hash),
+    ))
+
+
+def decode_prune_receipt(data: Any) -> PruneReceipt:
+    """Decode bytes produced by :func:`encode_prune_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, a size
+    outside the u64 range, or a ``merkle_root`` / ``chain_hash`` whose width
+    does not match the named digest raises ValueError. The returned receipt is
+    a frozen :class:`PruneReceipt` whose fields equal the originally encoded
+    ones; re-encoding it reproduces the original bytes exactly, and a receipt
+    sealed by a log using the same hash algorithm can be passed to
+    :meth:`AuditLog.prune` on a log in another process exactly as the original
+    could.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_PRUNE_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain prune-receipt encoding")
+    offset = len(_PRUNE_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _PRUNE_RECEIPT_VERSION:
+        raise ValueError("unsupported prune-receipt version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    merkle_root = read_blob("merkle_root")
+    chain_hash = read_blob("chain_hash")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the prune receipt")
+    return PruneReceipt(
+        hash_name=hash_name,
+        size=size,
+        merkle_root=merkle_root,
+        chain_hash=chain_hash,
+    )
 
 
 def encode_audit_batch(receipt: Any) -> bytes:

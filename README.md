@@ -143,6 +143,29 @@ receipt = log.apply_retention(3, mode="keep_last")  # 保留点 = max(当前保�
   `ValueError`；任何失败都发生在改动之前，全部日志、认证、索引与证明状态不变
 - 已裁剪条目的加密 nonce 仍记录在案，裁剪后依旧不可复用
 
+`PruneReceipt` 可编码为规范字节形式，便于落盘或跨进程恢复后继续用于
+`AuditLog.prune`（编解码均为只读，旧裁剪行为不变）：
+
+```python
+from auditchain import encode_prune_receipt, decode_prune_receipt
+
+data = encode_prune_receipt(receipt)        # bytes，可写文件/发网络
+restored = decode_prune_receipt(data)       # 冻结 PruneReceipt，字段与原回执相等
+restored == receipt                         # True
+encode_prune_receipt(restored) == data      # True：解码后重编码逐字节相同
+log.prune(restored.size, restored)          # 同算法日志可直接据此裁剪
+```
+
+编码即 `b"auditchain/prune-receipt/v1\0" || version || hash_name || size ||
+merkle_root || chain_hash`：魔数之后依次写 `version`（恒为 `1`）、`hash_name`
+的 UTF-8 blob、`size`、`merkle_root` blob、`chain_hash` blob；所有整数为 8
+字节无符号大端（`U`），每个 blob 为 `B(x) = U(len(x)) || x`（零长度也是全零
+u64）。`encode_prune_receipt` 只接受 `PruneReceipt`，其余类型或绕过冻结写入的
+字段类型错抛 `TypeError`；`decode_prune_receipt` 只接受 `bytes`（含拒绝
+`bytearray` / `memoryview`）。魔数、版本、非法 UTF-8、非固定输出或未知摘要
+算法、截断、尾随字节、blob 长度、`size` 的 u64 范围、两摘要宽度与算法不符（两
+摘要等宽）均抛 `ValueError`。
+
 ### 离线审计回执
 
 ```python
@@ -644,6 +667,17 @@ python3 -m auditchain
   版本、截断、尾随、blob 长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、
   冻结且重编码逐字节相同，结构合法但验真不匹配仍可解码（验包返回 `False`）；
   两个入口均为只读且确定
+- `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
+  规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
+  `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为
+  `b"auditchain/prune-receipt/v1\0" || version || hash_name || size ||
+  merkle_root || chain_hash`；`version` 恒为 `1`，`version` 与 `size` 写 u64，
+  `hash_name` 转 UTF-8 后与 `merkle_root`、`chain_hash` 均写 blob
+  （`B(x) = U(len(x)) || x`，零长度也是全零 u64）。解码返回字段相等的冻结
+  回执，重编码逐字节相同。前者只接受 `PruneReceipt`，后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；非对应类型或绕过冻结构造器写入的字段
+  类型错抛 `TypeError`，魔数、版本、UTF-8、未知或非固定输出算法、截断、尾随、
+  blob 长度、u64 范围或摘要宽度（两摘要等宽）非法抛 `ValueError`
 - `encode_audit_receipt(receipt)` / `decode_audit_receipt(data)` — 审计回执的规范二进制
   编码与解码：魔数 `b"auditchain/audit-receipt/v1\0"` 开头，整数为 8 字节无符号大端，
   blob 为 u64 长度前缀加原始字节；解码结果字段与原回执相等且重复编码字节相同；

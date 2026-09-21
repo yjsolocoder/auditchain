@@ -306,6 +306,45 @@ verify_signed_root(restored, public_key)   # True：无需持有日志
   宽度非法抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，
   `verify_signed_root` 返回 `False`。两个入口均为只读
 
+### 可信紧凑批量审计包（Ed25519）
+
+`signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
+`audit_batch` 的紧凑批量回执五元组与 `sign_root` 对同一快照签发的
+`SignedRoot` 检查点；离线接收方仅凭**预置信任**的 32 字节 Ed25519 公钥，
+即可一次确认所选条目、共享批量包含证明、快照 Merkle 根与链头均由日志持有者
+签发，无需持有 `AuditLog`，也不引入任何新的签名原文：
+
+```python
+from auditchain import verify_signed_audit_batch
+
+receipt = log.signed_audit_batch([0, 2], seed)         # size 默认 len(log)
+receipt.batch == log.audit_batch([0, 2])               # True：批量五元组
+receipt.checkpoint == log.sign_root(seed)             # True：同一签名检查点
+verify_signed_audit_batch(receipt, public_key)        # True：无需持有日志
+verify_signed_audit_batch(receipt, other_key)         # False：未信任的公钥
+AuditLog().signed_audit_batch((), seed)               # 空快照：规范空树根 + 零链头
+```
+
+- 包为冻结的 `SignedAuditBatch(batch:tuple, checkpoint:SignedRoot)`，字段顺序
+  即签名顺序，支持位置构造、按两个字段相等；`batch` 必须是元组、`checkpoint`
+  必须是 `SignedRoot`，字段类型错抛 `TypeError`（批量五元组内部的结构契约仍由
+  `verify_audit_batch` 校验）
+- `AuditLog.signed_audit_batch(indices, private_key, size=None)` 是只读签发
+  入口，`size` 默认当前长度：先调用 `audit_batch(indices, size)`，再调用
+  `sign_root(private_key, size)`，据其结果构造 `SignedAuditBatch`；任何失败
+  都在构造前抛出，不改变日志状态，也不新增签名原文（检查点签的仍是
+  `sign_root` 的原文）
+- `verify_signed_audit_batch(receipt, public_key)` 完全离线核验：依次调用
+  `verify_audit_batch` 与 `verify_signed_root`，并要求两部分描述同一快照——
+  `hash_name`、`size`、`root` 一致，且非空快照的检查点 `head` 等于批量回执
+  末条（索引 `size - 1`）的 `entry_hash`；空快照的 `head` 必须为同宽零摘要
+  （sha256 下即 `GENESIS_HASH`）。公钥不受信任、两部分不一致，或条目 / 证明 /
+  根 / 链头 / 签名被改，均返回 `False`（绝不抛异常）
+- 入参不是 `SignedAuditBatch`（含绕过冻结构造器写入的容器字段类型错）抛
+  `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
+  `verify_signed_root` 的既有异常（`TypeError` / `ValueError`）；公钥不是
+  `bytes` 抛 `TypeError`、不是 32 字节抛 `ValueError`；核验为只读
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -384,6 +423,10 @@ python3 -m auditchain
   `memoryview`，不做拷贝归一化）；`size` 须满足 `0 <= size < 2**64`。类型非法
   抛 `TypeError`，版本非 1、未知算法、`size` 越界、`root`/`head` 摘要宽度不符
   或 `signature` 不是 64 字节抛 `ValueError`
+- `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
+  字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
+  `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
+  抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -483,6 +526,13 @@ python3 -m auditchain
     `version` 恒为 1。私钥种子只用于这一次签名、从不保存或返回；`size` 越界或快照
     已裁剪抛 `ValueError`（空快照 `size=0` 始终可签），种子类型错抛 `TypeError`、
     长度非 32 抛 `ValueError`；调用只读，离线用 `verify_signed_root` 凭预信任公钥验真
+  - `signed_audit_batch(indices, private_key, size=None)` — 只读签发可信紧凑批量
+    审计包，返回不可变 `SignedAuditBatch`：先调用 `audit_batch(indices, size)`，
+    再调用 `sign_root(private_key, size)`（`size` 默认当前长度），据此构造
+    `SignedAuditBatch(batch, checkpoint)`，两部分描述同一快照，且不新增签名原文。
+    失败（非法选择、种子或 `size`）在构造前抛出，不改变日志状态；异常类型沿用
+    `audit_batch` / `sign_root`（`TypeError` / `ValueError`）；离线用
+    `verify_signed_audit_batch` 凭预信任公钥验真
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -536,6 +586,17 @@ python3 -m auditchain
   返回 `True`。入参不是 `SignedRoot` 或公钥不是 `bytes` 抛 `TypeError`；版本、
   未知算法、`size` 范围、摘要宽度、签名长度或公钥长度（非 32 字节）非法抛
   `ValueError`；调用只读
+- `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
+  无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）
+  与 `verify_signed_root`（核验检查点签名），并要求两部分的 `hash_name`、`size`、
+  `root` 一致，且非空快照的检查点 `head` 等于批量回执末条（索引 `size - 1`）的
+  `entry_hash`，空快照的 `head` 为同宽零摘要。公钥不受信任、两部分不一致，或
+  条目/证明/根/链头/签名被改返回 `False`，匹配返回 `True`。入参不是
+  `SignedAuditBatch`（含绕过构造器的容器字段类型错）或公钥不是 `bytes` 抛
+  `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
+  `verify_signed_root` 的既有异常（`TypeError` / `ValueError`），公钥长度非
+  32 字节抛 `ValueError`；调用只读
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head

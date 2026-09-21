@@ -1,10 +1,11 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / SignedRoot / IntegrityIssue / IntegrityReport / entry_digest /
-decrypt_entry / verify_inclusion / verify_batch_inclusion /
-verify_consistency / verify_auth / verify_audit_receipt / verify_audit_batch /
-verify_signed_root / encode_audit_receipt / decode_audit_receipt /
+Verifier / SignedRoot / SignedAuditBatch / IntegrityIssue /
+IntegrityReport / entry_digest / decrypt_entry / verify_inclusion /
+verify_batch_inclusion / verify_consistency / verify_auth /
+verify_audit_receipt / verify_audit_batch / verify_signed_root /
+verify_signed_audit_batch / encode_audit_receipt / decode_audit_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_signed_root / decode_signed_root.
 """
@@ -36,6 +37,7 @@ __all__ = [
     "IntegrityIssue",
     "IntegrityReport",
     "PruneReceipt",
+    "SignedAuditBatch",
     "SignedRoot",
     "Verifier",
     "GENESIS_HASH",
@@ -53,6 +55,7 @@ __all__ = [
     "verify_batch_inclusion",
     "verify_consistency",
     "verify_inclusion",
+    "verify_signed_audit_batch",
     "verify_signed_root",
 ]
 
@@ -589,6 +592,39 @@ class SignedRoot:
             raise ValueError(
                 f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
             )
+
+
+@dataclass(frozen=True)
+class SignedAuditBatch:
+    """Compact batch audit receipt sealed by a pre-trusted Ed25519 key.
+
+    Bundles the five-tuple of :meth:`AuditLog.audit_batch` with the
+    :class:`SignedRoot` checkpoint of :meth:`AuditLog.sign_root`, so an
+    offline receiver holding only a pre-trusted 32-byte Ed25519 public key
+    can confirm in one artifact that the selected entries, the snapshot
+    Merkle root and the chain head were all issued by the log holder —
+    without holding the :class:`AuditLog`:
+
+    - ``batch``: the ``(hash_name, size, root, entries, proof)`` five-tuple
+      produced by :meth:`AuditLog.audit_batch`,
+    - ``checkpoint``: the :class:`SignedRoot` produced by
+      :meth:`AuditLog.sign_root` for the same snapshot.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``batch`` must be a
+    tuple and ``checkpoint`` a :class:`SignedRoot`; the batch tuple's own
+    structural contract is left to :func:`verify_audit_batch`, so a field of
+    the wrong type raises TypeError.
+    """
+
+    batch: tuple
+    checkpoint: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch, tuple):
+            raise TypeError("batch must be the audit_batch five-tuple")
+        if not isinstance(self.checkpoint, SignedRoot):
+            raise TypeError("checkpoint must be a SignedRoot")
 
 
 @dataclass(frozen=True)
@@ -1578,6 +1614,36 @@ class AuditLog:
         entries = tuple(self.entry(index) for index in ordered)
         return self._hash_name, size, self.merkle_root(size), entries, proof
 
+    def signed_audit_batch(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedAuditBatch:
+        """Issue a :class:`SignedAuditBatch`: a batch receipt sealed by a
+        pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``batch =
+        audit_batch(indices, size)`` followed by ``checkpoint =
+        sign_root(private_key, size)`` (``size`` defaulting to the current
+        log length), bundled as one :class:`SignedAuditBatch`. The batch
+        five-tuple lets an offline receiver verify the selected entries
+        against the snapshot Merkle root, and the checkpoint lets the same
+        receiver confirm — using only a pre-trusted 32-byte Ed25519 public
+        key — that the root and chain head were issued by the log holder;
+        no new signing message is introduced, the checkpoint signs exactly
+        the :meth:`sign_root` message. The call is read-only: it never
+        changes entries, head, authentication state, Merkle roots or proofs,
+        and a failure (an invalid selection, seed or size) raises before the
+        bundle is constructed, leaving all state unchanged.
+        """
+        # Validate and build the batch first, exactly as the public method
+        # does; sign_root() is read-only as well, so either failure leaves the
+        # log untouched and nothing new is ever signed.
+        batch = self.audit_batch(indices, size)
+        checkpoint = self.sign_root(private_key, size)
+        return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
+
     def prune(self, retain_from: int, receipt: PruneReceipt) -> None:
         """Release payloads of the sealed prefix, retaining entries from ``retain_from``.
 
@@ -2533,6 +2599,60 @@ def verify_signed_root(receipt: Any, public_key: Any) -> bool:
     except InvalidSignature:
         return False
     return True
+
+
+def verify_signed_audit_batch(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedAuditBatch` against a pre-trusted Ed25519 key.
+
+    Confirms both parts of the sealed bundle without holding the log:
+    :func:`verify_audit_batch` re-verifies the selected entries and their
+    shared proof against the batch's snapshot root, and
+    :func:`verify_signed_root` verifies the checkpoint signature with the
+    32-byte ``public_key``. The two parts are then required to describe the
+    same snapshot — equal ``hash_name``, ``size`` and ``root`` — and the
+    checkpoint chain head must equal the batch's last entry's
+    ``entry_hash``; for an empty snapshot the head must be the digest-width
+    zero value. A genuine sealed bundle from the trusted key returns True;
+    a structurally valid bundle signed by another key, whose parts disagree,
+    or whose entries, proof, root, head or signature have been altered
+    returns False. Input that is not a :class:`SignedAuditBatch` (or whose
+    container fields have been bypassed to wrong types) raises TypeError;
+    nested structural violations raise exactly the exceptions of
+    :func:`verify_audit_batch` and :func:`verify_signed_root` (TypeError or
+    ValueError), and a public key that is not 32 ``bytes`` raises
+    ValueError (a non-``bytes`` key TypeError). The call is read-only.
+    """
+    if not isinstance(receipt, SignedAuditBatch):
+        raise TypeError("receipt must be a SignedAuditBatch")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuditBatch(receipt.batch, receipt.checkpoint)
+    # The batch's own structural contract (field types, ranges, widths,
+    # ordering, last entry, proof node count) raises as in verify_audit_batch.
+    hash_name, size, root, entries, _proof = _unpack_audit_batch(checked.batch)
+    digest_size = _digest_size(hash_name)
+
+    if not verify_audit_batch(checked.batch):
+        return False
+    if not verify_signed_root(checked.checkpoint, public_key):
+        return False
+
+    checkpoint = checked.checkpoint
+    # The signed checkpoint must attest exactly the batch's snapshot.
+    if (
+        checkpoint.hash_name != hash_name
+        or checkpoint.size != size
+        or checkpoint.root != root
+    ):
+        return False
+    if size == 0:
+        expected_head = bytes(digest_size)
+    else:
+        # verify_audit_batch guarantees the final carried entry is the last
+        # snapshot entry (index size - 1); its entry hash is the chain head.
+        expected_head = entries[-1].entry_hash
+    return hmac.compare_digest(checkpoint.head, expected_head)
 
 
 def encode_signed_root(receipt: Any) -> bytes:

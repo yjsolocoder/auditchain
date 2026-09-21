@@ -18,7 +18,8 @@ encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
 dump_secure_log / load_secure_log /
 dump_pruned_log / load_pruned_log /
-dump_secure_pruned / load_secure_pruned.
+dump_secure_pruned / load_secure_pruned /
+dump_auth / load_auth.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ __all__ = [
     "decode_signed_prune",
     "decode_signed_root",
     "decrypt_entry",
+    "dump_auth",
     "dump_log",
     "dump_pruned_log",
     "dump_secure_log",
@@ -76,6 +78,7 @@ __all__ = [
     "encode_signed_prune",
     "encode_signed_root",
     "entry_digest",
+    "load_auth",
     "load_log",
     "load_pruned_log",
     "load_secure_log",
@@ -216,6 +219,18 @@ _PRUNED_LOG_VERSION = 1
 # material or encryption keys are carried.
 _PRUNED_SECURE_MAGIC = b"auditchain/pruned-secure/v1\0"
 _PRUNED_SECURE_VERSION = 1
+
+# Binary framing of dump_auth / load_auth: a symmetric (AES-256-GCM) encrypted
+# export of a complete, unpruned, keyed log with no encrypted-entry history,
+# carrying the forward-secure authentication state (current evolving key and
+# stage) so forward-secure evolution can continue in another process. The wire
+# form is D || 0x01 || nonce(12) || ciphertext || tag(16); the GCM AAD is
+# D || 0x01 || nonce, and the plaintext P is a u64/blob record of
+# hash_name, entry count, all entries, root, head, stage, evolving key and the
+# u64 exported flag. Unlike the signed dumps, the same 32-byte key both
+# seals the export and authenticates the restored log.
+_AUTH_LOG_MAGIC = b"auditchain/auth-log/v1\0"
+_AUTH_LOG_VERSION = 0x01
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -5069,4 +5084,260 @@ def load_secure_pruned(data: Any, public_key: Any) -> AuditLog:
         raise ValueError(
             "recomputed Merkle root does not match the signed snapshot"
         )
+    return log
+
+
+def dump_auth(log: Any, key: Any, nonce: Any = None) -> bytes:
+    """Encrypt a complete keyed log (with its forward-secure state) as bytes.
+
+    The authenticated counterpart of the signed state dumps: the export is
+    sealed with AES-256-GCM under the 32-byte ``key`` rather than an Ed25519
+    seed, and it additionally carries the current forward-secure evolving key
+    and stage, so a restored log can continue authenticating in another
+    process exactly where the original left off.
+
+    Only an :class:`AuditLog` that holds its **complete, unpruned** history
+    (``retain_from == 0``), was **constructed with a non-empty authentication
+    key** and has never held encrypted entries qualifies: the dump restores a
+    keyed log, so a keyless log has no evolving state to carry, and encrypted
+    entries would require nonce history and locators the framing does not
+    include. The dump changes no state on the log.
+
+    The wire form is ``D || 0x01 || N || C`` with
+    ``D = b"auditchain/auth-log/v1\\0"``, ``N`` a 12-byte GCM nonce and ``C``
+    the AES-256-GCM ciphertext of the plaintext below followed by its 16-byte
+    tag; the AAD is ``D || 0x01 || N``. When ``nonce`` is ``None`` a fresh
+    ``os.urandom(12)`` nonce is generated; an explicit nonce must be 12
+    ``bytes`` and its safe reuse under one key is the caller's responsibility.
+
+    The plaintext ``P`` is, strictly in order,
+    ``B(UTF-8(hash_name))``, the entry count ``n`` as a u64, the ``n`` entries,
+    ``B(root)``, ``B(head)``, the current stage as a u64, ``B(K)`` (the
+    current evolving authentication key — the construction key may be any
+    non-empty bytes while ``stage == 0``, and is digest-width after the first
+    evolution) and the exported flag ``x`` (``1`` once
+    :meth:`AuditLog.export_verifier` has been called, otherwise ``0``) encoded
+    as a u64. Entry
+    ``Ei`` follows :class:`Entry`'s field order as ``U(index)``,
+    ``B(payload)``, ``B(previous_hash)`` and ``B(entry_hash)``, and the
+    indices must be exactly ``0..n-1``. ``U`` is an unsigned 8-byte big-endian
+    integer and ``B(v) = U(len(v)) || v``.
+
+    A non-:class:`AuditLog` ``log`` or a non-``bytes`` ``key`` / ``nonce``
+    raises TypeError; a key that is not 32 bytes, an ineligible log
+    (keyless, pruned or with encrypted history) or a non-12-byte explicit
+    nonce raises ValueError. The call is read-only.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the 32-byte sealing key first; it only seals/unseals this
+    # export — the restored log's ongoing authentication key is the carried
+    # evolving K, which need not equal the sealing key.
+    _check_key(key)
+    if nonce is None:
+        nonce = os.urandom(_NONCE_BYTES)
+    else:
+        _check_nonce(nonce)
+    # The format restores an independent keyed log and carries no prune
+    # checkpoint or encrypted-entry state, so only a complete, keyed
+    # append-only history qualifies.
+    if log._retain_from != 0:
+        raise ValueError(
+            "only an unpruned log holding its complete history can be dumped"
+        )
+    if log._key is None:
+        raise ValueError(
+            "only a log constructed with an authentication key can be dumped"
+        )
+    if log._encrypted_index or log._encrypted_locators or log._used_nonces:
+        raise ValueError("a log with encrypted entries cannot be dumped")
+    hash_name = log._hash_name
+    digest_size = log._digest_size
+    size = len(log)
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+    ]
+    for entry in log._entries:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    parts.append(_encode_u64(log._stage, "stage"))
+    evolving_key = log._key
+    # The construction key may be any non-empty bytes at stage 0 (the
+    # constructor accepts e.g. b"shared-secret"); after the first evolution
+    # every key is a digest-width hash output.
+    if not evolving_key:
+        raise ValueError("evolving key must be non-empty")
+    if log._stage > 0 and len(evolving_key) != digest_size:
+        raise ValueError(f"evolved key must be {digest_size} bytes")
+    parts.append(_encode_blob(evolving_key))
+    parts.append(_encode_u64(1 if log._verifier_exported else 0, "exported flag"))
+    plaintext = b"".join(parts)
+    aad = _AUTH_LOG_MAGIC + bytes((_AUTH_LOG_VERSION,)) + nonce
+    sealed = AESGCM(key).encrypt(nonce, plaintext, aad)
+    return aad + sealed
+
+
+def load_auth(data: Any, key: Any) -> AuditLog:
+    """Restore an independent, mutable keyed :class:`AuditLog` from
+    :func:`dump_auth`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError) and ``key`` the
+    same 32-byte key passed to :func:`dump_auth` (a non-``bytes`` value raises
+    TypeError, a wrong-length value raises ValueError). After the magic
+    ``b"auditchain/auth-log/v1\\0"`` the stream must contain the one-byte
+    algorithm identifier ``0x01``, the 12-byte GCM nonce and the
+    AES-256-GCM ciphertext with its trailing 16-byte tag, authenticated with
+    AAD ``D || 0x01 || N``. A wrong key, a bad tag or any framing truncation
+    raises ValueError before any state exists.
+
+    The authenticated plaintext is parsed as
+    ``B(UTF-8(hash_name))``, the entry count ``n`` as a u64, the ``n`` entries
+    (``U(index)``, ``B(payload)``, ``B(previous_hash)``, ``B(entry_hash)`` in
+    :class:`Entry` field order), ``B(root)``, ``B(head)``, the stage as a u64,
+    ``B(K)`` and the exported flag ``x`` as a u64. The indices must be exactly
+    ``0..n-1``; under the named ``hash_name`` every :func:`entry_digest` and
+    predecessor link is recomputed from genesis and the resulting chain head
+    and Merkle root must match the authenticated ``head`` / ``root``; the
+    evolving key must be non-empty (and digest-width once ``stage > 0``), the
+    stage must be a valid u64 and the exported flag must be ``0`` or ``1``.
+    Only then is a fresh keyed :class:`AuditLog` built by replaying the
+    payloads through the normal append path and seeding the forward-secure
+    state (evolving key, stage, exported flag) directly, so its length, head,
+    Merkle root, :meth:`AuditLog.find` results and stage match the original
+    log while sharing no state with the caller's buffers. Authentication can
+    continue in the restored log (and be cross-verified against a verifier
+    exported before the original log's first evolution).
+
+    A non-``bytes`` ``data`` raises TypeError; a bad magic, version, nonce
+    width, truncation, trailing bytes, UTF-8/hash algorithm, blob length,
+    index ordering, digest/key width, stage range, AEAD authentication failure
+    or recomputed chain/root mismatch raises ValueError.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    _check_key(key)
+    header = _AUTH_LOG_MAGIC + bytes((_AUTH_LOG_VERSION,))
+    if not data.startswith(header):
+        raise ValueError("not an auditchain auth-log encoding")
+    nonce_end = len(header) + _NONCE_BYTES
+    if len(data) < nonce_end + _GCM_TAG_BYTES:
+        raise ValueError("truncated encoding: missing nonce or ciphertext")
+    nonce = data[len(header):nonce_end]
+    sealed = data[nonce_end:]
+    aad = header + nonce
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, sealed, aad)
+    except InvalidTag as error:
+        raise ValueError(
+            "auth-log decryption failed (wrong key or tampered data)"
+        ) from error
+
+    offset = 0
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(plaintext):
+            raise ValueError(f"truncated plaintext: expected 8 bytes for {name}")
+        value = int.from_bytes(plaintext[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(plaintext):
+            raise ValueError(f"truncated plaintext: {name} is {length} bytes")
+        blob = plaintext[offset:end]
+        offset = end
+        return blob
+
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    count = read_u64("entries count")
+    raw_entries: list[tuple[int, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        raw_entries.append((index, payload, previous_hash, entry_hash))
+    root = read_blob("root")
+    head = read_blob("head")
+    stage = read_u64("stage")
+    evolving_key = read_blob("evolving key")
+    exported_flag = read_u64("exported flag")
+    if offset != len(plaintext):
+        raise ValueError("trailing bytes in the auth-log plaintext")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    if len(evolving_key) == 0:
+        raise ValueError("evolving key must be non-empty")
+    if stage > 0 and len(evolving_key) != digest_size:
+        raise ValueError(f"evolved key must be {digest_size} bytes")
+    if exported_flag not in (0, 1):
+        raise ValueError("exported flag must be 0 or 1")
+    if stage >= _MAX_STAGE:
+        raise ValueError("stage must be less than 2**64")
+
+    # Re-derive the whole chain from genesis under the named hash algorithm,
+    # and simultaneously replay the payloads into a fresh keyed log so the find
+    # index, Merkle frontier, head, length and retain point are rebuilt
+    # exactly as the normal append path builds them. The key is seeded only
+    # after the replay succeeds, so every validation failure stays atomic.
+    log = AuditLog(key=bytes(digest_size), hash_name=hash_name)
+    previous = bytes(digest_size)
+    for position, (index, payload, recorded_previous, recorded_hash) in enumerate(
+        raw_entries
+    ):
+        if index != position:
+            raise ValueError("entries must occupy indices 0..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {position}")
+        recomputed = entry_digest(
+            position,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {position}")
+        replayed = log.append(payload)
+        if (
+            replayed.index != index
+            or replayed.previous_hash != recorded_previous
+            or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+        ):
+            raise ValueError(f"entry chain is inconsistent at index {position}")
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the authenticated head")
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the authenticated root")
+    # Everything checks out; commit the forward-secure state. The placeholder
+    # stage-0 key is replaced by the authenticated evolving key without running
+    # an extra evolution, and the stage/exported flag are restored verbatim.
+    log._key = evolving_key
+    log._stage = stage
+    log._verifier_exported = exported_flag == 1
     return log

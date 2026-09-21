@@ -842,6 +842,63 @@ decode_auth_batch(encode_auth_batch(()))    # ("sha256", ())：空批次
   `ValueError`；结构合法但标签 / 条目不匹配仍可正常编解码，仅
   `verify_auth_batch` 在对应位置返回 `False`
 
+#### 认证日志的加密导出与恢复（AES-256-GCM）
+
+`dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 把一条**未裁剪、
+无 `encrypt` 历史且构造时带 `key`** 的认证日志加密导出，字节流携带当前演进密钥
+与 stage，因此可在另一进程中恢复为**独立、可变**的认证日志并继续前向安全演进
+——恢复对象的长度、`head`、Merkle 根、`find` 与 `stage` 均与原日志一致：
+
+```python
+from auditchain import dump_auth, load_auth
+
+key = b"k" * 32                          # 32 字节封装密钥；本例也用作日志构造 key
+log = AuditLog(key=key)
+log.append("agent started")
+verifier = log.export_verifier()         # 首次演进前带外交给验证方
+log.auth(0)                              # 密钥演进到 stage 1
+log.append("position claim")
+data = dump_auth(log, key)               # bytes：AES-256-GCM 密文，nonce 默认随机 12 字节
+restored = load_auth(data, key)          # 全新、独立、可变的认证 AuditLog
+restored.head == log.head                # True：链头一致
+restored.merkle_root() == log.merkle_root()  # True：Merkle 根一致
+restored.stage == log.stage              # True：演进 stage 一致
+restored.find(b"agent started")          # (0,)：find 索引已重建
+restored.append("new event")             # 恢复后照常追加
+restored.auth(2)                         # 从原 stage 继续演进，标签可由 verifier 核验
+```
+
+- 字节流为 `D || 0x01 || N || C`，其中
+  `D = b"auditchain/auth-log/v1\0"`，`N` 为 12 字节 nonce，`C` 为明文 `P` 的
+  AES-256-GCM 密文并附 16 字节 tag；AEAD 的 AAD 为 `D || 0x01 || N`。`nonce`
+  省略时用 `os.urandom(12)`；显式 nonce 须为 12 字节 `bytes`，同 key 下的复用
+  由调用方避免。明文 `P` 严格依次为
+  `B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) || B(K) || U(x)`：
+  `h` 为 `hash_name` 的 UTF-8 字节，`K` 为当前演进密钥（stage 0 时即构造
+  `key`，可为任意非空 bytes；首次演进后恒为摘要宽度），`x` 为
+  已导出标志（已调用 `export_verifier` 为 `1`，否则 `0`），以 u64 编码
+- 每个 `E` 按 `Entry(index, payload, previous_hash, entry_hash)` 的字段顺序写
+  `U(index)`、`B(payload)`、`B(previous_hash)`、`B(entry_hash)`；整数均为 8 字节
+  无符号大端（`U`），blob 均为 `B(x) = U(len(x)) || x`，条目索引须恰为
+  `0..n-1`
+- 仅接受 `retain_from == 0`（未裁剪）、构造时传了非空 `key` 且从未 `encrypt`
+  的日志；无密钥日志、已裁剪日志或含密文（含 nonce 历史）的日志抛 `ValueError`。
+  导出**只读**：不改变日志的任何状态（含演进密钥与 stage）；字节流携带的 `K` 是
+  当前前向安全演进密钥（在 GCM 密文内，不明文落盘），不携带任何 `encrypt` 按次
+  AES 密钥（本格式不支持密文历史）
+- `load_auth` 先以 `key` 和 AAD 解密认证（密钥错误或任何篡改均在构造任何状态前
+  抛 `ValueError`），再解析明文：要求索引恰为 `0..n-1`，按 `h` 指定的算法从
+  创世零摘要逐条重算 `entry_digest` 链头并重建 Merkle 根，二者必须与
+  `head` / `root` 一致，`K` 非空（`stage > 0` 时还须与摘要等宽）、`stage`
+  合法、`x ∈ {0,1}`、无截断与尾随字节；随后以正常 `append` 路径重放条目并
+  直接种入演进密钥、stage 与已导出标志，恢复出的日志与调用方缓冲区不共享任何
+  状态
+- `log` 不是 `AuditLog` 或 `key` / `nonce` 类型错抛 `TypeError`；`key` 须为
+  32 字节 `bytes`，`data` 只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；
+  资格不符、nonce 长度、魔数 / 版本、截断、尾随、UTF-8 / 算法、blob 宽度、索引
+  顺序、重算链头 / Merkle 根不符或 AEAD 认证失败均抛 `ValueError`；失败原子，
+  旧接口不变
+
 裁剪只释放内容、不改变逻辑：
 
 - `len(log)` 仍是累计条数；索引始终为绝对值（下一条仍接在原末尾之后）；`head`、`append`
@@ -1250,7 +1307,25 @@ python3 -m auditchain
   长度、魔数、版本、UTF-8、算法、截断、尾随、保留点、frontier 结构、nonce
   宽度 / 顺序、密文 nonce 缺失或重复、locator / 密文封装、条目数、索引、
   断链、重算链 / 根、签名不符均抛 `ValueError`；失败原子，旧接口不变
-- `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
+- `dump_auth(log, key, nonce=None)` / `load_auth(data, key)` — 认证日志的
+  加密导出与恢复，使一份未裁剪、无 `encrypt` 历史且构造时带 `key` 的前向安全
+  日志可加密落盘、跨进程恢复为独立、可变的认证 `AuditLog`，并从原 stage 继续
+  密钥演进（长度、`head`、Merkle 根、`find` 与 `stage` 均与原日志一致）：
+  字节流为 `D || 0x01 || N || C`，`D = b"auditchain/auth-log/v1\0"`，`N` 为
+  12 字节 nonce，`C` 为明文 `P` 的 AES-256-GCM 密文与 16 字节 tag，AAD 为
+  `D || 0x01 || N`；明文
+  `P = B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) || B(K) ||
+  U(x)`（`h` 为 hash_name 的 UTF-8，`K` 为当前演进密钥：stage 0 时即构造
+  key、可为任意非空 bytes，演进后与摘要等宽；`x` 为已导出标志 0/1）；每个 `E` 按 `Entry(index, payload, previous_hash, entry_hash)`
+  字段序写 `U,B,B,B`，索引须恰为 `0..n-1`；`U` 为 8 字节无符号大端、
+  `B(x) = U(len(x)) || x`。`key` 须为 32 字节 `bytes`（同时用于封装加解密与
+  恢复后的认证），`nonce` 省略时随机生成 12 字节、显式值的同 key 复用由调用
+  方避免；`log` 非 `AuditLog` 或 `key` / `nonce` / `data` 类型错抛
+  `TypeError`（`data` 拒绝 `bytearray` / `memoryview`）；资格不符（无密钥、
+  已裁剪或含密文历史）、密钥 / nonce 长度、魔数 / 版本、截断、尾随、UTF-8 /
+  算法、blob 宽度、索引顺序、`x` 取值、重算链头 / Merkle 根不符或密钥错误 /
+  AEAD 认证失败均抛 `ValueError`。导出只读，加载返回独立可变日志，失败原子，
+  旧接口不变
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，
   结构合法但内容不符（含篡改条目、错误标签、错误 stage、错误密钥）返回 `False`；

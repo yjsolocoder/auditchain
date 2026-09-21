@@ -1,15 +1,16 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / SignedRoot / SignedAuditBatch / IntegrityIssue /
-IntegrityReport / entry_digest / decrypt_entry / verify_inclusion /
-verify_batch_inclusion / verify_consistency / verify_auth /
-verify_audit_receipt / verify_audit_batch / verify_signed_root /
-verify_signed_audit_batch / encode_audit_receipt / decode_audit_receipt /
-encode_prune_receipt / decode_prune_receipt /
-encode_audit_batch / decode_audit_batch /
-encode_signed_root / decode_signed_root /
-encode_signed_audit_batch / decode_signed_audit_batch.
+Verifier / SignedRoot / SignedConsistency / SignedAuditBatch /
+IntegrityIssue / IntegrityReport / entry_digest / decrypt_entry /
+verify_inclusion / verify_batch_inclusion / verify_consistency /
+verify_auth / verify_audit_receipt / verify_audit_batch /
+verify_signed_root / verify_signed_consistency /
+verify_signed_audit_batch / encode_audit_receipt /
+decode_audit_receipt / encode_prune_receipt / decode_prune_receipt /
+encode_audit_batch / decode_audit_batch / encode_signed_root /
+decode_signed_root / encode_signed_audit_batch /
+decode_signed_audit_batch.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ __all__ = [
     "IntegrityReport",
     "PruneReceipt",
     "SignedAuditBatch",
+    "SignedConsistency",
     "SignedRoot",
     "Verifier",
     "GENESIS_HASH",
@@ -62,6 +64,7 @@ __all__ = [
     "verify_consistency",
     "verify_inclusion",
     "verify_signed_audit_batch",
+    "verify_signed_consistency",
     "verify_signed_root",
 ]
 
@@ -609,6 +612,44 @@ class SignedRoot:
             raise ValueError(
                 f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
             )
+
+
+@dataclass(frozen=True)
+class SignedConsistency:
+    """Two signed snapshot checkpoints linked by a consistency proof.
+
+    Issued by :meth:`AuditLog.signed_consistency` and verified entirely
+    offline by :func:`verify_signed_consistency` against one pre-trusted
+    32-byte Ed25519 public key, so an offline party can confirm that both
+    snapshots were signed by the log holder and that the newer snapshot was
+    formed from the older one append-only — without holding the
+    :class:`AuditLog` or an :class:`AuditReceipt`:
+
+    - ``old``: the :class:`SignedRoot` checkpoint of the older prefix,
+    - ``new``: the :class:`SignedRoot` checkpoint of the newer prefix,
+    - ``proof``: the tuple of RFC 6962 consistency-proof digests linking the
+      older snapshot root to the newer one, byte-for-byte the output of
+      :meth:`AuditLog.consistency_proof` for the two sizes.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. Only the container shape is validated here: ``old`` and
+    ``new`` must be :class:`SignedRoot` instances and ``proof`` a tuple; the
+    checkpoints' own structural contract is left to
+    :func:`verify_signed_root`, so a field of the wrong type raises
+    TypeError.
+    """
+
+    old: SignedRoot
+    new: SignedRoot
+    proof: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.old, SignedRoot):
+            raise TypeError("old must be a SignedRoot")
+        if not isinstance(self.new, SignedRoot):
+            raise TypeError("new must be a SignedRoot")
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
 
 
 @dataclass(frozen=True)
@@ -1660,6 +1701,48 @@ class AuditLog:
         batch = self.audit_batch(indices, size)
         checkpoint = self.sign_root(private_key, size)
         return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
+
+    def signed_consistency(
+        self,
+        old_size: int,
+        private_key: Any,
+        new_size: int | None = None,
+    ) -> SignedConsistency:
+        """Issue a :class:`SignedConsistency` between two signed snapshots.
+
+        Convenience for the read-only sequence ``old =
+        sign_root(private_key, old_size)``, ``new =
+        sign_root(private_key, new_size)`` (``new_size`` defaulting to the
+        current log length) and ``proof = consistency_proof(old_size,
+        new_size)``, bundled as one :class:`SignedConsistency`. Both
+        checkpoints are therefore signed by the same log holder over exactly
+        the :meth:`sign_root` message — no new signing message is introduced
+        — and ``proof`` is byte-for-byte the :meth:`consistency_proof`
+        digest tuple, so an offline receiver holding only a pre-trusted
+        32-byte Ed25519 public key can confirm that both snapshots were
+        issued by the log holder and that the newer prefix was formed from
+        the older one append-only, without holding the log or an
+        :class:`AuditReceipt`.
+
+        Sizes must satisfy
+        ``0 <= old_size <= new_size <= len(log)`` and both snapshots must
+        still be rebuildable (the empty snapshot ``old_size == 0`` is a
+        content-free constant and stays available after a prune; equal
+        sizes, like ``old_size == 0``, carry an empty proof). The private
+        seed is used only for the two signatures and is never stored,
+        copied into log state or returned. The call is read-only: it never
+        changes entries, head, authentication state, Merkle roots or
+        proofs, and a failure (an invalid seed, size or an unrebuildable
+        snapshot) raises through the existing :meth:`sign_root` /
+        :meth:`consistency_proof` interfaces — TypeError for wrong types,
+        ValueError otherwise — before the bundle is constructed.
+        """
+        # Both sign_root calls and consistency_proof are read-only, so any
+        # failure leaves the log untouched and nothing is ever committed.
+        old = self.sign_root(private_key, old_size)
+        new = self.sign_root(private_key, new_size)
+        proof = self.consistency_proof(old_size, new_size)
+        return SignedConsistency(old=old, new=new, proof=proof)
 
     def prune(self, retain_from: int, receipt: PruneReceipt) -> None:
         """Release payloads of the sealed prefix, retaining entries from ``retain_from``.
@@ -2716,6 +2799,56 @@ def verify_signed_root(receipt: Any, public_key: Any) -> bool:
     except InvalidSignature:
         return False
     return True
+
+
+def verify_signed_consistency(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedConsistency` against a pre-trusted Ed25519 key.
+
+    Confirms both signed snapshots and their link entirely without holding
+    the log: :func:`verify_signed_root` verifies ``receipt.old`` and
+    ``receipt.new`` separately with the 32-byte ``public_key``, the two
+    checkpoints are required to name the same hash algorithm, and then
+    :func:`verify_consistency` is invoked with the older checkpoint's
+    ``hash_name`` to check the two sizes, roots and ``receipt.proof`` —
+    that also enforces ``0 <= old_size <= new_size`` and, for equal sizes
+    or ``old_size == 0``, an empty proof. A genuine consistency receipt
+    from the trusted key returns True; a structurally valid receipt signed
+    by another key, whose checkpoints use different hash algorithms or do
+    not match one another, or whose snapshots, proof or either signature
+    have been altered returns False. Input that is not a
+    :class:`SignedConsistency` (or whose container fields have been
+    bypassed to wrong types) raises TypeError; nested structural violations
+    raise exactly the exceptions of :func:`verify_signed_root` and
+    :func:`verify_consistency` (TypeError or ValueError), and a public key
+    that is not 32 ``bytes`` raises ValueError (a non-``bytes`` key
+    TypeError). The call is read-only.
+    """
+    if not isinstance(receipt, SignedConsistency):
+        raise TypeError("receipt must be a SignedConsistency")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedConsistency(receipt.old, receipt.new, receipt.proof)
+    old = checked.old
+    new = checked.new
+
+    if not verify_signed_root(old, public_key):
+        return False
+    if not verify_signed_root(new, public_key):
+        return False
+    # The two checkpoints must describe Merkle trees under the same hash
+    # algorithm; verify_consistency takes a single hash_name, so a mismatch
+    # is a relabeled/forged association rather than a structural error.
+    if old.hash_name != new.hash_name:
+        return False
+    return verify_consistency(
+        old.size,
+        old.root,
+        new.size,
+        new.root,
+        checked.proof,
+        hash_name=old.hash_name,
+    )
 
 
 def verify_signed_audit_batch(receipt: Any, public_key: Any) -> bool:

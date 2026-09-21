@@ -393,6 +393,53 @@ verify_signed_audit_batch(restored, public_key)    # True：无需持有日志
   或任一嵌套格式非法抛 `ValueError`；结构合法但验真不匹配仍可解码，
   `verify_signed_audit_batch` 返回 `False`。两个入口均为只读且确定
 
+### 可信跨快照一致性凭据（Ed25519）
+
+`signed_consistency` 在一个不可变 `SignedConsistency` 中同时打包新旧两个
+`sign_root` 检查点与二者之间的 `consistency_proof`；离线方仅凭**预置信任**的
+32 字节 Ed25519 公钥，即可确认两个快照均由日志持有者签发，且新快照由旧快照
+**只追加**形成——无需持有 `AuditLog`，也不需要 `AuditReceipt`：
+
+```python
+from auditchain import verify_signed_consistency
+
+receipt = log.signed_consistency(3, seed)             # new_size 默认 len(log)
+receipt.old == log.sign_root(seed, 3)                 # True：旧快照检查点
+receipt.new == log.sign_root(seed)                    # True：新快照检查点
+receipt.proof == log.consistency_proof(3)             # True：逐字节相同
+verify_signed_consistency(receipt, public_key)        # True：无需持有日志
+verify_signed_consistency(receipt, other_key)         # False：未信任的公钥
+log.signed_consistency(0, seed, 5)                    # old_size=0：空证明
+log.signed_consistency(4, seed, 4)                    # 等大：空证明、两根相同
+```
+
+- 凭据为冻结的 `SignedConsistency(old:SignedRoot, new:SignedRoot,
+  proof:tuple[bytes, ...])`，字段顺序即签发顺序，支持位置构造、按三个字段
+  相等；`old`、`new` 必须是 `SignedRoot`、`proof` 必须是 `tuple`，容器字段
+  类型错抛 `TypeError`（两个检查点内部的结构契约仍由 `verify_signed_root`
+  校验）
+- `AuditLog.signed_consistency(old_size, private_key, new_size=None)` 是只读
+  签发入口，`new_size` 默认当前长度：两端分别调用
+  `sign_root(private_key, old_size)` 与 `sign_root(private_key, new_size)`，
+  再调用 `consistency_proof(old_size, new_size)`，据其结果构造
+  `SignedConsistency`；`proof` 与 `consistency_proof` 的输出逐字节相同，不
+  新增任何签名原文（两个检查点签的都是 `sign_root` 的原文）。允许
+  `0 <= old_size <= new_size <= len(log)` 且两个快照仍可重建（空快照
+  `old_size=0` 是内容无关常量，裁剪后始终可签；等大与 `old_size=0` 携带空
+  证明）。任何失败都在构造前抛出，异常类型沿用 `sign_root` /
+  `consistency_proof` 的既有接口（类型错抛 `TypeError`，越界、快照已裁剪或
+  种子长度不符抛 `ValueError`），不改变日志状态
+- `verify_signed_consistency(receipt, public_key)` 完全离线核验：先用
+  `verify_signed_root` 分别验证 `old` 与 `new` 的签名，再要求两者的
+  `hash_name` 相同，随后以 `old.hash_name` 调用 `verify_consistency`，核验
+  两端大小、根与 `proof`（含等大 / `old_size=0` 只能带空证明、
+  `old_size <= new_size` 等既有规则）。任一签名不受信任、两快照算法不一致 /
+  无追加关联，或证明与两端不匹配，均返回 `False`（绝不吞掉异常冒充通过）
+- 入参不是 `SignedConsistency`（含绕过冻结构造器写入的容器字段类型错）抛
+  `TypeError`；嵌套的检查点或证明结构非法时沿用 `verify_signed_root` /
+  `verify_consistency` 的既有异常（`TypeError` / `ValueError`）；公钥不是
+  `bytes` 抛 `TypeError`、不是 32 字节抛 `ValueError`；核验为只读
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -475,6 +522,11 @@ python3 -m auditchain
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
   抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
+- `SignedConsistency(old, new, proof)` — 不可变的可信跨快照一致性凭据，按三个
+  字段相等、支持位置构造；`old`、`new` 为旧、新两个前缀快照的 `SignedRoot`
+  （均必须是 `SignedRoot`），`proof` 为连接两快照根的一致性证明（必须是
+  `tuple`）；容器字段类型错抛 `TypeError`，两个检查点内部的结构契约由
+  `verify_signed_root` 校验
 - `IntegrityIssue(code, index)` — 不可变的单点完整性问题，按字段相等、支持位置构造；
   `code` 为 `"index"`、`"previous_hash"`、`"entry_hash"`（`index` 为问题所在条目的绝对索引）
   或 `"head"`（仅可配 `index=None`，表示重算出的链头与记录的 `head` 不符）；
@@ -581,6 +633,16 @@ python3 -m auditchain
     失败（非法选择、种子或 `size`）在构造前抛出，不改变日志状态；异常类型沿用
     `audit_batch` / `sign_root`（`TypeError` / `ValueError`）；离线用
     `verify_signed_audit_batch` 凭预信任公钥验真
+  - `signed_consistency(old_size, private_key, new_size=None)` — 只读签发可信
+    跨快照一致性凭据，返回不可变 `SignedConsistency`：分别调用
+    `sign_root(private_key, old_size)` 与 `sign_root(private_key, new_size)`
+    得到 `old`、`new` 两个检查点（`new_size` 默认当前长度，不新增签名原文），
+    再以 `consistency_proof(old_size, new_size)` 的输出逐字节作为 `proof`。
+    允许 `0 <= old_size <= new_size <= len(log)` 且两个快照须可重建（空快照
+    `old_size=0` 始终可签；等大与 `old_size=0` 为空证明）。失败在构造前抛出、
+    不改变日志状态，异常类型沿用 `sign_root` / `consistency_proof`
+    （`TypeError` / `ValueError`）；离线用 `verify_signed_consistency` 凭
+    预信任公钥验真
   - `prune(retain_from, receipt)` — 在校验通过后释放前 `retain_from` 条的 payload 及其认证标签：
     要求 `retain_from == receipt.size`，且回执的算法、Merkle 根、链摘要与日志一致；
     保留点只可前移（数值增大）且不可越界，类型非法抛 `TypeError`，越界、回退、
@@ -645,6 +707,18 @@ python3 -m auditchain
   `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
   `verify_signed_root` 的既有异常（`TypeError` / `ValueError`），公钥长度非
   32 字节抛 `ValueError`；调用只读
+- `verify_signed_consistency(receipt, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥离线验证 `AuditLog.signed_consistency` 签发的
+  `SignedConsistency`，无需持有日志，也不需要 `AuditReceipt`：先用
+  `verify_signed_root` 分别验证 `old`、`new` 两个检查点的签名，再要求二者
+  `hash_name` 相同，随后以 `old.hash_name` 调用 `verify_consistency` 核验两端
+  大小、根与 `proof`（等大只接受空证明且两根相等，`old_size=0` 只接受空证明
+  且旧根为规范空树根）。任一签名不受信任、两快照算法不一致 / 无追加关联，或
+  证明与两端不匹配返回 `False`，匹配返回 `True`。入参不是
+  `SignedConsistency`（含绕过构造器的容器字段类型错）或公钥不是 `bytes` 抛
+  `TypeError`；嵌套检查点或证明的结构非法（未知算法、摘要宽度、大小关系、
+  证明节点数等）沿用 `verify_signed_root` / `verify_consistency` 的既有
+  `ValueError`，公钥长度非 32 字节抛 `ValueError`；调用只读
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head

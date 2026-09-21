@@ -7,7 +7,8 @@ verify_batch_inclusion / verify_consistency / verify_auth /
 verify_audit_receipt / verify_audit_batch / verify_signed_root /
 verify_signed_audit_batch / encode_audit_receipt / decode_audit_receipt /
 encode_audit_batch / decode_audit_batch /
-encode_signed_root / decode_signed_root.
+encode_signed_root / decode_signed_root /
+encode_signed_audit_batch / decode_signed_audit_batch.
 """
 
 from __future__ import annotations
@@ -43,10 +44,12 @@ __all__ = [
     "GENESIS_HASH",
     "decode_audit_batch",
     "decode_audit_receipt",
+    "decode_signed_audit_batch",
     "decode_signed_root",
     "decrypt_entry",
     "encode_audit_batch",
     "encode_audit_receipt",
+    "encode_signed_audit_batch",
     "encode_signed_root",
     "entry_digest",
     "verify_audit_receipt",
@@ -103,6 +106,13 @@ _SIGNED_ROOT_DOMAIN = b"auditchain/signed-root/v1\0"
 _SIGNED_ROOT_VERSION = 1
 _ED25519_KEY_BYTES = 32
 _ED25519_SIGNATURE_BYTES = 64
+
+# Binary framing of encode_signed_audit_batch / decode_signed_audit_batch: a
+# fixed magic, then the format version (u64) and two length-prefixed blobs
+# carrying the complete canonical encode_audit_batch / encode_signed_root
+# bytes verbatim — no new signing message is introduced.
+_SIGNED_AUDIT_BATCH_MAGIC = b"auditchain/signed-audit-batch/v1\0"
+_SIGNED_AUDIT_BATCH_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -2754,3 +2764,109 @@ def decode_signed_root(data: Any) -> SignedRoot:
         head=head,
         signature=signature,
     )
+
+
+def encode_signed_audit_batch(receipt: Any) -> bytes:
+    """Encode a :class:`SignedAuditBatch` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-audit-batch/v1\\0"``; it then writes, strictly in
+    order, ``version`` (always 1) as an unsigned 8-byte big-endian integer,
+    the batch blob and the checkpoint blob — nothing may be omitted, reordered
+    or appended. Each blob is a u64 byte length followed by the raw bytes (a
+    zero length is an all-zero u64); the batch blob is verbatim the complete
+    canonical output of :func:`encode_audit_batch` for ``receipt.batch`` and
+    the checkpoint blob is verbatim the complete canonical output of
+    :func:`encode_signed_root` for ``receipt.checkpoint``, so no new signing
+    message is introduced.
+
+    ``receipt`` must be a :class:`SignedAuditBatch` — anything else, or a
+    receipt whose container fields have been bypassed to wrong types, raises
+    TypeError; errors inside the nested encodings propagate exactly as
+    :func:`encode_audit_batch` and :func:`encode_signed_root` raise them
+    (TypeError for wrong field types, ValueError for structural violations).
+    The call is read-only and deterministic: it never mutates the receipt, and
+    re-encoding a decoded one reproduces the original bytes exactly.
+    """
+    if not isinstance(receipt, SignedAuditBatch):
+        raise TypeError("receipt must be a SignedAuditBatch")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuditBatch(receipt.batch, receipt.checkpoint)
+    # Nested structural and type errors propagate from the existing encoders;
+    # their complete canonical bytes are embedded verbatim, never re-framed.
+    batch_blob = encode_audit_batch(checked.batch)
+    checkpoint_blob = encode_signed_root(checked.checkpoint)
+    return b"".join((
+        _SIGNED_AUDIT_BATCH_MAGIC,
+        _encode_u64(_SIGNED_AUDIT_BATCH_VERSION, "version"),
+        _encode_blob(batch_blob),
+        _encode_blob(checkpoint_blob),
+    ))
+
+
+def decode_signed_audit_batch(data: Any) -> SignedAuditBatch:
+    """Decode bytes produced by :func:`encode_signed_audit_batch`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). The stream must start with the magic
+    ``b"auditchain/signed-audit-batch/v1\\0"`` followed, strictly in order, by
+    ``version`` (an unsigned 8-byte big-endian integer, always 1), the batch
+    blob and the checkpoint blob — each a u64 byte length followed by the raw
+    bytes; fields may not be omitted or reordered and no trailing bytes are
+    allowed. A bad magic, a version other than 1, truncation (of the version,
+    a length prefix or a blob body), trailing bytes or an oversized blob
+    length raise ValueError. The two blobs must be consumed exactly and are
+    passed verbatim to the existing decoders: the batch blob to
+    :func:`decode_audit_batch` and the checkpoint blob to
+    :func:`decode_signed_root`, so any illegal nested format raises exactly
+    those decoders' ValueError.
+
+    The result is a frozen :class:`SignedAuditBatch` whose fields equal the
+    originally encoded ones; re-encoding reproduces the original bytes
+    exactly, and it verifies under :func:`verify_signed_audit_batch` whenever
+    the original did. A structurally sound encoding whose batch content or
+    checkpoint signature does not authenticate still decodes, and
+    verification of the result returns False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_AUDIT_BATCH_MAGIC):
+        raise ValueError("not an auditchain signed-audit-batch encoding")
+    offset = len(_SIGNED_AUDIT_BATCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_AUDIT_BATCH_VERSION:
+        raise ValueError(
+            f"unsupported signed-audit-batch version {version}"
+        )
+    batch_blob = read_blob("batch blob")
+    checkpoint_blob = read_blob("checkpoint blob")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed audit batch")
+    # The blobs were consumed exactly; nested format violations (a bad inner
+    # magic, truncation, trailing bytes, wrong digest widths, ...) surface as
+    # the existing decoders' ValueError.
+    batch = decode_audit_batch(batch_blob)
+    checkpoint = decode_signed_root(checkpoint_blob)
+    return SignedAuditBatch(batch=batch, checkpoint=checkpoint)

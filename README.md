@@ -842,6 +842,62 @@ decode_auth_batch(encode_auth_batch(()))    # ("sha256", ())：空批次
   `ValueError`；结构合法但标签 / 条目不匹配仍可正常编解码，仅
   `verify_auth_batch` 在对应位置返回 `False`
 
+### 认证日志的加密导出与恢复（AES-256-GCM）
+
+`dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
+`key` 的前向安全认证日志**提供对称加密的状态导出，使日志进程重启后能从完全
+相同的演进点继续前向安全认证。与 Ed25519 签名的各 `dump_*` 不同，导出用按次
+传入的 32 字节对称密钥做 AES-256-GCM 密封，字节流不携带明文；仅接受
+**未裁剪、无 `encrypt` 历史、构造时带 `key`** 的日志。恢复出的日志独立、可变，
+长度、链头、Merkle 根、`find` 索引与 `stage` 均与原日志一致：
+
+```python
+from auditchain import dump_auth, load_auth
+
+log = AuditLog(key=b"shared-secret")
+verifier = log.export_verifier()
+log.append("agent started")
+tag0 = log.auth(0)                    # stage 推进到 1
+data = dump_auth(log, key)            # key 必须是 32 字节 bytes；nonce=None 随机 12 字节
+restored = load_auth(data, key)       # 全新、独立、可变的带密钥 AuditLog
+restored.head == log.head             # True：链头一致
+restored.merkle_root() == log.merkle_root()  # True：Merkle 根一致
+restored.find(b"agent started")       # (0,)：find 索引已重建
+restored.stage == log.stage           # True：演进 stage 一致
+log.append("after restart")
+restored.append("after restart")
+restored.auth(1) == log.auth(1)       # True：重启后继续演进，标签逐字节相同
+verify_auth(restored.entry(0), tag0, verifier)  # True：旧验证材料仍可核验
+```
+
+- 字节流为 `D || 0x01 || N || C`，其中 `D = b"auditchain/auth-log/v1\0"`，
+  `0x01` 为单字节算法号（AES-256-GCM），`N` 为 12 字节 nonce，`C` 是明文帧
+  `P` 的 AESGCM 输出（`ciphertext || 16 字节 tag`）；AEAD 的 AAD 为
+  `D || 0x01 || N`，把密文绑定到魔数、算法号与 nonce
+- 明文帧为
+  `P = B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) ||
+  B(K) || U(x)`：`h` 是 `hash_name` 的 UTF-8 编码，`n` 为条目数，`root` /
+  `head` 为 size-`n` 快照的 Merkle 根与链头，`stage` 为当前演进 stage，`K`
+  为当前演进密钥（stage 0 时即构造密钥，可任意非空长度；演进后为摘要等宽），
+  `x` 为验证材料已导出标志（`0` 或 `1`，恢复后 `export_verifier` 的一次性
+  约束随之还原）
+- 每个 `E` 按 `Entry(index, payload, previous_hash, entry_hash)` 的字段序
+  依次以 `U, B, B, B` 编码；整数为 8 字节无符号大端（`U`），
+  `B(x) = U(len(x)) || x`；条目索引须恰为 `0..n-1`
+- 加载先做 GCM 解密与认证（错误密钥或任何篡改均失败），再按 `h` 指定的
+  算法与摘要宽度从创世零摘要逐条重算 `entry_digest` 链头并重建 Merkle 根，
+  二者必须与 `head` / `root` 匹配；最后经正常 `append` 路径重放，并装入
+  `K`、`stage` 与标志，失败不产生半成品日志
+- `key` 须为 32 字节 `bytes`；`nonce=None` 时用 `os.urandom(12)`，显式
+  nonce 须为 12 字节 `bytes`，同 key 复用由调用方避免。`log` 不是
+  `AuditLog`、`key` / `nonce` / `data` 类型错（`data` 拒绝 `bytearray` /
+  `memoryview`）抛 `TypeError`；密钥长度、nonce 长度、资格不符（已裁剪、
+  构造时无 `key`、含 `encrypt` 历史）、魔数 / 算法号、截断、尾随字节、
+  非法 UTF-8 / 未知算法、摘要宽度、索引顺序、`stage` / 标志范围、演进密钥
+  为空或宽度不符、AEAD 认证失败或重算链 / 根不符均抛 `ValueError`
+- 导出只读；恢复对象与调用方缓冲区不共享任何状态，可继续 `append`、
+  `auth`、`rotate_key` 等全部既有操作；字节流不含任何标签或验证材料
+
 裁剪只释放内容、不改变逻辑：
 
 - `len(log)` 仍是累计条数；索引始终为绝对值（下一条仍接在原末尾之后）；`head`、`append`
@@ -1250,6 +1306,23 @@ python3 -m auditchain
   长度、魔数、版本、UTF-8、算法、截断、尾随、保留点、frontier 结构、nonce
   宽度 / 顺序、密文 nonce 缺失或重复、locator / 密文封装、条目数、索引、
   断链、重算链 / 根、签名不符均抛 `ValueError`；失败原子，旧接口不变
+- `dump_auth(log, key, nonce=None)` / `load_auth(data, key)` — 构造时带
+  `key` 的前向安全认证日志（未裁剪、无 `encrypt` 历史）的加密导出与恢复，
+  使日志可落盘、跨进程重启后从同一演进点继续前向安全认证，恢复出独立、可变
+  的带密钥 `AuditLog`（长度、链头、Merkle 根、`find` 索引与 `stage` 均与原
+  日志一致）：字节流为 `D || 0x01 || N || C`，
+  `D = b"auditchain/auth-log/v1\0"`，`0x01` 为 AES-256-GCM 算法号，`N` 为
+  12 字节 nonce，`C` 为明文帧 `P` 的 AESGCM 输出（`ciphertext || 16 字节
+  tag`），AAD 为 `D || 0x01 || N`；
+  `P = B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) ||
+  B(K) || U(x)`，`h` 为 `hash_name` 的 UTF-8，`K` 为当前演进密钥，`x` 为
+  验证材料已导出标志（0/1）；每个 `E` 按
+  `Entry(index, payload, previous_hash, entry_hash)` 字段序以 `U, B, B, B`
+  编码，索引须恰为 `0..n-1`。加载先通过 GCM 认证，再按 `h` 从创世重算链与
+  Merkle 根并与 `head` / `root` 比对，最后以正常 `append` 路径重放并装入
+  `K`、`stage` 与标志。`key` 须为 32 字节 `bytes`，`nonce=None` 时随机
+  12 字节、显式值同 key 复用由调用方避免；类型错抛 `TypeError`，资格、格式、
+  校验或 AEAD 认证失败抛 `ValueError`；导出只读、失败原子，旧接口不变
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

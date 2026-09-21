@@ -695,6 +695,72 @@ restored.append("new event")                 # 恢复后照常追加、加密、
   不符、索引顺序、断链、重算链头 / Merkle 根不符、签名不符均抛
   `ValueError`；恢复为只读校验，不改变入参
 
+### 已裁剪且含密文日志的签名导出与恢复（Ed25519）
+
+`dump_secure_pruned(log, private_key)` 与
+`load_secure_pruned(data, public_key)` 是 `dump_secure_log` 的已裁剪版本：
+把一份 **`retain_from > 0`（已裁剪）、构造时未传 `key` 且从无认证状态或
+历史** 的日志导出为自证其真的字节流——与 `dump_pruned_log` 不同，历史中
+**允许密文条目**（包括密文已随裁剪释放、只剩 nonce 历史的情形）。仅凭预置
+信任的 32 字节 Ed25519 公钥离线验真后，恢复出一条**独立、可变**的无密钥
+`AuditLog`：长度、绝对索引、`retain_from`、检查点、Merkle 根与包含证明、
+`find` / `find_encrypted` 检索索引以及**完整 nonce 历史**都与原日志一致：
+
+```python
+from auditchain import dump_secure_pruned, load_secure_pruned
+
+key = b"k" * 32
+log.append(b"anchor")
+log.encrypt(b"classified-before-prune", key, nonce_a)  # nonce 历史终身保留
+log.prune(2, log.seal(2))                               # 释放前 2 条（含密文）
+log.encrypt(b"classified-after-prune", key, nonce_b)    # 保留段中的密文
+data = dump_secure_pruned(log, seed)                    # bytes，可落盘/跨介质传递
+restored = load_secure_pruned(data, public_key)         # 全新、独立、可变的 AuditLog
+restored.retain_from == 2                               # True：保留点一致
+restored.head == log.head                               # True：链头一致
+restored.merkle_root() == log.merkle_root()             # True：Merkle 根一致
+restored.inclusion_proof(2) == log.inclusion_proof(2)   # True：证明一致
+restored._used_nonces == {nonce_a, nonce_b}             # True：裁剪前 nonce 也保留
+restored.encrypt(b"x", key, nonce_a)                    # ValueError：旧 nonce 不可复用
+restored.append("new event")                            # 恢复后照常追加、加密、再裁剪
+```
+
+- 导出**只读**且确定：不改变日志任何状态；同状态、同种子的两次导出逐字节
+  相同（Ed25519 确定性签名），私钥从不保存、不写入字节流
+- 仅接受 `retain_from > 0` 的已裁剪日志，且构造时未传 `key`、没有任何认证
+  状态或历史（未 `auth` / `auth_batch` / `rotate_key` / `export_verifier`，
+  无残留标签与演进状态）；密文条目允许出现
+- 头部复用 `dump_pruned_log` 的字段顺序与 `U/B` 规则，只把魔数改为
+  `b"auditchain/pruned-secure/v1\0"`：依次写 `version`（恒为 `1`，u64）、
+  `B(hash_name 的 UTF-8)`、总条目数 `n`（u64）、保留点 `r`（u64）、
+  `B(checkpoint)`（与算法摘要等宽）、frontier 计数与按**高度升序**的
+  `U(height) || B(digest)`（高度恰为 `r` 的置位，覆盖 `[0, r)`）；blob 均为
+  u64 大端长度前缀
+- frontier 之后写 **nonce 历史**：先 u64 计数，再按**字典序**逐项写
+  **原始 12 字节 `B(nonce)`（定长、无长度前缀）**，严格升序、无重复；集合须
+  包含每个保留密文的 nonce，并完整保留裁剪前已用 nonce（即使其封装已被释放）
+- 随后写保留段计数（u64，恰为 `n - r`）与索引 `r..n-1` 的条目，每项复用
+  `dump_secure_log` 的 `E` 编码：`U(index)`、`B(payload)`、
+  `B(previous_hash)`、`B(entry_hash)`、`B(locator)`；`locator` 空为普通条目，
+  非空须与摘要同宽，且其 `payload` 必须能解析为加密封装并恢复出 12 字节
+  nonce（分类只看 locator，不看 payload 是否以封装魔数开头）
+- 末尾写 `B(root)`、`B(head)`（完整 size-`n` 快照的 Merkle 根与链头），并附加
+  覆盖此前全部字节的 **64 字节 Ed25519 签名**；不允许省略、换序或附加字节
+- `load_secure_pruned` 的 `data` 只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`），两密钥均须为 32 字节 `bytes`。**先验签**（对签名之前的全部
+  字节校验末尾签名），通过后才解析并复核：`0 < r <= n`、检查点 / frontier /
+  摘要宽度、frontier 高度恰为 `r` 的置位、nonce 段严格字典序升序无重复且每项
+  12 字节、保留密文 nonce 必须在 nonce 历史中、条目数恰为 `n - r`、索引恰为
+  `r..n-1`；随后按 `hash_name` 从检查点起逐条重算 `entry_digest` 链，链头必须
+  等于 `head`，由 frontier 与保留条目重建的 Merkle 根必须等于 `root`，最后经
+  正常 append / 加密恢复路径重放（`find`、`find_encrypted` 索引、frontier、
+  链头、长度、保留点与完整 nonce 历史随之重建）
+- 类型错抛 `TypeError`；资格不符、密钥长度、魔数、版本、非法 UTF-8、未知 /
+  非固定输出算法、截断、尾随、保留点越界、检查点 / frontier / locator / 摘要
+  宽度不符、nonce 历史乱序或重复、保留密文 nonce 缺失、密文封装损坏、条目数 /
+  索引顺序不符、断链、重算链头 / Merkle 根不符、签名不符均抛 `ValueError`；
+  失败原子（任何校验失败前不返回日志、不改动入参缓冲区），旧接口不变
+
 ### 前向安全认证
 
 构造日志时传入一个非空 `key` 即可开启前向安全认证；不传 `key` 的无密钥模式
@@ -1157,6 +1223,25 @@ python3 -m auditchain
   `bytearray` / `memoryview`），公钥类型错抛 `TypeError`；公钥非 32 字节，
   或魔数、版本、UTF-8、算法、截断、尾随、保留点越界、宽度、frontier 结构、
   条目数、索引顺序、断链、重算链 / 根、签名不符均抛 `ValueError`
+- `dump_secure_pruned(log, private_key)` /
+  `load_secure_pruned(data, public_key)` — 已裁剪且**可含密文**日志
+  （`retain_from > 0`、无认证状态或历史，历史中允许 `encrypt` 密文，包括已被
+  裁剪释放的密文）的签名导出与离线恢复，恢复为独立、可变的无密钥 `AuditLog`
+  （长度、绝对索引、`retain_from`、保留点、证明、检索索引与 nonce 历史均与原
+  日志一致）：头部与 frontier 完全复用 `dump_pruned_log` 的字段顺序与 `U/B`
+  规则，仅魔数改为 `b"auditchain/pruned-secure/v1\0"`；frontier 之后写
+  nonce 历史——先 u64 计数，再按**字典序**逐项写**原始 12 字节 nonce**（无长度
+  前缀，严格升序、无重复），集合须包含每个保留密文的 nonce，并完整保留裁剪前
+  已用 nonce；随后写保留段计数（恰为 `n - r`）与索引 `r..n-1` 的条目，每项复用
+  `dump_secure_log` 的 `E` 编码（额外 `B(locator)`，空为普通条目，非空须与摘要
+  同宽且其密文封装须能恢复 12 字节 nonce）；末尾写 `B(root)`、`B(head)` 并追加
+  覆盖此前全部字节的 64 字节 Ed25519 签名。加载**先验签**再解析：复核
+  `0 < r <= n`、frontier 高度恰为 `r` 的置位、nonce 段严格升序无重复、保留密文
+  nonce 必须在历史中、条目数与索引顺序，从检查点重算链头与 Merkle 根并匹配后，
+  经正常 append / 加密恢复路径重放（`find` / `find_encrypted`、frontier、链头、
+  长度、保留点与完整 nonce 历史随之重建）。导出只读且确定（同状态同种子字节
+  相同，私钥不存储）；类型错抛 `TypeError`，资格 / 长度 / 格式 / 验真失败抛
+  `ValueError`，失败原子、不改动任何入参，旧接口不变
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

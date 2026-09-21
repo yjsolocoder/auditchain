@@ -17,7 +17,8 @@ encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
 dump_secure_log / load_secure_log /
-dump_pruned_log / load_pruned_log.
+dump_pruned_log / load_pruned_log /
+dump_secure_pruned / load_secure_pruned.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ __all__ = [
     "dump_log",
     "dump_pruned_log",
     "dump_secure_log",
+    "dump_secure_pruned",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_auth_batch",
@@ -77,6 +79,7 @@ __all__ = [
     "load_log",
     "load_pruned_log",
     "load_secure_log",
+    "load_secure_pruned",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -198,6 +201,19 @@ _SECURE_LOG_VERSION = 1
 # authentication material or encryption state is carried.
 _PRUNED_LOG_MAGIC = b"auditchain/pruned-log/v1\0"
 _PRUNED_LOG_VERSION = 1
+
+# Binary framing of dump_secure_pruned / load_secure_pruned. The pruned
+# counterpart of the secure-log framing: identical header, frontier and
+# retained-record framing as dump_pruned_log (same u64/blob rules, inline
+# snapshot fields and a trailing 64-byte Ed25519 signature), except the magic
+# and that the retained records reuse dump_secure_log's E record (an extra
+# B(locator), empty for a plain entry), and between the frontier and the
+# retained records the stream carries the log's whole nonce history —
+# U(count) followed by exactly that many 12-byte nonces in lexicographic
+# order — so nonces used by encrypted entries already released by pruning are
+# restored as well as the nonces of retained ciphertext.
+_PRUNED_SECURE_MAGIC = b"auditchain/pruned-secure/v1\0"
+_PRUNED_SECURE_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -4639,6 +4655,401 @@ def load_pruned_log(data: Any, public_key: Any) -> AuditLog:
             raise ValueError(
                 f"entry chain is inconsistent at index {expected_index}"
             )
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError(
+            "recomputed chain head does not match the signed snapshot"
+        )
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError(
+            "recomputed Merkle root does not match the signed snapshot"
+        )
+    return log
+
+
+def dump_secure_pruned(log: Any, private_key: Any) -> bytes:
+    """Export a pruned log (``retain_from > 0``) that may hold ciphertext.
+
+    The pruned counterpart of :func:`dump_secure_log`: only an
+    :class:`AuditLog` that has been pruned (``retain_from > 0``), was
+    constructed without an authentication key and has never held any
+    authentication state or history is accepted. Unlike
+    :func:`dump_pruned_log`, the history (including the released prefix) may
+    contain entries appended with :meth:`AuditLog.encrypt`; the stream carries
+    everything needed to restore the log offline without any pruned payload or
+    encryption key: the retain point ``r``, the sealed checkpoint (the chain
+    head of the released prefix ``[0, r)``), the perfect-subtree frontier
+    covering that prefix, the log's complete nonce history (including nonces
+    whose envelopes were released by pruning) and the retained entries
+    ``r..n-1`` — no prune receipts, authentication tags, key-evolution state
+    or encryption keys.
+
+    The encoding starts with the magic
+    ``b"auditchain/pruned-secure/v1\\0"`` and then writes, strictly in order,
+    the same header fields as :func:`dump_pruned_log`: the envelope version
+    (always ``1``) as an unsigned 8-byte big-endian integer,
+    ``B(UTF-8(hash_name))``, the total entry count ``n`` as a u64, the retain
+    point ``r`` as a u64, ``B(checkpoint)`` and the frontier subtree count as
+    a u64 followed by one ``U(height) || B(digest)`` pair per frontier
+    subtree in ascending height order. Next come the nonce history: its count
+    as a u64 and then every used nonce as a raw 12-byte item (no length
+    prefix) in strictly ascending lexicographic order — the set includes the
+    nonces of retained ciphertext and every nonce used before pruning. Then
+    the retained entry count as a u64 (exactly ``n - r``) and the retained
+    entries indexed ``r..n-1``, each encoded with :func:`dump_secure_log`'s
+    ``E`` record: ``U(index)``, ``B(payload)``, ``B(previous_hash)``,
+    ``B(entry_hash)`` and ``B(locator)``, where an empty locator marks an
+    ordinary entry and a non-empty locator is the digest-width
+    encrypted-location HMAC whose payload parses as an envelope embedding the
+    12-byte nonce. Finally ``B(root)`` and ``B(head)`` of the full size-``n``
+    snapshot, and a 64-byte Ed25519 signature over every preceding byte closes
+    the stream. ``U`` is an unsigned 8-byte big-endian integer and
+    ``B(x) = U(len(x)) || x``. Nothing is omitted, reordered or appended.
+
+    ``private_key`` is a 32-byte Ed25519 private key seed; it is used for the
+    one signature and is never stored, copied into the dump or added as a
+    separate signing input. The call is read-only and deterministic: it never
+    mutates the log, and two dumps of logs in the same state signed with the
+    same seed are byte-for-byte identical (Ed25519 signatures are
+    deterministic). A non-:class:`AuditLog` value or a non-``bytes`` seed
+    raises TypeError; a seed that is not 32 bytes, or a log that is unpruned
+    (``retain_from == 0``) or carries authentication state/history raises
+    ValueError.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, mirroring the other
+    # dump_* functions; the key is used only for the one signature below and
+    # is never stored on the log.
+    signing_key = _load_ed25519_seed(private_key)
+    # The format restores an independent keyless log from the prune
+    # checkpoint, the frontier, the nonce history and the retained entries,
+    # so a pruned log without any authentication material is required;
+    # encrypted history is allowed.
+    if log._retain_from == 0:
+        raise ValueError(
+            "only a pruned log (retain_from > 0) can be dumped as a pruned secure log"
+        )
+    if log._key is not None or log._stage != 0 or log._tags or log._verifier_exported:
+        raise ValueError("a log with authentication state or history cannot be dumped")
+    hash_name = log._hash_name
+    digest_size = log._digest_size
+    size = len(log)
+    retain_from = log._retain_from
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _PRUNED_SECURE_MAGIC,
+        _encode_u64(_PRUNED_SECURE_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+        _encode_u64(retain_from, "retain_from"),
+        _encode_blob(log._checkpoint_head),
+        _encode_u64(len(log._frontier), "frontier count"),
+    ]
+    for height in sorted(log._frontier):
+        parts.append(_encode_u64(height, "frontier height"))
+        parts.append(_encode_blob(log._frontier[height]))
+    # The complete nonce history survives pruning on the live log and must be
+    # carried verbatim: it includes nonces of retained ciphertext and nonces
+    # whose envelopes were released with the pruned prefix. Raw 12-byte items
+    # in strictly ascending lexicographic order keep the section canonical.
+    nonces = sorted(log._used_nonces)
+    parts.append(_encode_u64(len(nonces), "nonce count"))
+    for nonce in nonces:
+        if not isinstance(nonce, bytes) or len(nonce) != _NONCE_BYTES:
+            raise ValueError(f"nonce must be {_NONCE_BYTES} bytes")
+        parts.append(nonce)
+    parts.append(_encode_u64(len(log._entries), "retained entries count"))
+    for entry in log._entries:
+        locator = log._encrypted_locators.get(entry.index, b"")
+        if locator and len(locator) != digest_size:
+            raise ValueError(f"encrypted locator must be {digest_size} bytes")
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        parts.append(_encode_blob(locator))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    body = b"".join(parts)
+    # Sign every byte written so far; the signature is the trailing field, so
+    # the wire format verifies without knowing any inner framing offset.
+    signature = signing_key.sign(body)
+    if len(signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    return body + signature
+
+
+def load_secure_pruned(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable keyless :class:`AuditLog` from
+    :func:`dump_secure_pruned`, verifying entirely offline.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) and ``public_key`` must be a 32-byte
+    Ed25519 public key. After the magic
+    ``b"auditchain/pruned-secure/v1\\0"`` the body contains, strictly in
+    order, the u64 envelope version (only ``1`` is supported),
+    ``B(UTF-8(hash_name))``, the total entry count ``n`` as a u64, the retain
+    point ``r`` as a u64 (``0 < r <= n``), ``B(checkpoint)`` (the chain
+    digest of the last of the first ``r`` entries, exactly the digest width),
+    the u64 frontier subtree count and one ``U(height) || B(digest)`` pair per
+    subtree in strictly ascending height order (the heights must be exactly
+    the set bits of ``r``, covering ``[0, r)``), the u64 nonce count followed
+    by exactly that many raw 12-byte nonces in strictly ascending
+    lexicographic order with no repetition, the u64 retained entry count
+    (exactly ``n - r``), that many ``E`` records
+    ``U(index) || B(payload) || B(previous_hash) || B(entry_hash) ||
+    B(locator)``, and finally ``B(root)`` and ``B(head)``, followed by a
+    closing 64-byte Ed25519 signature, with no truncation or trailing bytes.
+
+    Verification happens before any state is built: the trailing signature is
+    checked against every preceding byte with ``public_key``; only then is the
+    stream parsed and re-checked. Under the named ``hash_name`` the retained
+    entries must occupy indices ``r..n-1`` in order, and every
+    :func:`entry_digest` and predecessor link is recomputed starting from the
+    signed checkpoint; the resulting chain head must equal ``head`` and the
+    Merkle root rebuilt from the frontier and the retained entries must equal
+    ``root``. Classification is driven by the locator, never the payload: an
+    empty locator marks an ordinary entry, while a non-empty locator must be
+    exactly the digest width and its payload must parse as an
+    encrypted-entry envelope whose 12-byte nonce recovers and must be present
+    in the signed nonce history (an unparseable envelope, a wrong-width
+    locator, a repeated retained nonce or a ciphertext nonce missing from the
+    history raises ValueError); nonces in the history without a retained
+    envelope are the nonces of the released prefix. Only then is a fresh
+    keyless :class:`AuditLog` materialized with ``retain_from == r``, the
+    checkpoint, frontier and complete nonce history installed and the
+    payloads replayed through the normal append / encrypted-entry recovery
+    path, so its find index, encrypted locator index, nonce history, Merkle
+    frontier, head, length, retain point, Merkle roots and inclusion proofs
+    are exactly those of the original pruned log; the result is fully mutable
+    and shares no state with the caller's buffers.
+
+    A non-``bytes`` ``data`` or a non-``bytes`` ``public_key`` raises
+    TypeError; a public key that is not 32 bytes, or a bad magic, version,
+    UTF-8, hash algorithm, truncation, trailing bytes, an out-of-range retain
+    point, a checkpoint/frontier/digest width mismatch, a frontier that is not
+    exactly the set bits of ``r``, a malformed or non-ascending/duplicate
+    nonce history, an entry count that disagrees with ``n - r``, an index
+    ordering violation, a broken recomputed chain, a ciphertext nonce absent
+    from the history, a root/head mismatch or a signature that does not
+    verify raises ValueError. A failure raises before any log is returned and
+    never mutates the caller's buffers.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verification_key = _load_ed25519_public(public_key)
+    if not data.startswith(_PRUNED_SECURE_MAGIC):
+        raise ValueError("not an auditchain pruned-secure encoding")
+    if len(data) < _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify the signature over the entire body before parsing any of it, so a
+    # forged or corrupted stream never reaches the chain-replay logic.
+    try:
+        verification_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError("pruned-secure signature does not verify") from error
+    offset = len(_PRUNED_SECURE_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = body[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _PRUNED_SECURE_VERSION:
+        raise ValueError(f"unsupported pruned-secure version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    size = read_u64("entries count")
+    retain_from = read_u64("retain_from")
+    checkpoint = read_blob("checkpoint")
+    if not 0 < retain_from <= size:
+        raise ValueError(
+            "retain_from must satisfy 0 < retain_from <= entries count"
+        )
+    if len(checkpoint) != digest_size:
+        raise ValueError(f"checkpoint must be {digest_size} bytes")
+    frontier_count = read_u64("frontier count")
+    frontier: dict[int, bytes] = {}
+    previous_height = -1
+    for _ in range(frontier_count):
+        height = read_u64("frontier height")
+        digest = read_blob("frontier digest")
+        if height <= previous_height:
+            raise ValueError("frontier heights must be in strictly ascending order")
+        if len(digest) != digest_size:
+            raise ValueError(f"frontier digest must be {digest_size} bytes")
+        frontier[height] = digest
+        previous_height = height
+    # The frontier is exactly the set of maximal perfect subtrees covering
+    # [0, retain_from): one subtree of height h per set bit h of retain_from.
+    expected_heights = [
+        height for height in range(64) if (retain_from >> height) & 1
+    ]
+    if sorted(frontier) != expected_heights:
+        raise ValueError(
+            "frontier heights must be exactly the set bits of retain_from"
+        )
+    # Nonce history: raw fixed-width 12-byte items, canonicalized by strictly
+    # ascending lexicographic order and free of duplicates. The set covers
+    # nonces of retained ciphertext and nonces released by pruning alike.
+    nonce_count = read_u64("nonce count")
+    used_nonces: set[bytes] = set()
+    previous_nonce: bytes | None = None
+    for _ in range(nonce_count):
+        end = offset + _NONCE_BYTES
+        if end > len(body):
+            raise ValueError(
+                f"truncated encoding: nonce must be {_NONCE_BYTES} bytes"
+            )
+        nonce = body[offset:end]
+        offset = end
+        if previous_nonce is not None and nonce <= previous_nonce:
+            raise ValueError(
+                "nonce history must be in strictly ascending lexicographic order"
+            )
+        if nonce in used_nonces:
+            raise ValueError("duplicate nonce in nonce history")
+        used_nonces.add(nonce)
+        previous_nonce = nonce
+    count = read_u64("retained entries count")
+    if count != size - retain_from:
+        raise ValueError(
+            "retained entries count must equal entries count minus retain_from"
+        )
+    raw_entries: list[tuple[int, bytes, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        locator = read_blob("entry.locator")
+        raw_entries.append((index, payload, previous_hash, entry_hash, locator))
+    root = read_blob("root")
+    head = read_blob("head")
+    if offset != len(body):
+        raise ValueError("trailing bytes before the pruned-secure signature")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+
+    # Re-derive the retained chain from the signed checkpoint under the named
+    # hash algorithm, and simultaneously replay the payloads into a fresh
+    # keyless log with the checkpoint, frontier, retain point and complete
+    # nonce history installed, so the find indexes and every other auxiliary
+    # structure are rebuilt exactly as the normal append / encrypt paths
+    # build them. Seeding the head with the checkpoint makes the first
+    # retained append link to it exactly as the live log did.
+    log = AuditLog(hash_name=hash_name)
+    log._retain_from = retain_from
+    log._checkpoint_head = checkpoint
+    log._frontier = dict(frontier)
+    log._head = checkpoint
+    log._used_nonces = set(used_nonces)
+    previous = checkpoint
+    # Nonces claimed by retained ciphertext must be unique among the retained
+    # records and members of the signed history.
+    replayed_nonces: set[bytes] = set()
+    for position, (index, payload, recorded_previous, recorded_hash, locator) in enumerate(
+        raw_entries
+    ):
+        expected_index = retain_from + position
+        if index != expected_index:
+            raise ValueError("entries must occupy indices r..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {expected_index}")
+        recomputed = entry_digest(
+            expected_index,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {expected_index}")
+        # Classification is driven by the locator, never by the payload, just
+        # as in load_secure_log: a plain append() may legitimately store bytes
+        # beginning with the envelope magic.
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+            # _parse_envelope validates the envelope magic, algorithm and
+            # truncation and returns the embedded 12-byte nonce.
+            _algorithm, nonce, _sealed = _parse_envelope(payload)
+            if len(nonce) != _NONCE_BYTES:
+                raise ValueError(
+                    f"encrypted nonce must be {_NONCE_BYTES} bytes"
+                )
+            if nonce in replayed_nonces:
+                raise ValueError(
+                    "duplicate encrypted nonce among retained entries"
+                )
+            if nonce not in used_nonces:
+                raise ValueError(
+                    "retained ciphertext nonce is missing from nonce history"
+                )
+            replayed_nonces.add(nonce)
+            # Replay the same commit encrypt() performs, seeding the locator
+            # indexes without any encryption key; the nonce history already
+            # carries the complete set.
+            entry = Entry(
+                index=expected_index,
+                payload=payload,
+                previous_hash=previous,
+                entry_hash=recomputed,
+            )
+            log._entries.append(entry)
+            log._index.setdefault(
+                _locator_digest(payload, hash_name), []
+            ).append(expected_index)
+            log._encrypted_index.setdefault(locator, []).append(expected_index)
+            log._encrypted_locators[expected_index] = locator
+            log._used_nonces.add(nonce)
+            log._head = recomputed
+        else:
+            # Ordinary entry: replay through the normal append path so the
+            # find index and every other structure match a live append.
+            replayed = log.append(payload)
+            if (
+                replayed.index != index
+                or replayed.previous_hash != recorded_previous
+                or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+            ):
+                raise ValueError(
+                    f"entry chain is inconsistent at index {expected_index}"
+                )
         previous = recomputed
     if not hmac.compare_digest(previous, head):
         raise ValueError(

@@ -1016,6 +1016,65 @@ verify_signed_auth_bundle(bundle, public_key)   # (True, True)：逐项核验
   重复导出抛 `ValueError`；非保留索引沿用 `auth_batch` 的 `IndexError`。成功不
   改哈希链、Merkle 根或搜索索引；既有接口及包编解码不变
 
+#### 认证与审计二合一交付包（Ed25519）
+
+`SignedAuthBundle` 交付"前向安全标签 + stage-0 验证材料"，`SignedAuditBatch`
+交付"快照包含证明 + 签名检查点"，但二者仍可被分别伪造、分别替换。冻结的
+`SignedAuthAuditBundle(auth, audit)` 把两个包绑成**一个**交付物，且离线核验不只
+是"两包各自验真"：`AuditLog.signed_auth_audit_bundle(indices, private_key,
+size=None)` 原子签发，`verify_signed_auth_audit_bundle` 要求两包在同一预置信任
+公钥下均验真、算法一致，并且**认证包的每个 `Entry` 等于审计包同绝对索引的
+`Entry`**——审计包可额外携带认证包未覆盖的条目（始终含快照末条），但被认证条目
+无法被替换：
+
+```python
+from auditchain import (
+    SignedAuthAuditBundle,
+    decode_signed_auth_audit_bundle,
+    encode_signed_auth_audit_bundle,
+    verify_signed_auth_audit_bundle,
+)
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    log.append(record)
+bundle = log.signed_auth_audit_bundle([3, 1], seed)   # 一次原子调用
+
+# auth 部分等价于同型 stage-0 日志上的 signed_auth_bundle，audit 为同一快照的签名审计包
+[entry.index for entry in bundle.audit.batch[3]]              # [1, 3, 4]：审计自动并末条
+
+verify_signed_auth_audit_bundle(bundle, public_key)           # True：同钥、同算法、同条目
+verify_signed_auth_audit_bundle(bundle, other_key)            # False：任一签名不验真
+
+data = encode_signed_auth_audit_bundle(bundle)                # bytes
+data.startswith(b"auditchain/auth-audit/v1\0")                # True
+restored = decode_signed_auth_audit_bundle(data)              # 冻结，字段相等
+restored == bundle                                            # True
+encode_signed_auth_audit_bundle(restored) == data             # True：重编码逐字节相同
+```
+
+- 交付包为冻结的 `SignedAuthAuditBundle(auth, audit)`，支持位置构造、按两个字段
+  相等；`auth` 必须是 `SignedAuthBundle`，`audit` 必须是 `SignedAuditBatch`，
+  容器字段类型错抛 `TypeError`；两包是否同钥、同算法、同索引条目相等由
+  `verify_signed_auth_audit_bundle` 判定
+- `AuditLog.signed_auth_audit_bundle(indices, private_key, size=None)` 原子签发：
+  `size` 默认当前长度（快照不可重建时抛 `ValueError`），审计半自动并上快照末条
+  （`size=0` 为空快照）；`indices` 为互异非 `bool` 整数且
+  `retain_from <= i < size`（超出快照范围抛 `IndexError`），空选择仍交付签名
+  stage-0 材料但不推进 stage。签发与 `signed_auth_bundle` 共用同一份一次性导出
+  资格，不新增任何签名原文；所有校验先于签名与状态变更，失败完全原子
+- `verify_signed_auth_audit_bundle(bundle, public_key) -> bool` 完全离线：两包
+  各自验真（空选择也显式核验嵌套 `SignedVerifier` 签名）、三处算法一致、且每个
+  认证 `Entry` 等于审计包同索引条目；任一不满足返回 `False`（非 `bytes` 公钥
+  抛 `TypeError`、非 32 字节抛 `ValueError`），调用只读
+- `encode_signed_auth_audit_bundle(x)` /
+  `decode_signed_auth_audit_bundle(data)` 的字节流为
+  `b"auditchain/auth-audit/v1\0" || U(1) || B(A) || B(M)`：`A`、`M` 分别为
+  `encode_signed_auth_bundle` 与 `encode_signed_audit_batch` 的完整规范字节；
+  `decode` 只接受 `bytes`，魔数 / 版本 / 截断 / 尾随 / blob 长度 / 嵌套格式 /
+  两包算法冲突抛 `ValueError`，非 `bytes` 抛 `TypeError`；验证密钥明文携带，须
+  像裸 `Verifier` 一样保护
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1364,6 +1423,10 @@ python3 -m auditchain
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
   抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
+- `SignedAuthAuditBundle(auth, audit)` — 不可变的可信认证/审计二合交付包，按两个
+  字段相等、支持位置构造；`auth` 必须是 `SignedAuthBundle`，`audit` 必须是
+  `SignedAuditBatch`；容器字段类型错抛 `TypeError`，两部分是否同钥、同算法、
+  同索引条目相等且各自验真由 `verify_signed_auth_audit_bundle` 判定
 - `SignedPrune(receipt, checkpoint)` — 不可变的可信签名裁剪授权，按两个字段
   相等、支持位置构造；`receipt` 为 `seal` 的前缀裁剪回执（必须是
   `PruneReceipt`），`checkpoint` 为同一前缀的 `SignedRoot`（必须是
@@ -1493,6 +1556,18 @@ python3 -m auditchain
     失败（非法选择、种子或 `size`）在构造前抛出，不改变日志状态；异常类型沿用
     `audit_batch` / `sign_root`（`TypeError` / `ValueError`）；离线用
     `verify_signed_audit_batch` 凭预信任公钥验真
+  - `signed_auth_audit_bundle(indices, private_key, size=None)` — 原子签发可信
+    认证/审计二合交付包，返回不可变 `SignedAuthAuditBundle(auth, audit)`：一次
+    调用同时交付 `signed_auth_bundle` 的已签名 stage-0 材料与前向安全标签（消耗
+    同一份一次性导出资格、成功后密钥按所选条数演进）和 `signed_audit_batch` 对
+    同一快照（`size` 默认当前长度）的签名批量审计包（审计自动并上快照末条，
+    `size=0` 为空快照），不新增签名原文。`indices` 为互异非 `bool` 整数且满足
+    `retain_from <= i < size`；所有校验（私钥、`size`、索引、重复、快照范围与
+    可重建性、stage 容量、导出资格）均在签名与任何状态变更之前完成，失败不消耗
+    资格、不演进密钥、不动日志。私钥 / 索引 / `size` 类型错或索引为 `bool` 抛
+    `TypeError`，重复、`size` 越界或快照已裁剪、容量不足、无密钥、已演进或重复
+    导出抛 `ValueError`，索引超出快照范围抛 `IndexError`；离线用
+    `verify_signed_auth_audit_bundle` 凭同一预信任公钥验真
   - `sign_prune(private_key, size=None)` — 只读签发可信签名裁剪授权，返回不可变
     `SignedPrune`：先调用 `seal(size)`，再调用 `sign_root(private_key, size)`
     （`size` 默认当前长度），据此构造 `SignedPrune(receipt, checkpoint)`，两部分
@@ -1604,6 +1679,17 @@ python3 -m auditchain
   非 32 字节抛 `ValueError`，嵌套结构非法沿用 `verify_signed_verifier` /
   `verify_auth_batch` 的既有异常（`TypeError` / `ValueError`）；签名只认证
   来源、不加密其中密钥，调用只读
+- `verify_signed_auth_audit_bundle(bundle, public_key) -> bool` — 凭同一预置信任
+  的 32 字节 Ed25519 公钥离线核验 `SignedAuthAuditBundle`（由
+  `AuditLog.signed_auth_audit_bundle(indices, private_key, size=None)` 原子
+  签发，或手工组合两个包），无需持有日志：两包均须在该公钥下验真——嵌套
+  `SignedVerifier` 签名（空选择也必须验签成功）、逐项前向安全标签与审计批量的
+  包含证明 / 检查点签名全部成立——且三处算法一致（签名验证材料、认证包
+  `hash_name`、审计批量算法），并且认证包中每个 `Entry` 必须等于审计批量同
+  绝对索引的 `Entry`；审计批量允许携带认证包未覆盖的额外条目（始终含快照末
+  条）。任一条件不满足返回 `False`；入参不是 `SignedAuthAuditBundle`（含绕过
+  构造器的容器字段类型错）或公钥不是 `bytes` 抛 `TypeError`，公钥长度非 32
+  字节抛 `ValueError`，嵌套结构非法沿用各既有核验入口的异常；调用只读
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
@@ -1682,6 +1768,21 @@ python3 -m auditchain
   相同；编解码不校验签名与标签，结构合法但签名或标签不匹配仍可解码
   （`verify_signed_auth_bundle` 逐项返回 `False`）；编码携带明文验证密钥，须像
   裸 `Verifier` 一样保护；两个入口均为只读且确定
+- `encode_signed_auth_audit_bundle(x)` /
+  `decode_signed_auth_audit_bundle(data)` — 可信认证/审计二合交付包的规范二进制
+  编码与解码，使 `SignedAuthAuditBundle` 可落盘、跨进程恢复后继续凭预置信任的
+  Ed25519 公钥离线验真，且不新增签名原文：字节流为
+  `D || U(1) || B(A) || B(M)`，其中 `D = b"auditchain/auth-audit/v1\0"`，
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`；`A`、`M` 依次为既有
+  `encode_signed_auth_bundle(auth)` 与 `encode_signed_audit_batch(audit)` 的
+  完整规范字节，认证包在前、审计包在后，解码精确消费两个 blob 并禁止尾随字节，
+  分别交给既有解码器，且两包算法必须一致。前者只接受 `SignedAuthAuditBundle`
+  （其余类型抛 `TypeError`，嵌套错误沿用既有编码器），后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度、
+  任一嵌套格式或两包算法冲突抛 `ValueError`；解码对象字段相等、冻结且重编码
+  逐字节相同，结构合法但验真不匹配仍可解码（`verify_signed_auth_audit_bundle`
+  返回 `False`）；编码携带明文验证密钥，须像裸 `Verifier` 一样保护；两个入口
+  均为只读且确定
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

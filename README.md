@@ -1060,6 +1060,91 @@ verify_auth(restored.entry(1), tag1, verifier)  # True：旧验证材料仍可�
   `encrypt`、`auth`、`rotate_key` 等全部既有操作（已用 nonce 仍被拒绝）；
   字节流不含任何标签或验证材料；旧接口不变
 
+### 带认证且可含密文的已裁剪日志的混合加密导出与恢复（AES-256-GCM）
+
+`dump_pruned_hybrid(log, key, nonce=None)` 与
+`load_pruned_hybrid(data, key)` 是 `dump_hybrid` 的裁剪对应物，也是
+`dump_pruned_auth` 的密文宽容版本：为**构造时带 `key`、已裁剪
+（`retain_from > 0`）且历史可含 `encrypt` 条目**的前向安全认证日志提供对称
+加密的状态导出——裁剪掉的前缀中同样可以有密文。导出用按次传入的 32 字节
+对称密钥做 AES-256-GCM 密封，字节流不携带明文；明文帧同时携带裁剪检查点与
+前缀 frontier、**完整** nonce 历史（含被裁剪释放的密文 nonce）、保留段密文的
+locator HMAC 与认证演进状态（演进密钥、`stage`、导出标志），恢复出的日志
+独立、可变，长度、`retain_from`、链头、Merkle 根与包含证明、`find` /
+`find_encrypted` 索引、nonce 历史与 `stage` 均与原日志一致，重启后从完全相同
+的演进点继续前向安全认证：
+
+```python
+import os
+from auditchain import AuditLog, dump_pruned_hybrid, load_pruned_hybrid, verify_auth
+
+key = os.urandom(32)                 # 密封用对称密钥，必须是 32 字节 bytes
+enc_key = os.urandom(32)             # encrypt 用密钥，按次传入、不落盘
+log = AuditLog(key=b"shared-secret")
+verifier = log.export_verifier()
+log.append("plain event")
+log.encrypt("released secret", enc_key)   # 该密文随后会被裁剪释放
+log.append("kept plain")
+log.encrypt("kept secret", enc_key, nonce=b"\x07" * 12)
+log.prune(2, log.seal(2))                  # retain_from == 2
+data = dump_pruned_hybrid(log, key)        # nonce=None 随机 12 字节
+restored = load_pruned_hybrid(data, key)   # 全新、独立、可变的带密钥 AuditLog
+restored.retain_from == 2                  # True：保留点一致
+restored.head == log.head                  # True：链头一致
+restored.merkle_root() == log.merkle_root()  # True：完整快照的 Merkle 根一致
+restored.find_encrypted("kept secret", enc_key)  # (3,)：密文索引仅含保留段
+restored._used_nonces == log._used_nonces  # True：完整 nonce 历史（含被释放的）
+restored.encrypt("again", enc_key, nonce=b"\x07" * 12)  # ValueError：旧 nonce 仍被拒绝
+log.append("after restart")
+restored.append("after restart")
+restored.auth(4) == log.auth(4)            # True：重启后继续演进，标签逐字节相同
+```
+
+- 字节流严格复用 `dump_hybrid` 的 `D || 0x01 || N || C` 与 AES-256-GCM 规则，
+  仅将 `D` 改为 `b"auditchain/pruned-hybrid/v1\0"`：`0x01` 为单字节算法号
+  （AES-256-GCM），`N` 为 12 字节 nonce，`C` 是明文帧 `P` 的 AESGCM 输出
+  （`ciphertext || 16 字节 tag`）；AEAD 的 AAD 为 `D || 0x01 || N`
+- 明文帧严格依次为
+  `P = B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E ||
+  B(root) || B(head) || U(stage) || B(K) || U(x)`：`h` 是 `hash_name` 的
+  UTF-8 编码；`n` 为累计条目数，`r` 为保留点（`0 < r <= n`），`checkpoint`
+  为前 `r` 条末条的链摘要；`U` 为 8 字节无符号大端，`B(v) = U(len(v)) || v`
+- `F` 严格沿用 `dump_pruned_auth` 的公开编码：u64 子树计数后按高度升序写每个
+  `r` 置位子树的 `U(height) || B(digest)`（高度恰为 `r` 的置位，覆盖
+  `[0, r)`）
+- `Q` 严格复用 `dump_hybrid` 的**完整** nonce 历史：u64 计数后按字典序逐个写
+  12 字节的 `B(nonce)`，覆盖该日志 `encrypt` 用过的全部 nonce——即使对应密文
+  已被裁剪释放
+- `E` 先写 u64 保留条目计数（恰为 `n - r`），再按索引 `r..n-1` 顺序写各条记录，
+  每条严格复用 `dump_secure_log` 的 `U(index) || B(payload) ||
+  B(previous_hash) || B(entry_hash) || B(locator)` 编码与 locator 判型：空
+  locator 表示普通条目，非空 locator 必为摘要等宽的密文定位 HMAC，且其
+  payload 必须能解析为加密条目封装
+- `root` / `head` 为完整 size-`n` 快照的 Merkle 根与链头；尾部的 `stage`、
+  `K`（当前演进密钥；stage 0 时即构造密钥、可任意非空长度，演进后为摘要等宽）
+  与 `x`（验证材料已导出标志，u64 编码、值为 `0` 或 `1`）严格复用
+  `dump_hybrid` 的认证状态尾部
+- 加载**先做 GCM 解密与认证**（错误密钥或任何篡改均失败），再复核 frontier、
+  完整 nonce 历史（宽度、互异、字典序）、locator（保留密文 nonce 须在历史中且
+  在保留段不重复，历史可额外含被释放密文的 nonce）、摘要宽度、保留点越界、
+  保留条目数与索引顺序；随后从检查点起逐条重算 `entry_digest` 链头并由
+  frontier 与保留条目重建完整 Merkle 根，二者必须与 `head` / `root` 匹配；
+  最后经正常 `append` / 加密条目恢复路径原子地重建全部索引与认证状态
+  （retain_from、检查点、frontier、find 索引、密文定位索引、完整 nonce 历史、
+  `K`、`stage`、导出标志），失败不产生半成品日志
+- `key` 须为 32 字节 `bytes`；`nonce=None` 时用 `os.urandom(12)`，显式
+  nonce 须为 12 字节 `bytes`，同 key 复用由调用方避免。`log` 不是
+  `AuditLog`、`key` / `nonce` / `data` 类型错（`data` 拒绝 `bytearray` /
+  `memoryview`）抛 `TypeError`；密钥长度、nonce 长度、资格不符（未裁剪或构造
+  时无 `key`）、魔数 / 算法号、截断、尾随字节、非法 UTF-8 / 未知算法、
+  checkpoint / frontier 结构、保留点越界、nonce 宽度 / 顺序 / 覆盖、摘要 /
+  locator 宽度、封装不可解析、保留密文 nonce 重复或缺失、条目数 / 索引顺序、
+  断链、`stage` / 标志范围、演进密钥为空或宽度不符、AEAD 认证失败或重算
+  链 / 根不符均抛 `ValueError`
+- 导出只读；恢复对象与调用方缓冲区不共享任何状态，可继续 `append`、
+  `encrypt`、`auth`、`rotate_key`、再次裁剪等全部既有操作（已用 nonce 仍被
+  拒绝）；字节流不含任何裁剪回执、标签或验证材料；失败原子，旧接口不变
+
 ## 命令行演示
 
 ```bash
@@ -1510,6 +1595,26 @@ python3 -m auditchain
   `bytes`，`nonce=None` 时随机 12 字节、显式值同 key 复用由调用方避免；
   类型错抛 `TypeError`，资格、长度、格式、认证或状态不一致抛
   `ValueError`；导出只读、失败原子，旧接口不变
+- `dump_pruned_hybrid(log, key, nonce=None)` /
+  `load_pruned_hybrid(data, key)` — 构造时带 `key`、**已裁剪**
+  （`retain_from > 0`）且历史可含 `encrypt` 条目（含被裁剪释放的密文）的
+  前向安全认证日志的混合加密导出与恢复，恢复出独立、可变的带密钥 `AuditLog`
+  （长度、`retain_from`、链头、完整 Merkle 根与包含证明、`find` /
+  `find_encrypted` 索引、完整 nonce 历史与 `stage` 均与原日志一致）：字节流
+  严格复用 `dump_hybrid` 的 `D || 0x01 || N || C` 与 AES-256-GCM（AAD 为
+  `D || 0x01 || N`），仅 `D = b"auditchain/pruned-hybrid/v1\0"`；
+  `P = B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E ||
+  B(root) || B(head) || U(stage) || B(K) || U(x)`；`F` 沿用
+  `dump_pruned_auth` 的 frontier 编码（高度恰为 `r` 的置位，覆盖 `[0, r)`），
+  `Q` 复用 `dump_hybrid` 的完整 nonce 历史（12 字节、字典序、含被释放密文的
+  nonce），`E` 为 u64 计数（恰 `n - r`）后按 `r..n-1` 排列的
+  `dump_secure_log` 记录（`U, B, B, B, B`，locator 判型），尾部为
+  `dump_hybrid` 的认证状态。加载先通过 GCM 认证，再复核 frontier、完整
+  nonce 历史、locator（保留密文 nonce 须在历史中且不重复）、各宽度与范围，
+  从检查点重算链与完整 Merkle 根并与 `head` / `root` 比对，最后原子重建全部
+  索引与认证状态。`key` 须为 32 字节 `bytes`，显式 nonce 须为 12 字节
+  `bytes`，`data` 只收 `bytes`；类型错抛 `TypeError`，资格、长度、格式、
+  认证或状态冲突抛 `ValueError`；导出只读、失败原子，旧接口不变
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

@@ -844,6 +844,53 @@ decode_auth_batch(encode_auth_batch(()))    # ("sha256", ())：空批次
   `ValueError`；结构合法但标签 / 条目不匹配仍可正常编解码，仅
   `verify_auth_batch` 在对应位置返回 `False`
 
+#### 可信交付 stage-0 验证材料（Ed25519）
+
+`export_verifier()` 给出的 stage-0 `Verifier` 本身不带来源证明：验证方需要另行走
+带外信任通道确认它确实来自日志持有者。`export_signed_verifier(private_key)` 用持有
+者按次提供的 32 字节 Ed25519 私钥种子为 stage-0 `Verifier` 签发一个不可变
+`SignedVerifier`；接收方凭**预先信任**的 32 字节公钥即可离线确认验证材料的来源，
+私钥从不落盘：
+
+```python
+from auditchain import verify_signed_verifier
+
+log = AuditLog(key=b"shared-secret")
+log.append("agent started")
+receipt = log.export_signed_verifier(seed)        # 首次演进前、仅可导出一次
+receipt.version                                  # 1
+receipt.verifier.key == b"shared-secret"         # True：stage-0 验证材料
+len(receipt.signature)                           # 64
+verify_signed_verifier(receipt, public_key)      # True：来源可信
+verify_signed_verifier(receipt, other_key)       # False：未信任的公钥
+
+tag = log.auth(0)
+verify_auth(log.entry(0), tag, receipt.verifier)  # True：交付的材料照常验证标签
+```
+
+签名**只认证来源、不加密**：`Verifier.key` 在回执中以明文携带，任何拿到回执的人都
+能验证该日志此后任意 stage 的标签，调用方仍须像保护裸 `Verifier` 一样保护它。
+
+- 回执为冻结的
+  `SignedVerifier(version, verifier, signature)`，支持位置构造、按全部字段相等；
+  `version` 恒为 `1`，`verifier` 为嵌套的不可变 `Verifier`（空 `key` 或未知算法
+  在构造时即抛 `ValueError`），`signature` 只收恰好 64 字节的 `bytes`
+- 签名原文依次为 `D || 0x01 || B(hash_name 的 UTF-8) || B(key)`，其中
+  `D = b"auditchain/signed-verifier/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；Ed25519 对该消息确定性签名
+- `export_signed_verifier(private_key)` 与 `export_verifier()` 共用同一份一次性
+  导出资格：仅限带 `key` 的日志在 `stage == 0` 且尚未导出验证材料时调用，成功即消耗
+  资格，此后两个导出接口都不可再用；无密钥模式、已演进或重复导出抛 `ValueError`。
+  所有校验（含私钥种子）均在签名与消耗资格之前完成，**失败不消耗资格、不演进密钥、
+  不改日志**
+- `verify_signed_verifier(receipt, public_key)` 只凭回执与预信任公钥离线验真：
+  重建同一签名原文并用公钥校验 64 字节签名。公钥不是对应签发方，或结构合法但
+  `verifier` 的 `key` / `hash_name` 或 `signature` 被改，均返回 `False`
+- 类型边界只接受 `bytes`：`private_key` / `public_key` 传入 `str` /
+  `bytearray` / `memoryview` 等抛 `TypeError`；二者不是 32 字节、`version` 非 `1`、
+  嵌套字段类型或宽度非法、空 `key`、未知摘要算法或 `signature` 不是 64 字节抛
+  `ValueError`；验签入口为只读
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1177,6 +1224,12 @@ python3 -m auditchain
   `memoryview`，不做拷贝归一化）；`size` 须满足 `0 <= size < 2**64`。类型非法
   抛 `TypeError`，版本非 1、未知算法、`size` 越界、`root`/`head` 摘要宽度不符
   或 `signature` 不是 64 字节抛 `ValueError`
+- `SignedVerifier(version, verifier, signature)` — 不可变的 Ed25519 可信交付
+  stage-0 验证材料，按全部字段相等、支持位置构造；`version` 恒为 `1`，
+  `verifier` 必须是 `Verifier`（其非空 `bytes` 类型 `key` 与算法名同样被复验），
+  `signature` 只接受恰好 64 字节的精确 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；签名只认证来源、不加密其中密钥。类型非法抛 `TypeError`，版本非
+  1、空 `key`、未知算法或 `signature` 不是 64 字节抛 `ValueError`
 - `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
@@ -1257,6 +1310,16 @@ python3 -m auditchain
   - `rotate_key()` — 只演进密钥一次（stage 加一），不签发标签、不追加条目；无密钥模式抛 `ValueError`
   - `export_verifier()` — 仅可在首次演进前调用一次，返回不可变 `Verifier`；
     演进后或再次调用抛 `ValueError`，无密钥模式抛 `ValueError`
+  - `export_signed_verifier(private_key)` — 在与 `export_verifier()` 相同的资格
+    条件下（带 key、`stage == 0`、未导出过验证材料），用按次传入的 32 字节
+    Ed25519 私钥种子对 stage-0 `Verifier` 确定性签名，返回不可变
+    `SignedVerifier(version=1, verifier, signature)`；签名原文为
+    `D || 0x01 || B(hash_name 的 UTF-8) || B(key)`
+    （`D = b"auditchain/signed-verifier/v1\0"`，`U` 为 8 字节无符号大端，
+    `B(x) = U(len(x)) || x`）。成功即消耗与 `export_verifier` 共用的一次导出资格；
+    所有校验先于签名和资格消耗，失败不消耗资格、不演进密钥、不改日志。种子类型错
+    抛 `TypeError`、长度非 32 抛 `ValueError`；无密钥模式、已演进或重复导出抛
+    `ValueError`；离线用 `verify_signed_verifier` 凭预信任公钥验真
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
@@ -1358,6 +1421,17 @@ python3 -m auditchain
   顺序/重复、缺末条（含 `size>0 且 entries==()`）、空快照携带条目或证明节点数与
   `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容、证明或根不匹配返回
   `False`，匹配返回 `True`
+- `verify_signed_verifier(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519
+  公钥离线验证 `AuditLog.export_signed_verifier` 签发的 `SignedVerifier`：从嵌套
+  `Verifier` 重建同一签名原文
+  `D || 0x01 || B(hash_name 的 UTF-8) || B(key)`
+  （`D = b"auditchain/signed-verifier/v1\0"`，`U` 为 8 字节无符号大端，
+  `B(x) = U(len(x)) || x`）并校验其 64 字节签名，无需持有日志；公钥不是对应
+  签发方，或结构合法但 `verifier` 的 `key` / `hash_name` 或 `signature` 被改
+  返回 `False`，匹配返回 `True`。签名只认证来源、不加密其中密钥。入参不是
+  `SignedVerifier`（含绕过构造器写入错误字段类型）或公钥不是 `bytes` 抛
+  `TypeError`；版本非 1、空 `key`、未知算法、签名长度或公钥长度（非 32 字节）
+  非法抛 `ValueError`；调用只读
 - `verify_signed_root(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_root` 签发的 `SignedRoot`：重建同一签名原文
   `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`

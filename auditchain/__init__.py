@@ -1,12 +1,12 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / SignedRoot / SignedAuditBatch / SignedConsistency /
-SignedPrune / IntegrityIssue / IntegrityReport / entry_digest /
-decrypt_entry / verify_inclusion / verify_batch_inclusion /
+Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
+SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
+entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
-verify_audit_batch / verify_signed_root / verify_signed_audit_batch /
-verify_signed_consistency / verify_signed_prune /
+verify_audit_batch / verify_signed_verifier / verify_signed_root /
+verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -55,6 +55,7 @@ __all__ = [
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
+    "SignedVerifier",
     "Verifier",
     "GENESIS_HASH",
     "decode_audit_batch",
@@ -102,6 +103,7 @@ __all__ = [
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
+    "verify_signed_verifier",
 ]
 
 GENESIS_HASH = bytes(32)
@@ -158,6 +160,13 @@ _SIGNED_ROOT_DOMAIN = b"auditchain/signed-root/v1\0"
 _SIGNED_ROOT_VERSION = 1
 _ED25519_KEY_BYTES = 32
 _ED25519_SIGNATURE_BYTES = 64
+
+# Signed stage-0 verifier of AuditLog.export_signed_verifier /
+# verify_signed_verifier. An Ed25519 signature over the verifier's hash
+# algorithm and stage-0 key; the signature authenticates the source only, it
+# does not encrypt the key it carries.
+_SIGNED_VERIFIER_DOMAIN = b"auditchain/signed-verifier/v1\0"
+_SIGNED_VERIFIER_VERSION = 1
 
 # Binary framing of encode_signed_audit_batch / decode_signed_audit_batch:
 # a fixed magic, then the envelope version as a u64 and two u64-length-prefixed
@@ -363,6 +372,21 @@ def _signed_root_message(hash_name: str, size: int, root: bytes, head: bytes) ->
         + _encode_u64(size, "size")
         + _encode_blob(root)
         + _encode_blob(head)
+    )
+
+
+def _signed_verifier_message(hash_name: str, key: bytes) -> bytes:
+    """M of export_signed_verifier / verify_signed_verifier.
+
+    ``D || 0x01 || B(UTF-8(hash_name)) || B(key)``
+    with ``D = b"auditchain/signed-verifier/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``.
+    """
+    return (
+        _SIGNED_VERIFIER_DOMAIN
+        + bytes((0x01,))
+        + _encode_blob(hash_name.encode("utf-8"))
+        + _encode_blob(key)
     )
 
 
@@ -916,6 +940,50 @@ class Verifier:
         _digest_size(self.hash_name)
 
 
+@dataclass(frozen=True)
+class SignedVerifier:
+    """Ed25519-signed stage-0 :class:`Verifier` for trusted delivery.
+
+    Issued by :meth:`AuditLog.export_signed_verifier` and verified entirely
+    offline by :func:`verify_signed_verifier` against a pre-trusted 32-byte
+    Ed25519 public key, so a receiver can confirm where the stage-0
+    verification material came from without holding the log:
+
+    - ``version``: format version, always ``1``,
+    - ``verifier``: the stage-0 :class:`Verifier` (key and hash algorithm),
+    - ``signature``: the 64-byte Ed25519 signature over the verifier fields.
+
+    The signature authenticates provenance only; it does not encrypt the
+    verifier's key, so callers must still protect the material carried here
+    exactly as they would protect a bare :class:`Verifier`.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields.
+    """
+
+    version: int
+    verifier: Verifier
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != _SIGNED_VERIFIER_VERSION:
+            raise ValueError("version must be 1")
+        if not isinstance(self.verifier, Verifier):
+            raise TypeError("verifier must be a Verifier")
+        # Re-validate the nested verifier even for an instance whose fields
+        # were set bypassing the frozen constructor, so corruption raises
+        # exactly as the Verifier constructor would.
+        Verifier(self.verifier.key, self.verifier.hash_name)
+        if not isinstance(self.signature, bytes):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
+
+
 # Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
 # mismatch at a retained entry's absolute index; "head" pinpoints no entry,
 # only that the recomputed chain head does not equal the recorded log head.
@@ -1285,6 +1353,48 @@ class AuditLog:
         verifier = Verifier(key=self._key, hash_name=self._hash_name)  # type: ignore[arg-type]
         self._verifier_exported = True
         return verifier
+
+    def export_signed_verifier(self, private_key: Any) -> SignedVerifier:
+        """Export the stage-0 verification material once, Ed25519-signed.
+
+        The signed-delivery counterpart of :meth:`export_verifier`: it shares
+        the exact same eligibility — a keyed log, still at ``stage == 0`` and
+        with the verifier not yet exported — and a successful call consumes
+        that one export, so neither method can run again (and a prior
+        :meth:`export_verifier` disqualifies this call). The returned
+        :class:`SignedVerifier` bundles the stage-0 :class:`Verifier` with a
+        64-byte Ed25519 signature a receiver checks against a pre-trusted
+        public key via :func:`verify_signed_verifier`.
+
+        ``private_key`` is a 32-byte Ed25519 seed; it is used for this one
+        signature and is never stored, copied into log state or returned. The
+        signed message is
+        ``D || 0x01 || B(UTF-8(hash_name)) || B(key)`` with
+        ``D = b"auditchain/signed-verifier/v1\\0"``, ``U`` an unsigned 8-byte
+        big-endian integer and ``B(x) = U(len(x)) || x``; ``version`` is
+        always 1. The signature authenticates the source only — it does not
+        encrypt the stage-0 key — so callers must still protect the returned
+        material. Every check (key mode, stage, one-shot eligibility and the
+        seed) runs before the signature is made and the eligibility consumed:
+        a failure leaves the key, stage and export eligibility untouched. A
+        non-``bytes`` seed raises TypeError; a seed that is not 32 bytes,
+        keyless mode, a non-zero stage or a repeat export raises ValueError.
+        """
+        key = self._require_key()
+        signing_key = _load_ed25519_seed(private_key)
+        if self._stage != 0 or self._verifier_exported:
+            raise ValueError(
+                "verifier can only be exported once and before the first key evolution"
+            )
+        verifier = Verifier(key=key, hash_name=self._hash_name)
+        message = _signed_verifier_message(self._hash_name, key)
+        signature = signing_key.sign(message)
+        self._verifier_exported = True
+        return SignedVerifier(
+            version=_SIGNED_VERIFIER_VERSION,
+            verifier=verifier,
+            signature=signature,
+        )
 
     def entries(self) -> list[Entry]:
         return list(self._entries)
@@ -3324,6 +3434,51 @@ def verify_auth_batch(items: Any, verifier: Any) -> tuple[bool, ...]:
     return tuple(
         verify_auth(entry, tag, verifier) for entry, tag in items  # type: ignore[misc]
     )
+
+
+def verify_signed_verifier(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedVerifier` against a pre-trusted Ed25519 key.
+
+    Rebuilds the exact message :meth:`AuditLog.export_signed_verifier` signed
+    — ``D || 0x01 || B(UTF-8(hash_name)) || B(key)`` with
+    ``D = b"auditchain/signed-verifier/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x`` — from the nested
+    :class:`Verifier` and checks the receipt's 64-byte Ed25519 signature with
+    the 32-byte ``public_key``, entirely without holding the log. A genuine
+    receipt from that key returns True; a structurally valid receipt signed
+    by another key, or whose verifier fields or signature have been altered,
+    returns False.
+
+    Input that is not a :class:`SignedVerifier` (or whose fields have been
+    bypassed to wrong types) raises TypeError; a version other than 1, an
+    unknown hash algorithm, an empty key, a signature that is not 64 bytes or
+    a public key that is not 32 bytes raises ValueError (a non-``bytes`` key
+    TypeError). The signature authenticates provenance only, not
+    confidentiality: the verifier key travels in the clear and must be
+    protected by the caller. The call is read-only and never mutates the
+    receipt.
+    """
+    if not isinstance(receipt, SignedVerifier):
+        raise TypeError("receipt must be a SignedVerifier")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor (the constructor
+    # also re-validates the nested Verifier), so structural corruption raises
+    # exactly as the constructor would and only genuine mismatches return
+    # False below.
+    checked = SignedVerifier(
+        receipt.version,
+        receipt.verifier,
+        receipt.signature,
+    )
+    verification_key = _load_ed25519_public(public_key)
+    message = _signed_verifier_message(
+        checked.verifier.hash_name, checked.verifier.key
+    )
+    try:
+        verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True
 
 
 def verify_signed_root(receipt: Any, public_key: Any) -> bool:

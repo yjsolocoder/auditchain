@@ -141,6 +141,7 @@ __all__ = [
     "verify_inclusion",
     "verify_rotation",
     "verify_rotation_chain",
+    "verify_rotated_chain",
     "verify_signed_audit_batch",
     "verify_signed_auth_audit_bundle",
     "verify_signed_auth_audit_continuation",
@@ -5888,6 +5889,112 @@ def verify_continuation_chain(receipts: Any, public_key: Any) -> bool:
         if not consistency.old.size < consistency.new.size:
             return False
         if previous_new is not None and consistency.old != previous_new:
+            return False
+        previous_new = consistency.new
+    return True
+
+
+def verify_rotated_chain(receipts: Any, rotations: Any, key: Any) -> bool:
+    """Verify a non-empty tuple of continuation receipts across key rotations.
+
+    The rotation-aware extension of :func:`verify_continuation_chain`: an
+    offline party holding only the first segment signer's pre-trusted 32-byte
+    Ed25519 public key can confirm one continuous append-only history whose
+    signing key rotates between segments. ``receipts`` must be a non-empty
+    ``tuple`` of frozen :class:`SignedAuthAuditContinuation` objects in chain
+    order and ``rotations`` a ``tuple`` whose length is one less than the
+    number of segments; ``rotations[i]`` is the ``(old, new_key, new, auth)``
+    four-tuple returned by :meth:`AuditLog.rotate_signer` that joins segment
+    ``i`` to segment ``i + 1``.
+
+    Each segment is verified on its own with
+    :func:`verify_signed_auth_audit_continuation` against the key currently
+    trusted — the initial ``key`` for the first segment — and each boundary
+    rotation is checked in order with :func:`verify_rotation`; only after a
+    rotation verifies is its ``new_key`` trusted for the following segment.
+    The rotation must bind the boundary checkpoints: its ``old`` checkpoint
+    must equal the preceding segment's ``consistency.new`` checkpoint on
+    every field and its ``new`` checkpoint the following segment's
+    ``consistency.old`` on every field (each including the Ed25519 signature
+    itself). As in :func:`verify_continuation_chain`, every segment must
+    extend a strictly smaller prefix (``consistency.old.size`` must be less
+    than its ``consistency.new.size``), and neither a receipt nor a rotation
+    record may repeat (two equal elements anywhere in either tuple, not only
+    adjacent ones, make the result False).
+
+    Verification re-uses only :func:`verify_signed_auth_audit_continuation`
+    and :func:`verify_rotation`: it introduces no new container, wire format
+    or signing domain of its own, holds neither the log nor any checkpoint
+    history, is read-only and never mutates the arguments. A genuine,
+    strictly growing cross-key chain returns True; any segment or rotation
+    whose signatures do not verify, any authorization, tag, label, inclusion
+    proof, consistency proof or boundary association that does not match,
+    any non-growing segment, or any repeated receipt or rotation returns
+    False. A non-``tuple`` ``receipts`` or ``rotations`` (including a list, a
+    generator or ``None``), a receipt that is not a
+    :class:`SignedAuthAuditContinuation`, or a ``key`` that is not ``bytes``
+    raises TypeError; an empty ``receipts`` tuple, a ``rotations`` tuple whose
+    length is not one less than the number of segments, or a ``key`` that is
+    not 32 bytes raises ValueError. Every other nested structural violation
+    — including a malformed rotation record — propagates from
+    :func:`verify_rotation` and
+    :func:`verify_signed_auth_audit_continuation` unchanged.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if not isinstance(rotations, tuple):
+        raise TypeError("rotations must be a tuple of rotation records")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    if len(rotations) != len(receipts) - 1:
+        raise ValueError(
+            "rotations must contain exactly one fewer record than receipts"
+        )
+    for receipt in receipts:
+        if not isinstance(receipt, SignedAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedAuthAuditContinuation"
+            )
+    for rotation in rotations:
+        if not isinstance(rotation, tuple):
+            raise TypeError(
+                "each rotation must be a (old, new_key, new, auth) tuple"
+            )
+    # Pin the initial key to 32 bytes before the first use, exactly as
+    # verify_rotation_chain does, so a malformed anchor key raises identically
+    # whether or not the chain happens to be examined.
+    _load_ed25519_public(key)
+    current_key = key
+    seen_receipts: set[SignedAuthAuditContinuation] = set()
+    seen_rotations: set[tuple] = set()
+    previous_new: SignedRoot | None = None
+    for index, receipt in enumerate(receipts):
+        if index > 0:
+            rotation = rotations[index - 1]
+            if rotation in seen_rotations:
+                return False
+            seen_rotations.add(rotation)
+            # The rotation joins the previous segment to this one: it is
+            # verified against the key that signed the preceding segment
+            # before its new_key is trusted for this segment, so trust can
+            # only advance one authorized hop at a time.
+            if not verify_rotation(rotation, current_key):
+                return False
+            # All-field equality, including each checkpoint's signature, ties
+            # the authorized handoff to the exact boundary the segments name.
+            if (
+                rotation[0] != previous_new
+                or rotation[2] != receipt.consistency.old
+            ):
+                return False
+            current_key = rotation[1]
+        if receipt in seen_receipts:
+            return False
+        seen_receipts.add(receipt)
+        if not verify_signed_auth_audit_continuation(receipt, current_key):
+            return False
+        consistency = receipt.consistency
+        if not consistency.old.size < consistency.new.size:
             return False
         previous_new = consistency.new
     return True

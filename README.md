@@ -1344,6 +1344,55 @@ verify_continuation_chain(restored, public_key)  # True：无需持有日志
   关联，结构合法但验真不匹配仍可解码，由 `verify_continuation_chain` 返回
   `False`；两个入口均只读且确定，旧接口和签名域不变
 
+#### 跨签名钥轮换的续接链离线核验（逐跳信任）
+
+`verify_continuation_chain` 要求整链由同一预置密钥签发。顶层
+`verify_rotated_chain(receipts, rotations, key) -> bool` 把它扩展到**段间发生
+签名钥轮换**的历史：离线方只持首段签名者的预置 32 字节 Ed25519 公钥，即可确认
+一条跨密钥的连续只追加历史，全程只读、不持有日志，也**不新增任何容器、线格式或
+签名域**——只复用既有 `verify_signed_auth_audit_continuation` 与
+`verify_rotation`。`receipts` 为非空 tuple 的既有冻结续接凭据（保持链序），
+`rotations` 为 tuple、长度恰为**段数减一**，其第 i 项是 `rotate_signer` 返回的
+`(old, new_key, new, auth)` 四元组，连接第 i 段与第 i+1 段：
+
+```python
+from auditchain import verify_rotated_chain
+
+# 三段 0 -> 2 -> 5 -> 8，分别由 A、B、C 签发；A->B（size 2）、B->C（size 5）
+# 两次既有的 rotate_signer 轮换夹在相邻段之间
+rot1 = log0.rotate_signer(seed_a, seed_b, size=2)
+rot2 = log0.rotate_signer(seed_b, seed_c, size=5)
+chain = (
+    log1.signed_auth_audit_continuation(0, (), seed_a, size=2),
+    log2.signed_auth_audit_continuation(2, (), seed_b, size=5),
+    log3.signed_auth_audit_continuation(5, (), seed_c, size=8),
+)
+verify_rotated_chain(chain, (rot1, rot2), public_a)  # True
+verify_rotated_chain(chain, (rot1, rot2), public_b)  # False：未预置 A
+```
+
+- 核验严格按 tuple 顺序逐段进行：首段以初始 `key` 调用
+  `verify_signed_auth_audit_continuation`；每个段间边界先以**当前信任钥**顺序调用
+  既有 `verify_rotation` 核验对应轮换，**成功后**才信任其 `new_key` 并以此核验
+  后段——一次轮换背书的新钥是唯一可信的下段签名者，信任只能逐跳前进。第 i 个轮换
+  的 `old` 必须与前段 `consistency.new` **全字段相等**（含 Ed25519 签名本身），
+  其 `new` 必须与后段 `consistency.old` **全字段相等**，把授权交接绑定到两段实际
+  指名的边界检查点
+- 沿用 `verify_continuation_chain` 的段内要求：每段
+  `consistency.old.size < consistency.new.size`（等长段不描述任何追加）；任何重复
+  凭据（与更早凭据相等）或**重复轮换**（与更早轮换四元组相等，不限于相邻）都返回
+  `False`。结构与类型合法但任一签名、授权、标签、包含证明、一致性证明或边界关联
+  不匹配均返回 `False`；全部通过才返回 `True`，调用只读且从不修改任何入参
+- 异常约定：`receipts`、`rotations` 非 `tuple`（含 list / 生成器 / `None`）或
+  元素类型错（凭据非 `SignedAuthAuditContinuation`、轮换项非 tuple）抛
+  `TypeError`，`key` 非 `bytes` 抛 `TypeError`；空链（`receipts` 为空 tuple）、
+  `rotations` 长度不等于段数减一、或 `key` 非 32 字节抛 `ValueError`；其余嵌套
+  结构非法（含轮换四元组长度非 4）按 `verify_rotation` 与
+  `verify_signed_auth_audit_continuation` 的既有规则原样传播 `TypeError` /
+  `ValueError`。单段链以空 tuple 的 `rotations` 核验，行为与
+  `verify_continuation_chain` 一致；不新增容器或线格式，既有轮换及续接编解码字节
+  与所有旧接口保持不变
+
 #### 续接链只读诊断：定位首个失败段或断裂边界（Ed25519）
 
 `verify_continuation_chain` 只回答“整条链是否成立”。顶层

@@ -8,6 +8,7 @@ entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
 verify_audit_batch / verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
+verify_continuation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -17,6 +18,7 @@ encode_signed_verifier / decode_signed_verifier /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
+encode_continuations / decode_continuations /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
@@ -68,6 +70,7 @@ __all__ = [
     "decode_audit_batch",
     "decode_audit_receipt",
     "decode_auth_batch",
+    "decode_continuations",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
     "decode_signed_auth_audit_bundle",
@@ -89,6 +92,7 @@ __all__ = [
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_auth_batch",
+    "encode_continuations",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
     "encode_signed_auth_audit_bundle",
@@ -113,6 +117,7 @@ __all__ = [
     "verify_auth_batch",
     "verify_batch_inclusion",
     "verify_consistency",
+    "verify_continuation_chain",
     "verify_inclusion",
     "verify_signed_audit_batch",
     "verify_signed_auth_audit_bundle",
@@ -236,6 +241,15 @@ _SIGNED_AUTH_AUDIT_CONTINUATION_MAGIC = (
     b"auditchain/auth-audit-continuation/v1\0"
 )
 _SIGNED_AUTH_AUDIT_CONTINUATION_VERSION = 1
+
+# Binary framing of encode_continuations / decode_continuations: a fixed
+# magic, then the envelope version as a u64, the receipt count n as a u64 and
+# n u64-length-prefixed blobs each holding the complete canonical
+# encode_signed_auth_audit_continuation bytes of one receipt, in tuple order
+# and with nothing else. The chain introduces no framing of its own beyond
+# that envelope and no new signing domain.
+_CONT_CHAIN_MAGIC = b"auditchain/cont-chain/v1\0"
+_CONT_CHAIN_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -5162,6 +5176,170 @@ def decode_signed_auth_audit_continuation(
     consistency = decode_signed_consistency(consistency_blob)
     return SignedAuthAuditContinuation(
         bundle=bundle, consistency=consistency
+    )
+
+
+def verify_continuation_chain(receipts: Any, public_key: Any) -> bool:
+    """Verify a chain of continuation receipts against a pre-trusted key.
+
+    Confirms entirely offline, without holding the log, that a non-empty
+    tuple of :class:`SignedAuthAuditContinuation` receipts describes one
+    continuous append-only history under the pre-trusted 32-byte Ed25519
+    public key:
+
+    1. every receipt is verified in input order with
+       :func:`verify_signed_auth_audit_continuation` — any receipt that
+       does not verify makes the whole chain False;
+    2. every receipt must describe a strict extension of its own old
+       snapshot: ``consistency.old.size < consistency.new.size``;
+    3. adjacent receipts must join exactly: the previous receipt's
+       ``consistency.new`` checkpoint must equal the next receipt's
+       ``consistency.old`` checkpoint on every field, including the
+       signature itself, so the chain has no gaps and no forks;
+    4. no receipt may appear twice.
+
+    A genuine chain from the trusted key returns True; a repeated receipt,
+    a broken adjacency, a non-extending receipt or any altered signature,
+    tag, proof, entry or checkpoint returns False. ``receipts`` must be a
+    non-empty ``tuple`` — anything else raises TypeError, and an empty
+    tuple raises ValueError; an element that is not a
+    :class:`SignedAuthAuditContinuation` raises TypeError, nested
+    structural violations raise exactly the exceptions of
+    :func:`verify_signed_auth_audit_continuation` (TypeError or
+    ValueError), and a public key that is not 32 ``bytes`` raises
+    ValueError (a non-``bytes`` key TypeError). The call is read-only,
+    introduces no new signing domain and never mutates the receipts.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+    if not receipts:
+        raise ValueError("receipts must be a non-empty tuple")
+    seen: list[SignedAuthAuditContinuation] = []
+    previous: SignedAuthAuditContinuation | None = None
+    for receipt in receipts:
+        # The nested verifier raises TypeError for an element that is not
+        # a SignedAuthAuditContinuation and validates the public key.
+        if not verify_signed_auth_audit_continuation(receipt, public_key):
+            return False
+        consistency = receipt.consistency
+        if not consistency.old.size < consistency.new.size:
+            return False
+        if receipt in seen:
+            return False
+        if (
+            previous is not None
+            and previous.consistency.new != consistency.old
+        ):
+            return False
+        seen.append(receipt)
+        previous = receipt
+    return True
+
+
+def encode_continuations(receipts: Any) -> bytes:
+    """Encode a non-empty tuple of continuation receipts into canonical bytes.
+
+    The byte stream is ``D || U(1) || U(n) || B(R1)…B(Rn)`` with
+    ``D = b"auditchain/cont-chain/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), the receipt count ``n`` and one blob per
+    receipt in tuple order — nothing may be omitted, reordered or
+    appended. Each ``Ri`` is byte-for-byte the complete canonical output
+    of :func:`encode_signed_auth_audit_continuation` over
+    ``receipts[i]``. No new signing message is introduced: encoding is
+    read-only and only re-uses the existing canonical encoding.
+
+    ``receipts`` must be a non-empty ``tuple`` — anything else raises
+    TypeError and an empty tuple raises ValueError; an element that is
+    not a :class:`SignedAuthAuditContinuation` raises TypeError and
+    nested structural problems raise exactly the exceptions of
+    :func:`encode_signed_auth_audit_continuation` (TypeError or
+    ValueError). Encoding is deterministic: re-encoding a decoded tuple
+    reproduces the original bytes exactly, and structurally valid
+    receipts whose verification does not pass encode just as well.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a tuple")
+    if not receipts:
+        raise ValueError("receipts must be a non-empty tuple")
+    parts = [
+        _CONT_CHAIN_MAGIC,
+        _encode_u64(_CONT_CHAIN_VERSION, "version"),
+        _encode_u64(len(receipts), "receipt count"),
+    ]
+    for receipt in receipts:
+        parts.append(
+            _encode_blob(encode_signed_auth_audit_continuation(receipt))
+        )
+    return b"".join(parts)
+
+
+def decode_continuations(data: Any) -> tuple:
+    """Decode bytes produced by :func:`encode_continuations`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray``
+    and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/cont-chain/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the u64
+    receipt count ``n`` (at least 1) and ``n`` length-prefixed receipt
+    blobs, with no trailing bytes. Each blob is consumed exactly and
+    handed whole to :func:`decode_signed_auth_audit_continuation`, so
+    every nested framing and structural rule is theirs. A bad magic or
+    version, an empty chain, truncation, an oversized blob length,
+    trailing bytes or an illegal nested encoding raises ValueError.
+
+    Signatures, tags, proof content and the chain relations between
+    receipts are not checked here. The returned value is a ``tuple`` of
+    frozen :class:`SignedAuthAuditContinuation` instances in the
+    original order, each equal to the originally encoded one, and
+    re-encoding reproduces the original bytes exactly. A structurally
+    sound encoding whose verification simply does not pass still
+    decodes; :func:`verify_continuation_chain` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_CONT_CHAIN_MAGIC):
+        raise ValueError("not an auditchain continuation-chain encoding")
+    offset = len(_CONT_CHAIN_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _CONT_CHAIN_VERSION:
+        raise ValueError(
+            f"unsupported continuation-chain version {version}"
+        )
+    count = read_u64("receipt count")
+    if count == 0:
+        raise ValueError("continuation chain must carry at least one receipt")
+    blobs = [
+        read_blob(f"continuation receipt {index}")
+        for index in range(count)
+    ]
+    if offset != len(data):
+        raise ValueError("trailing bytes after the continuation chain")
+    # Decode each nested blob with the existing decoder; its own magic,
+    # version, truncation/trailing-byte and structural checks apply
+    # verbatim. Tuple order is preserved.
+    return tuple(
+        decode_signed_auth_audit_continuation(blob) for blob in blobs
     )
 
 

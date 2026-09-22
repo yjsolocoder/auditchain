@@ -1169,6 +1169,70 @@ verify_signed_auth_audit_continuation(restored, public_key)  # True：无需持�
   `SignedAuthAuditContinuation(bundle, consistency)` 仍按字段相等，保留位置
   构造及字段顺序，旧接口和签名域不变
 
+#### 续接链的离线核验与规范编码（Ed25519）
+
+单个 `SignedAuthAuditContinuation` 证明"新快照由某个更早日签名快照只追加
+续接而来"；把多段续接凭据按快照首尾相接排成元组，就能描述一段跨越多次
+导出的连续只追加历史。`verify_continuation_chain(receipts, public_key)`
+离线核验这样一个**非空续接元组**：离线方只凭预置信任的 32 字节 Ed25519
+公钥，即可确认每一段续接凭据真实有效、且段与段精确衔接成一条无缺口、
+无分叉的只追加历史，全程不持有日志、也**不新增任何签名域**：
+
+```python
+from auditchain import verify_continuation_chain
+
+# 三段续接：0->3、3->6、6->9，首尾相接；每段各自由一份相同内容、
+# 相同认证密钥的孪生日志签发（签发消耗一次性导出资格）
+c1 = log_a.signed_auth_audit_continuation(0, (1,), seed, size=3)
+c2 = log_b.signed_auth_audit_continuation(3, (4,), seed, size=6)
+c3 = log_c.signed_auth_audit_continuation(6, (7, 8), seed, size=9)
+verify_continuation_chain((c1, c2, c3), public_key)   # True：连续只追加历史
+verify_continuation_chain((c1, c3), public_key)       # False：3->6 缺口
+verify_continuation_chain((c2, c1), public_key)       # False：顺序不符
+verify_continuation_chain((c1, c2, c2), public_key)   # False：重复段
+```
+
+- 首参只收**非空 `tuple`**，元素均为既有冻结 `SignedAuthAuditContinuation`
+  并保持输入顺序；逐项调用 `verify_signed_auth_audit_continuation`，任一
+  返回 `False` 即整体 `False`
+- 每段须满足 `consistency.old.size < consistency.new.size`（严格只追加
+  扩展）；相邻段要求前段 `consistency.new` 与后段 `consistency.old`
+  **全字段相等**（含签名本身），链因此无缺口、无分叉；重复段或任一关系
+  不符返回 `False`（绝不抛异常冒充结构错误）
+- 入参不是 `tuple` 或元素不是 `SignedAuthAuditContinuation` 抛
+  `TypeError`；空元组、公钥长度非 32 字节抛 `ValueError`；嵌套结构非法
+  沿用 `verify_signed_auth_audit_continuation` 的既有异常
+  （`TypeError` / `ValueError`）；核验为只读，不改变任何凭据
+- `encode_continuations(receipts)` / `decode_continuations(data)` 把整个
+  非空续接元组序列化为只读、确定的规范二进制并按原有顺序还原，使续接链
+  可落盘、跨进程恢复后继续凭预置信任的 Ed25519 公钥离线核验，且不引入
+  任何新的签名域：
+
+```python
+from auditchain import encode_continuations, decode_continuations
+
+data = encode_continuations((c1, c2, c3))     # bytes，可写文件/发网络
+restored = decode_continuations(data)         # tuple，保持原有顺序
+restored == (c1, c2, c3)                      # True：凭据逐段相等
+encode_continuations(restored) == data        # True：重编码逐字节相同
+verify_continuation_chain(restored, public_key)  # True：无需持有日志
+```
+
+  字节流严格为 `D || U(1) || U(n) || B(R1)…B(Rn)`，其中
+  `D = b"auditchain/cont-chain/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则）；`n` 为段数，
+  每个 `Ri` 逐字节等于既有 `encode_signed_auth_audit_continuation` 对第
+  i 段的完整输出，顺序与元组一致，不允许省略、换序或附加字节。解码精确
+  消费各 `Ri` 及全部外层字节，每个 blob 原样交给既有
+  `decode_signed_auth_audit_continuation`，嵌套异常沿用对应既有编解码器。
+  `encode_continuations` 只接受非空凭据元组（非 `tuple` 或元素类型错抛
+  `TypeError`，空元组抛 `ValueError`），`decode_continuations` 只接受
+  `bytes`（含拒绝 `bytearray` / `memoryview`）；魔数、版本、空链
+  （`n == 0`）、截断、blob 长度、嵌套格式或尾随字节非法均抛
+  `ValueError`；编解码不校验签名、标签、证明内容及段间衔接关系，结构
+  合法但验真不匹配仍可解码，`verify_continuation_chain` 返回 `False`；
+  两个入口均为只读且确定，旧接口和签名域不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1853,6 +1917,22 @@ python3 -m auditchain
   不校验签名、标签、证明内容及两部分的快照关联，结构合法但验真不匹配仍可解码
   （`verify_signed_auth_audit_continuation` 返回 `False`）；两个入口均为只读
   且确定，旧接口和签名域不变
+- `verify_continuation_chain(receipts, public_key)` / `encode_continuations(receipts)`
+  / `decode_continuations(data)` — 非空续接元组描述的连续只追加历史的离线核验
+  与规范编解码，不新增签名域：核验逐项调用
+  `verify_signed_auth_audit_continuation`（任一 `False` 即整体 `False`），要求
+  每段 `consistency.old.size < consistency.new.size`、相邻段前段
+  `consistency.new` 与后段 `consistency.old` 全字段相等（含签名），重复段或
+  任一关系不符返回 `False`；首参只收非空 `tuple`（类型错抛 `TypeError`，空元组
+  抛 `ValueError`），公钥长度错抛 `ValueError`，嵌套结构非法沿用既有异常。
+  字节流严格为 `D || U(1) || U(n) || B(R1)…B(Rn)`，
+  `D = b"auditchain/cont-chain/v1\0"`，`U` 为 8 字节无符号大端，
+  `B(x) = U(len(x)) || x`，每个 `Ri` 为既有
+  `encode_signed_auth_audit_continuation` 的完整输出，解码精确消费各 blob 及
+  全部外层字节并保持凭据元组的原有顺序，逐段交给既有解码器；魔数、版本、空链、
+  截断、blob 长度、嵌套格式或尾随非法抛 `ValueError`；编解码不校验签名与段间
+  关系，结构合法但验真不匹配仍可解码（`verify_continuation_chain` 返回
+  `False`）；各入口均为只读且确定，旧接口和签名域不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

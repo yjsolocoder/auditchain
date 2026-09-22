@@ -1266,6 +1266,45 @@ inspect_continuation_chain(chain, other_public_key)
   嵌套核验按既有规则抛出的 `TypeError` / `ValueError` **原样传播**，不会变成
   `"verify"` 报告。调用只读、确定，既有核验与编解码接口、签名域均不变
 
+#### 续接链端点锚定诊断：确认链恰从期望旧快照延伸到期望新快照（Ed25519）
+
+`inspect_continuation_chain` 只回答“链内部是否连续”。顶层
+`inspect_anchors(receipts, public_key, start, end) -> ContinuationChainReport`
+是其**端点锚定扩展**：离线方仅凭预置信任公钥与两个期望 `SignedRoot`
+检查点，即可确认这条链不仅内部连续，而且**恰好**从期望旧快照延伸到期望新
+快照——被截去前缀、截去后缀或整体替换的**有效子链**都会被定位而非被接受。
+四个参数均无默认值；调用同样全程离线、只读、不新增任何签名域：
+
+```python
+from auditchain import ContinuationChainReport, inspect_anchors
+
+inspect_anchors(chain, public_key, start, end)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+inspect_anchors(chain[1:], public_key, start, end)
+# ContinuationChainReport(ok=False, index=0, code='start')   # 截去前缀
+
+inspect_anchors(chain[:-1], public_key, start, end)
+# ContinuationChainReport(ok=False, index=len(chain)-2, code='end')  # 截去后缀
+```
+
+- 先委托 `inspect_continuation_chain(receipts, public_key)` 做内部诊断，
+  失败报告**原样返回**——`"verify"`、`"growth"`、`"duplicate"`、`"link"`
+  四类首错顺序不变，内部不成立的链绝不会被改报为锚点不符
+- 仅当内部报告成功才比较锚点，且**起点优先于终点**：首段
+  `consistency.old` 不等于 `start` 报 `"start"`（`index` 取 `0`）；末段
+  `consistency.new` 不等于 `end` 报 `"end"`（`index` 取末段位置）
+- 端点按 `SignedRoot` 全六字段（`version`、`hash_name`、`size`、`root`、
+  `head` 及 Ed25519 `signature`）全等比较：尺寸相同但历史或签名者不同的
+  检查点不算匹配。两端均锚定的内部连续链返回 `(True, None, None)`
+- 报告仍为冻结三字段 `ContinuationChainReport(ok, index, code)`，构造与
+  相等规则不变，仅合法码集合新增 `"start"`、`"end"` 两个（仅由
+  `inspect_anchors` 报告）
+- 调用前校验：非 `tuple` 链、非 `SignedAuthAuditContinuation` 元素、非
+  `bytes` 公钥或非 `SignedRoot` 锚点抛 `TypeError`；空链或公钥非 32 字节
+  抛 `ValueError`；结构非法凭据的嵌套异常沿用既有规则原样传播。既有核验
+  与编解码接口、签名域均不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1970,6 +2009,16 @@ python3 -m auditchain
   tuple 与 32 字节 `bytes` 公钥的类型/长度校验及嵌套异常传播规则与
   `verify_continuation_chain` 一致；不持有日志、不改凭据、不新增签名域，旧
   接口不变
+- `inspect_anchors(receipts, public_key, start, end)` —
+  `inspect_continuation_chain` 的端点锚定扩展（四参均无默认值）：先委托内部
+  诊断，失败报告原样返回（四类首错顺序不变）；仅当链内部成立才比较锚点，
+  首段 `consistency.old` 不等于期望 `start` 报 `"start"`（`index` 取 `0`），
+  末段 `consistency.new` 不等于期望 `end` 报 `"end"`（`index` 取末段位置），
+  起点不符优先于终点不符；端点按 `SignedRoot` 全六字段全等，故被截去前缀、
+  后缀或整体替换的有效子链都会被定位。报告仍为冻结三字段
+  `ContinuationChainReport`，仅合法码新增 `"start"`、`"end"`；非
+  `SignedRoot` 锚点抛 `TypeError`，其余校验与异常传播规则同
+  `inspect_continuation_chain`；只读、不新增签名域，旧接口不变
 - `encode_continuations(receipts)` / `decode_continuations(data)` — 续接链的
   规范二进制编码与解码，使非空续接凭据 tuple 可落盘、跨进程恢复后继续凭预置
   信任的 Ed25519 公钥由 `verify_continuation_chain` 离线验真，且不新增签名域：

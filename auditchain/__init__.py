@@ -7,7 +7,7 @@ SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
-verify_audit_batch / inspect_continuation_chain / verify_signed_verifier / verify_signed_root /
+verify_audit_batch / inspect_continuation_chain / inspect_anchors / verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
@@ -103,6 +103,7 @@ __all__ = [
     "encode_signed_root",
     "encode_signed_verifier",
     "entry_digest",
+    "inspect_anchors",
     "inspect_continuation_chain",
     "load_auth",
     "load_hybrid",
@@ -1174,30 +1175,38 @@ class SignedAuthAuditContinuation:
             raise TypeError("consistency must be a SignedConsistency")
 
 
-# Diagnostic codes of inspect_continuation_chain, each pinpointing the first
-# segment or boundary at which the receipts fail to describe one chain:
-# "verify" — a segment itself fails verify_signed_auth_audit_continuation;
-# "growth" — a segment's old checkpoint is not strictly smaller than its new;
-# "duplicate" — a segment repeats an earlier receipt;
-# "link" — adjacent segments do not join at equal checkpoints. "link" names
-# only the boundary between segments, it does not blame either one.
+# Diagnostic codes of inspect_continuation_chain and inspect_anchors, each
+# pinpointing the first segment or boundary at which the receipts fail to
+# describe one chain: "verify" — a segment itself fails
+# verify_signed_auth_audit_continuation; "growth" — a segment's old checkpoint
+# is not strictly smaller than its new; "duplicate" — a segment repeats an
+# earlier receipt; "link" — adjacent segments do not join at equal
+# checkpoints; "start" — the first segment's old checkpoint is not the
+# expected anchor; "end" — the last segment's new checkpoint is not the
+# expected anchor. "link" names only the boundary between segments, it does
+# not blame either one. "start" and "end" are reported by inspect_anchors
+# only, never by inspect_continuation_chain.
 _CHAIN_CODE_VERIFY = "verify"
 _CHAIN_CODE_GROWTH = "growth"
 _CHAIN_CODE_DUPLICATE = "duplicate"
 _CHAIN_CODE_LINK = "link"
+_CHAIN_CODE_START = "start"
+_CHAIN_CODE_END = "end"
 _CHAIN_CODES = frozenset(
     {
         _CHAIN_CODE_VERIFY,
         _CHAIN_CODE_GROWTH,
         _CHAIN_CODE_DUPLICATE,
         _CHAIN_CODE_LINK,
+        _CHAIN_CODE_START,
+        _CHAIN_CODE_END,
     }
 )
 
 
 @dataclass(frozen=True)
 class ContinuationChainReport:
-    """Result of :func:`inspect_continuation_chain`.
+    """Result of :func:`inspect_continuation_chain` and :func:`inspect_anchors`.
 
     A read-only diagnosis of a non-empty tuple of chained
     :class:`SignedAuthAuditContinuation` receipts, locating the **first**
@@ -1207,15 +1216,20 @@ class ContinuationChainReport:
     - ``ok``: the single source of truth, ``True`` exactly for a chain whose
       every segment verifies against the pre-trusted key, whose segments all
       grow strictly, which repeats no receipt and whose adjacent segments join
-      on equal checkpoints;
+      on equal checkpoints — and, for :func:`inspect_anchors`, which
+      additionally starts and ends exactly at the expected anchor
+      checkpoints;
     - ``index``: the tuple position of the failing segment for ``"verify"``,
       ``"growth"`` and ``"duplicate"``, or the position of the segment whose
       ``old`` boundary does not join its predecessor's ``new`` for
-      ``"link"``; ``None`` exactly when ``ok`` is ``True``;
-    - ``code``: one of ``"verify"``, ``"growth"``, ``"duplicate"`` or
-      ``"link"`` describing that first failure; ``None`` exactly when ``ok``
-      is ``True``. A ``"link"`` code identifies the boundary only and blames
-      neither segment.
+      ``"link"``; for the anchor codes of :func:`inspect_anchors` it is ``0``
+      for ``"start"`` and the last segment's position for ``"end"``;
+      ``None`` exactly when ``ok`` is ``True``;
+    - ``code``: one of ``"verify"``, ``"growth"``, ``"duplicate"``,
+      ``"link"``, ``"start"`` or ``"end"`` describing that first failure;
+      ``None`` exactly when ``ok`` is ``True``. A ``"link"`` code identifies
+      the boundary only and blames neither segment. ``"start"`` and
+      ``"end"`` are reported by :func:`inspect_anchors` only.
 
     Reports are immutable, may be built positionally and compare by all three
     fields. The success report is ``ContinuationChainReport(True, None, None)``.
@@ -1242,7 +1256,7 @@ class ContinuationChainReport:
         if self.code not in _CHAIN_CODES:
             raise ValueError(
                 f"unknown chain code {self.code!r}; expected one of "
-                f"'verify', 'growth', 'duplicate', 'link'"
+                "'verify', 'growth', 'duplicate', 'link', 'start', 'end'"
             )
         if not isinstance(self.index, int) or isinstance(self.index, bool):
             raise TypeError("index must be an integer or None")
@@ -5400,6 +5414,89 @@ def inspect_continuation_chain(
             return ContinuationChainReport(False, index, _CHAIN_CODE_LINK)
         previous_new = consistency.new
     return ContinuationChainReport(True, None, None)
+
+
+def inspect_anchors(
+    receipts: Any, public_key: Any, start: Any, end: Any
+) -> ContinuationChainReport:
+    """Diagnose whether a chain joins two expected snapshot checkpoints.
+
+    The anchor-aware extension of :func:`inspect_continuation_chain`: an
+    offline party holding only the pre-trusted key and two expected
+    :class:`SignedRoot` checkpoints can confirm that the receipts not only
+    form one internally continuous chain but span **exactly** from the
+    expected old snapshot to the expected new one — a valid sub-chain with a
+    truncated prefix, a truncated suffix, or a wholesale replacement of the
+    expected span is located rather than accepted. It is equally read-only:
+    it holds neither the log nor any checkpoint history, introduces no new
+    Ed25519 or HMAC signing domain and never mutates the receipts, the key
+    or the anchors.
+
+    The chain itself is diagnosed first by delegating to
+    :func:`inspect_continuation_chain`; a failing report is returned
+    unchanged, so the four internal codes (``"verify"``, ``"growth"``,
+    ``"duplicate"``, ``"link"``) keep their first-failure order and an
+    internally broken chain is never re-diagnosed as an anchor mismatch.
+    Only when the internal report succeeds are the anchors compared, start
+    before end:
+
+    - the first segment's ``consistency.old`` checkpoint must equal
+      ``start`` — a mismatch reports ``"start"`` at index ``0``;
+    - the last segment's ``consistency.new`` checkpoint must equal ``end``
+      — a mismatch reports ``"end"`` at the last segment's position.
+
+    Anchor equality is full :class:`SignedRoot` equality over all six
+    fields (``version``, ``hash_name``, ``size``, ``root``, ``head`` and
+    the Ed25519 ``signature``), so a checkpoint attesting the right size
+    over the wrong history — or signed by the wrong key — does not match.
+    A chain that is internally continuous and anchored at both ends reports
+    ``ContinuationChainReport(True, None, None)``.
+
+    ``receipts``, ``public_key``, ``start`` and ``end`` are all required
+    and validated before the internal diagnosis runs: a non-tuple
+    ``receipts`` (including a list, a generator or ``None``), an element
+    that is not a :class:`SignedAuthAuditContinuation`, a non-``bytes``
+    ``public_key`` (including ``bytearray``) or a ``start``/``end`` that is
+    not a :class:`SignedRoot` raises TypeError, while an empty tuple or a
+    ``public_key`` of another length than 32 bytes raises ValueError.
+    Nested structural violations raised on a structurally illegal receipt
+    propagate unchanged (TypeError or ValueError) exactly as in
+    :func:`inspect_continuation_chain`.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    for receipt in receipts:
+        if not isinstance(receipt, SignedAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedAuthAuditContinuation"
+            )
+    if not isinstance(public_key, bytes):
+        raise TypeError("public_key must be a 32-byte Ed25519 public key")
+    if len(public_key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"public_key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+    if not isinstance(start, SignedRoot):
+        raise TypeError("start must be a SignedRoot")
+    if not isinstance(end, SignedRoot):
+        raise TypeError("end must be a SignedRoot")
+
+    # The internal chain diagnosis keeps its own first-failure order; only
+    # an internally sound chain is ever compared against the anchors, start
+    # before end.
+    report = inspect_continuation_chain(receipts, public_key)
+    if not report.ok:
+        return report
+    if receipts[0].consistency.old != start:
+        return ContinuationChainReport(False, 0, _CHAIN_CODE_START)
+    if receipts[-1].consistency.new != end:
+        return ContinuationChainReport(
+            False, len(receipts) - 1, _CHAIN_CODE_END
+        )
+    return report
 
 
 def encode_continuations(receipts: Any) -> bytes:

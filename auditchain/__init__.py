@@ -139,6 +139,7 @@ __all__ = [
     "verify_consistency",
     "verify_continuation_chain",
     "verify_inclusion",
+    "verify_rotated_chain",
     "verify_rotation",
     "verify_rotation_chain",
     "verify_signed_audit_batch",
@@ -5888,6 +5889,125 @@ def verify_continuation_chain(receipts: Any, public_key: Any) -> bool:
         if not consistency.old.size < consistency.new.size:
             return False
         if previous_new is not None and consistency.old != previous_new:
+            return False
+        previous_new = consistency.new
+    return True
+
+
+def verify_rotated_chain(receipts: Any, rotations: Any, key: Any) -> bool:
+    """Verify a non-empty tuple of continuation receipts across key rotations.
+
+    The rotation-aware extension of :func:`verify_continuation_chain`: an
+    offline party holding only one pre-trusted 32-byte Ed25519 public key
+    can confirm that the receipts — consecutive segments of one strictly
+    growing append-only history — may be signed by a *different* key per
+    segment, with each handoff authorized by a signer rotation the previous
+    key vouches for. Nothing about the check requires the log or any
+    checkpoint history, it introduces no new signing message or wire format,
+    and it never mutates the receipts, the rotations or the key.
+
+    ``receipts`` must be a non-empty ``tuple`` of
+    :class:`SignedAuthAuditContinuation` objects (the segments, in chain
+    order) and ``rotations`` a ``tuple`` whose length is exactly one less
+    than the number of segments; ``rotations[i]`` is the
+    :meth:`AuditLog.rotate_signer` ``(old, new_key, new, auth)`` four-tuple
+    that connects segment ``i`` to segment ``i + 1``. The receipts are then
+    examined strictly in tuple order, with trust hopping exactly once per
+    boundary:
+
+    - segment 0 is verified on its own with
+      :func:`verify_signed_auth_audit_continuation` against the pre-trusted
+      ``key``, and every later segment against the ``new_key`` learned from
+      the rotation in front of it — a new signer is trusted only after the
+      preceding rotation passes :func:`verify_rotation`;
+    - before that hop, ``rotations[i]`` must be verified with
+      :func:`verify_rotation` against the currently trusted key, and its
+      checkpoints must join the two segments on every field: its ``old``
+      checkpoint must equal segment ``i``'s ``consistency.new`` and its
+      ``new`` checkpoint must equal segment ``i + 1``'s
+      ``consistency.old`` — version, hash name, size, root, head and the
+      Ed25519 signature itself — so the rotation authorizes exactly the
+      boundary between those two signed snapshots;
+    - every segment must extend a strictly smaller prefix, i.e. its
+      ``consistency.old.size`` must be less than its ``consistency.new.size``
+      (a zero-length segment never describes an append);
+    - neither a receipt nor a rotation may be repeated: a tuple element
+      equal to an earlier one of the same kind makes the result False.
+
+    A genuine, strictly growing chain whose every handoff is authorized by
+    the preceding key returns True. A non-tuple ``receipts`` or ``rotations``
+    (including a list, a generator or ``None``), a receipt of another type,
+    a rotation element of another type, or a ``key`` that is not ``bytes``
+    raises TypeError; an empty ``receipts`` tuple, a ``rotations`` tuple
+    whose length is not exactly ``len(receipts) - 1`` or a key that is not
+    32 bytes raises ValueError. Every other nested structural violation — a
+    rotation four-tuple of the wrong length, a wrongly typed or sized
+    rotation field, or any structural exception raised by
+    :func:`verify_signed_auth_audit_continuation` — propagates unchanged
+    from :func:`verify_rotation` /
+    :func:`verify_signed_auth_audit_continuation` (TypeError or
+    ValueError). Types and shapes being legal, any signature,
+    authorization, tag, inclusion proof, consistency proof, growth or
+    boundary-link mismatch returns False.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if not isinstance(rotations, tuple):
+        raise TypeError("rotations must be a tuple of rotation records")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    if len(rotations) != len(receipts) - 1:
+        raise ValueError(
+            "rotations must contain exactly one record per segment boundary "
+            f"({len(rotations)} given for {len(receipts)} segments)"
+        )
+    for receipt in receipts:
+        if not isinstance(receipt, SignedAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedAuthAuditContinuation"
+            )
+    # The raw four-tuples returned by rotate_signer have no dedicated class;
+    # check only their container type here, leaving length and element
+    # validation to verify_rotation, exactly as verify_rotation_chain does.
+    for rotation in rotations:
+        if not isinstance(rotation, tuple):
+            raise TypeError(
+                "each rotation must be a (old, new_key, new, auth) tuple"
+            )
+    # Pin the initial key to 32 bytes before the first use, exactly as
+    # verify_rotation and verify_rotation_chain pin every learned new_key.
+    _load_ed25519_public(key)
+    current_key = key
+    seen_receipts: set[SignedAuthAuditContinuation] = set()
+    seen_rotations: set[tuple] = set()
+    previous_new: SignedRoot | None = None
+    for index, receipt in enumerate(receipts):
+        if index > 0:
+            rotation = rotations[index - 1]
+            if rotation in seen_rotations:
+                return False
+            seen_rotations.add(rotation)
+            # The boundary rotation must be authorized by the key currently
+            # trusted — the pre-trusted key at the first boundary, otherwise
+            # the previous rotation's verified new_key — before that key may
+            # sign the following segment, and it must join exactly the two
+            # checkpoints that meet at this boundary (all six fields).
+            if not verify_rotation(rotation, current_key):
+                return False
+            if rotation[0] != previous_new:
+                return False
+            if rotation[2] != receipt.consistency.old:
+                return False
+            # verify_rotation succeeded and pinned new_key to 32 bytes: it is
+            # now the only signer trusted for the following segment.
+            current_key = rotation[1]
+        if receipt in seen_receipts:
+            return False
+        seen_receipts.add(receipt)
+        if not verify_signed_auth_audit_continuation(receipt, current_key):
+            return False
+        consistency = receipt.consistency
+        if not consistency.old.size < consistency.new.size:
             return False
         previous_new = consistency.new
     return True

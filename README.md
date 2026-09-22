@@ -1344,6 +1344,51 @@ verify_continuation_chain(restored, public_key)  # True：无需持有日志
   关联，结构合法但验真不匹配仍可解码，由 `verify_continuation_chain` 返回
   `False`；两个入口均只读且确定，旧接口和签名域不变
 
+#### 跨密钥续接链的轮换感知离线核验（Ed25519）
+
+`verify_continuation_chain` 要求每段都由同一预置公钥签发。顶层
+`verify_rotated_chain(receipts, rotations, key) -> bool` 是其**轮换感知扩展**：
+各段允许由**不同**签名者签发，段间由既有签名者轮换四元组衔接，离线方仅凭**一个**
+预置信任的 32 字节 Ed25519 公钥即可确认整条跨密钥历史仍为严格只追加。全程不持有
+日志、**不新增容器或线格式**、不新增任何签名原文（只复用
+`verify_signed_auth_audit_continuation` 与 `verify_rotation`），调用只读：
+
+```python
+from auditchain import verify_rotated_chain
+
+# 三段分别由 A、B、C 签发；段 i 与段 i+1 之间由一次 rotate_signer 衔接
+s0 = fresh_log().signed_auth_audit_continuation(0, (), seed_a, size=3)
+r0 = fresh_log().rotate_signer(seed_a, seed_b, 3)
+s1 = fresh_log().signed_auth_audit_continuation(3, (), seed_b, size=6)
+r1 = fresh_log().rotate_signer(seed_b, seed_c, 6)
+s2 = fresh_log().signed_auth_audit_continuation(6, (), seed_c, size=8)
+
+receipts = (s0, s1, s2)
+rotations = (r0, r1)          # 长度恰为段数减一：rotations[i] 连接第 i 段与后段
+verify_rotated_chain(receipts, rotations, public_a)  # True：只凭 public_a
+verify_rotated_chain(receipts, rotations, public_b)  # False：初始钥不受信任
+```
+
+- `receipts` 为**非空 tuple**，元素均为既有冻结
+  `SignedAuthAuditContinuation`；`rotations` 为 tuple，长度恰为段数减一，
+  第 i 项是连接第 i 段与后段的既有 `rotate_signer` 四元组。段 0 以预置 `key`
+  调用 `verify_signed_auth_audit_continuation`；在每处边界先以**当前信任钥**
+  调用 `verify_rotation`，成功后才信任该项的 `new_key`，并用它核验后段——新
+  签名者只有在前一把钥背书的轮换通过后才受信，信任逐跳转移，不跳序、不重排
+- 边界关联按**全字段**检查：第 i 个轮换的 `old` 必须等于前段
+  `consistency.new`，其 `new` 必须等于后段 `consistency.old`（`version`、
+  `hash_name`、`size`、`root`、`head` 及 Ed25519 签名本身全等），故轮换授权
+  的恰是这两个已签名快照之间的接缝。每段还须严格增长
+  （`consistency.old.size < consistency.new.size`）；tuple 中出现重复凭据或
+  重复轮换均返回 `False`
+- 类型与结构合法但任一签名、授权、标签、包含证明、一致性证明、严格增长或边界
+  关联不匹配，一律返回 `False`。`receipts` / `rotations` 非 `tuple`（含
+  list、生成器、`None`）或其元素类型错、`key` 非 `bytes` 抛 `TypeError`；
+  空链、`rotations` 长度不等于段数减一、`key` 非 32 字节抛 `ValueError`；
+  其余嵌套结构异常（四元组长度非 4、轮换字段类型/宽度错、凭据嵌套结构错）由
+  `verify_rotation` 与 `verify_signed_auth_audit_continuation` **原样传播**。
+  既有轮换及续接的编解码字节与所有旧接口均保持不变
+
 #### 续接链只读诊断：定位首个失败段或断裂边界（Ed25519）
 
 `verify_continuation_chain` 只回答“整条链是否成立”。顶层
@@ -2271,6 +2316,20 @@ python3 -m auditchain
   `consistency.old.size < consistency.new.size`，相邻段要求前段
   `consistency.new` 与后段 `consistency.old` 全字段相等（含签名本身）；重复段
   或任一关系不符返回 `False`
+- `verify_rotated_chain(receipts, rotations, key)` —
+  `verify_continuation_chain` 的轮换感知扩展（三参均无默认值）：各段允许由
+  不同签名者签发，段间由既有轮换四元组衔接，离线仅凭一个预置信任 32 字节
+  Ed25519 公钥确认跨密钥的严格只追加历史，只读、不新增容器或线格式。
+  `receipts` 为非空 `SignedAuthAuditContinuation` tuple，`rotations` 为长度
+  恰等于段数减一的 tuple（第 i 项连接第 i 段与后段）；段 0 以 `key`、后续段以
+  前一边界轮换验证通过后学到的 `new_key` 调用
+  `verify_signed_auth_audit_continuation`，每处边界先以当前信任钥调用
+  `verify_rotation`；第 i 个轮换的 `old` 须与前段 `consistency.new` 全字段
+  相等、`new` 须与后段 `consistency.old` 全字段相等；各段严格增长，重复凭据或
+  重复轮换返回 `False`。非 tuple、元素类型错或 `key` 非 `bytes` 抛
+  `TypeError`，空链、数量不符或 `key` 非 32 字节抛 `ValueError`，嵌套异常原样
+  传播；类型与结构合法但任一签名、授权、标签、包含/一致性证明或边界关联不匹配
+  返回 `False`；既有轮换及续接编解码字节和所有旧接口不变
 - `inspect_continuation_chain(receipts, public_key)` — `verify_continuation_chain`
   的只读诊断对应物，返回冻结
   `ContinuationChainReport(ok, index, code)` 定位**首个**失败段或断裂边界，

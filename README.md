@@ -1389,6 +1389,54 @@ verify_rotated_chain(receipts, rotations, public_b)  # False：初始钥不受�
   `verify_rotation` 与 `verify_signed_auth_audit_continuation` **原样传播**。
   既有轮换及续接的编解码字节与所有旧接口均保持不变
 
+#### 跨密钥续接链只读诊断：定位首个失败段、轮换或断裂接缝（Ed25519）
+
+`verify_rotated_chain` 只回答“整条跨密钥链是否成立”。顶层
+`inspect_rotated_chain(receipts, rotations, key) -> ContinuationChainReport`
+是它的**只读诊断对应物**：同样全程离线、不持有日志、**不新增签名域或线格式**
+（只复用既有 `verify_rotation` 与
+`verify_signed_auth_audit_continuation`）、不修改凭据、轮换或密钥，但返回冻结
+报告以**定位首个失败段、轮换或断裂接缝**——有效链返回
+`ContinuationChainReport(True, None, None)`，且永远只报告最早出现的那一个
+问题。三参均无默认值，输入形状与 `verify_rotated_chain` 完全相同：
+
+```python
+from auditchain import ContinuationChainReport, inspect_rotated_chain
+
+inspect_rotated_chain(receipts, rotations, public_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+inspect_rotated_chain(receipts, (other_rotation, r1), public_a)
+# ContinuationChainReport(ok=False, index=1, code='rotation_link')
+```
+
+- 诊断严格按输入顺序进行。第 0 段以预置 `key` 依次检查：先调用既有
+  `verify_signed_auth_audit_continuation`，失败报 `"verify"`（签名、标签或
+  证明不匹配是报告而非异常）；再查严格增长，
+  `consistency.old.size >= consistency.new.size`（等长段不描述任何追加）报
+  `"growth"`；再查重复（位置 0 不可能与更早凭据相等）
+- 每个位置 `i > 0` **先诊断边界、再诊断后段**，只报首错。边界按
+  `rotations[i-1]` 依次检查：与更早轮换全等报 `"rotation_duplicate"`；以
+  当前信任钥调用 `verify_rotation` 失败报 `"rotation"`；轮换的 `old` 未与
+  前段 `consistency.new`、或 `new` 未与后段 `consistency.old` 按**全部字段**
+  （`version`、`hash_name`、`size`、`root`、`head` 及 Ed25519 签名本身）
+  分别相等报 `"rotation_link"`。三关皆过后才把信任跳到该轮换验真过的
+  `new_key`，再以其按第 0 段同序检查第 i 段：`"verify"`、`"growth"`，随后
+  与更早凭据全等报 `"duplicate"`
+- 报告仍为冻结三字段 `ContinuationChainReport(ok, index, code)`，构造与
+  相等规则不变；合法码集合新增 `"rotation_duplicate"`、`"rotation"`、
+  `"rotation_link"` 三个（仅由 `inspect_rotated_chain` 报告）。三个轮换码的
+  `index` 一律取**后段位置** `i`（首边界即 `1`）；`"rotation_link"` 只标识
+  接缝、不归责其中任一侧
+- 调用前校验与 `verify_rotated_chain` 完全一致：`receipts` / `rotations`
+  非 `tuple`（含 list、生成器、`None`）或其元素类型错、`key` 非 `bytes`
+  抛 `TypeError`；空链、`rotations` 长度不等于段数减一、`key` 非 32 字节抛
+  `ValueError`；四元组长度非 4、轮换字段类型/宽度错或凭据嵌套结构错等
+  嵌套异常由 `verify_rotation` /
+  `verify_signed_auth_audit_continuation` **原样传播**。类型与结构合法但
+  任一验真、增长或接缝不匹配只生成失败报告、不抛异常。调用只读、确定，
+  既有核验与编解码接口、签名域均不变
+
 #### 续接链只读诊断：定位首个失败段或断裂边界（Ed25519）
 
 `verify_continuation_chain` 只回答“整条链是否成立”。顶层
@@ -2341,6 +2389,19 @@ python3 -m auditchain
   tuple 与 32 字节 `bytes` 公钥的类型/长度校验及嵌套异常传播规则与
   `verify_continuation_chain` 一致；不持有日志、不改凭据、不新增签名域，旧
   接口不变
+- `inspect_rotated_chain(receipts, rotations, key)` —
+  `verify_rotated_chain` 的只读诊断对应物（三参均无默认值，输入形状完全
+  相同），返回冻结 `ContinuationChainReport(ok, index, code)` 定位**首个**
+  失败段、轮换或断裂接缝，有效链为 `(True, None, None)`，只报最早问题：
+  第 0 段以 `key` 依次查验真、严格增长、重复；每个位置 `i > 0` 先依次查
+  `rotations[i-1]` 的重复（`"rotation_duplicate"`）、`verify_rotation`
+  验真（`"rotation"`）、与接缝两侧全字段相等（`"rotation_link"`），三关
+  过后才以其 `new_key` 按同序查第 i 段（`"verify"` / `"growth"` /
+  `"duplicate"`）；三个轮换码 `index` 均取后段位置，`"rotation_link"` 只
+  标识接缝不归责任一侧。非 tuple、元素类型错或 `key` 非 `bytes` 抛
+  `TypeError`，空链、轮换数量不符或 `key` 非 32 字节抛 `ValueError`，嵌套
+  异常原样传播，结构合法但不匹配仅生成失败报告；全程只读、不持有日志、不
+  新增签名域或线格式，既有接口不变
 - `inspect_anchors(receipts, key, start, end)` —
   `inspect_continuation_chain` 的端点锚定扩展（四参均无默认值）：先委托内部
   诊断，失败报告原样返回（四类首错顺序不变）；仅当链内部成立才比较锚点，

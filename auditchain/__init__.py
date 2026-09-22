@@ -2,17 +2,20 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
-SignedAuthAuditBundle /
+SignedAuthAuditBundle / AnchoredContinuationChain /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
-verify_audit_batch / inspect_continuation_chain / inspect_anchors / verify_signed_verifier / verify_signed_root /
+verify_audit_batch / inspect_continuation_chain / inspect_anchors /
+inspect_anchored_continuations / verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_auth_batch / decode_auth_batch /
+encode_continuations / decode_continuations /
+encode_anchored_continuations / decode_anchored_continuations /
 encode_signed_root / decode_signed_root /
 encode_signed_verifier / decode_signed_verifier /
 encode_signed_audit_batch / decode_signed_audit_batch /
@@ -49,6 +52,7 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 __all__ = [
+    "AnchoredContinuationChain",
     "AuditLog",
     "AuditReceipt",
     "AuthTag",
@@ -67,6 +71,7 @@ __all__ = [
     "SignedVerifier",
     "Verifier",
     "GENESIS_HASH",
+    "decode_anchored_continuations",
     "decode_audit_batch",
     "decode_audit_receipt",
     "decode_auth_batch",
@@ -89,6 +94,7 @@ __all__ = [
     "dump_pruned_log",
     "dump_secure_log",
     "dump_secure_pruned",
+    "encode_anchored_continuations",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_auth_batch",
@@ -103,6 +109,7 @@ __all__ = [
     "encode_signed_root",
     "encode_signed_verifier",
     "entry_digest",
+    "inspect_anchored_continuations",
     "inspect_anchors",
     "inspect_continuation_chain",
     "load_auth",
@@ -251,6 +258,17 @@ _SIGNED_AUTH_AUDIT_CONTINUATION_VERSION = 1
 # encode_signed_auth_audit_continuation output, with nothing else.
 _CONTINUATION_CHAIN_MAGIC = b"auditchain/cont-chain/v1\0"
 _CONTINUATION_CHAIN_VERSION = 1
+
+# Binary framing of encode_anchored_continuations /
+# decode_anchored_continuations: a fixed magic, then the envelope version as a
+# u64 and three u64-length-prefixed blobs — the complete canonical
+# encode_continuations bytes of the receipt tuple, followed by the
+# encode_signed_root bytes of the start and end anchors, in that order and
+# with nothing else. Persisting the two anchors beside the receipts lets the
+# exact chain span be restored in another process and re-checked offline with
+# inspect_anchored_continuations.
+_ANCHORED_CONTINUATION_MAGIC = b"auditchain/anchor/v1\0"
+_ANCHORED_CONTINUATION_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -1173,6 +1191,55 @@ class SignedAuthAuditContinuation:
             raise TypeError("bundle must be a SignedAuthAuditBundle")
         if not isinstance(self.consistency, SignedConsistency):
             raise TypeError("consistency must be a SignedConsistency")
+
+
+@dataclass(frozen=True)
+class AnchoredContinuationChain:
+    """A continuation chain persisted together with its exact anchor span.
+
+    Bundles the non-empty tuple of chained
+    :class:`SignedAuthAuditContinuation` receipts with the two
+    :class:`SignedRoot` checkpoints the chain spans — the first segment's
+    ``consistency.old`` (``start``) and the last segment's ``consistency.new``
+    (``end``) — so the continuation credentials and both anchors can be saved
+    to storage, restored in another process and re-checked entirely offline
+    by :func:`inspect_anchored_continuations` against the same pre-trusted
+    key:
+
+    - ``receipts``: the non-empty ``tuple`` of
+      :class:`SignedAuthAuditContinuation` segments, exactly as
+      :func:`encode_continuations` and :func:`inspect_anchors` consume them,
+    - ``start``: the :class:`SignedRoot` checkpoint the chain starts at,
+    - ``end``: the :class:`SignedRoot` checkpoint the chain ends at.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. Only the container shape is validated here: ``receipts``
+    must be a non-empty ``tuple`` of
+    :class:`SignedAuthAuditContinuation` objects, and ``start``/``end`` must
+    be :class:`SignedRoot` values, so a non-tuple, a wrong element type or a
+    non-:class:`SignedRoot` field raises TypeError and an empty tuple raises
+    ValueError; whether the receipts join, verify or actually meet the two
+    anchors is left to :func:`inspect_anchored_continuations`.
+    """
+
+    receipts: tuple
+    start: SignedRoot
+    end: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipts, tuple):
+            raise TypeError("receipts must be a non-empty tuple")
+        if len(self.receipts) == 0:
+            raise ValueError("receipts must be a non-empty tuple")
+        for receipt in self.receipts:
+            if not isinstance(receipt, SignedAuthAuditContinuation):
+                raise TypeError(
+                    "each receipt must be a SignedAuthAuditContinuation"
+                )
+        if not isinstance(self.start, SignedRoot):
+            raise TypeError("start must be a SignedRoot")
+        if not isinstance(self.end, SignedRoot):
+            raise TypeError("end must be a SignedRoot")
 
 
 # Diagnostic codes of inspect_continuation_chain and inspect_anchors, each
@@ -5417,7 +5484,7 @@ def inspect_continuation_chain(
 
 
 def inspect_anchors(
-    receipts: Any, public_key: Any, start: Any, end: Any
+    receipts: Any, key: Any, start: Any, end: Any
 ) -> ContinuationChainReport:
     """Diagnose whether a chain joins two expected snapshot checkpoints.
 
@@ -5452,13 +5519,13 @@ def inspect_anchors(
     A chain that is internally continuous and anchored at both ends reports
     ``ContinuationChainReport(True, None, None)``.
 
-    ``receipts``, ``public_key``, ``start`` and ``end`` are all required
+    ``receipts``, ``key``, ``start`` and ``end`` are all required
     and validated before the internal diagnosis runs: a non-tuple
     ``receipts`` (including a list, a generator or ``None``), an element
     that is not a :class:`SignedAuthAuditContinuation`, a non-``bytes``
-    ``public_key`` (including ``bytearray``) or a ``start``/``end`` that is
+    ``key`` (including ``bytearray``) or a ``start``/``end`` that is
     not a :class:`SignedRoot` raises TypeError, while an empty tuple or a
-    ``public_key`` of another length than 32 bytes raises ValueError.
+    ``key`` of another length than 32 bytes raises ValueError.
     Nested structural violations raised on a structurally illegal receipt
     propagate unchanged (TypeError or ValueError) exactly as in
     :func:`inspect_continuation_chain`.
@@ -5472,9 +5539,9 @@ def inspect_anchors(
             raise TypeError(
                 "each receipt must be a SignedAuthAuditContinuation"
             )
-    if not isinstance(public_key, bytes):
+    if not isinstance(key, bytes):
         raise TypeError("public_key must be a 32-byte Ed25519 public key")
-    if len(public_key) != _ED25519_KEY_BYTES:
+    if len(key) != _ED25519_KEY_BYTES:
         raise ValueError(
             f"public_key must be {_ED25519_KEY_BYTES} bytes "
             "(an Ed25519 public key)"
@@ -5487,7 +5554,7 @@ def inspect_anchors(
     # The internal chain diagnosis keeps its own first-failure order; only
     # an internally sound chain is ever compared against the anchors, start
     # before end.
-    report = inspect_continuation_chain(receipts, public_key)
+    report = inspect_continuation_chain(receipts, key)
     if not report.ok:
         return report
     if receipts[0].consistency.old != start:
@@ -5600,6 +5667,140 @@ def decode_continuations(data: Any) -> tuple:
     if offset != len(data):
         raise ValueError("trailing bytes after the continuation chain")
     return tuple(receipts)
+
+
+def encode_anchored_continuations(bundle: Any) -> bytes:
+    """Encode an :class:`AnchoredContinuationChain` into canonical bytes.
+
+    The byte stream is ``D || U(1) || B(C) || B(S) || B(E)`` with
+    ``D = b"auditchain/anchor/v1\\0"``, ``U`` an unsigned 8-byte big-endian
+    integer and ``B(x) = U(len(x)) || x``: the envelope ``version`` (always
+    1), then one length-prefixed blob per field — ``C`` is byte-for-byte the
+    complete canonical output of :func:`encode_continuations` over the
+    bundle's receipts, and ``S``/``E`` are the complete canonical outputs of
+    :func:`encode_signed_root` over ``bundle.start``/``bundle.end``, in that
+    order and with nothing else. The framing introduces no new signing
+    message and is read-only.
+
+    ``bundle`` must be an :class:`AnchoredContinuationChain` — anything else
+    raises TypeError — and a chain whose fields have been bypassed to wrong
+    types raises exactly the exceptions of its constructor or of
+    :func:`encode_continuations` / :func:`encode_signed_root` (TypeError or
+    ValueError), which propagate unchanged. Encoding is deterministic:
+    re-encoding a decoded bundle reproduces the original bytes exactly, so
+    the persisted bytes carry the continuation credentials together with
+    both anchors and can be restored wholesale in another process.
+    """
+    if not isinstance(bundle, AnchoredContinuationChain):
+        raise TypeError("bundle must be an AnchoredContinuationChain")
+    # Re-validate every field even for a bundle built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = AnchoredContinuationChain(
+        bundle.receipts, bundle.start, bundle.end
+    )
+    return b"".join((
+        _ANCHORED_CONTINUATION_MAGIC,
+        _encode_u64(_ANCHORED_CONTINUATION_VERSION, "version"),
+        _encode_blob(encode_continuations(checked.receipts)),
+        _encode_blob(encode_signed_root(checked.start)),
+        _encode_blob(encode_signed_root(checked.end)),
+    ))
+
+
+def decode_anchored_continuations(data: Any) -> AnchoredContinuationChain:
+    """Decode bytes produced by :func:`encode_anchored_continuations`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/anchor/v1\\0"`` it must contain, strictly in order, the
+    u64 envelope version (only ``1`` is supported) and exactly three
+    length-prefixed blobs consumed whole with no trailing bytes: the
+    :func:`encode_continuations` receipt chain, then the
+    :func:`encode_signed_root` start and end anchors. A bad magic or
+    version, truncation, an oversized blob length, trailing bytes or an
+    illegal nested encoding raises ValueError — the nested decoders'
+    exceptions (TypeError or ValueError, for example a structurally bad
+    receipt or anchor) propagate unchanged.
+
+    Signatures, proofs, adjacency and the anchor span itself are not checked
+    here — only :func:`inspect_anchored_continuations` confirms the restored
+    chain is internally continuous and meets both anchors. The returned
+    bundle compares equal to the originally encoded one by every field, and
+    re-encoding reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ANCHORED_CONTINUATION_MAGIC):
+        raise ValueError("not an auditchain anchored-continuation encoding")
+    offset = len(_ANCHORED_CONTINUATION_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ANCHORED_CONTINUATION_VERSION:
+        raise ValueError(
+            f"unsupported anchored-continuation version {version}"
+        )
+    chain_blob = read_blob("continuation chain")
+    start_blob = read_blob("start anchor")
+    end_blob = read_blob("end anchor")
+    if offset != len(data):
+        raise ValueError(
+            "trailing bytes after the anchored continuation chain"
+        )
+    # Each nested decoder sees its blob whole and in canonical form; their
+    # structural exceptions propagate unchanged.
+    receipts = decode_continuations(chain_blob)
+    start = decode_signed_root(start_blob)
+    end = decode_signed_root(end_blob)
+    return AnchoredContinuationChain(receipts, start, end)
+
+
+def inspect_anchored_continuations(
+    bundle: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose a persisted anchored chain against its span, offline.
+
+    The anchor-aware counterpart of :func:`inspect_continuation_chain` for a
+    restored :class:`AnchoredContinuationChain`: it holds neither the log
+    nor any checkpoint history, introduces no new Ed25519 or HMAC signing
+    domain and never mutates the bundle or the key. Diagnosis is delegated
+    wholesale to :func:`inspect_anchors` with the bundle's ``receipts``,
+    ``start`` and ``end``, so the report semantics — the internal codes
+    ``"verify"``, ``"growth"``, ``"duplicate"`` and ``"link"`` taking
+    precedence, then ``"start"`` at index ``0`` and ``"end"`` at the last
+    segment's position, success as
+    ``ContinuationChainReport(True, None, None)`` — are identical.
+
+    ``bundle`` must be an :class:`AnchoredContinuationChain` — anything else
+    raises TypeError — and ``key`` must be a 32-byte ``bytes`` Ed25519
+    public key: a non-``bytes`` value (including ``bytearray``) raises
+    TypeError and a ``bytes`` value of another length raises ValueError.
+    A bundle whose fields were bypassed to wrong types, an empty receipt
+    tuple or a nested structural violation propagates exactly the
+    TypeError/ValueError that :func:`inspect_anchors` would raise.
+    """
+    if not isinstance(bundle, AnchoredContinuationChain):
+        raise TypeError("bundle must be an AnchoredContinuationChain")
+    return inspect_anchors(bundle.receipts, key, bundle.start, bundle.end)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

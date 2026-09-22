@@ -2,6 +2,7 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
+SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
@@ -53,6 +54,7 @@ __all__ = [
     "IntegrityReport",
     "PruneReceipt",
     "SignedAuditBatch",
+    "SignedAuthAuditBundle",
     "SignedAuthBundle",
     "SignedConsistency",
     "SignedPrune",
@@ -65,6 +67,7 @@ __all__ = [
     "decode_auth_batch",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
+    "decode_signed_auth_audit_bundle",
     "decode_signed_auth_bundle",
     "decode_signed_consistency",
     "decode_signed_prune",
@@ -84,6 +87,7 @@ __all__ = [
     "encode_auth_batch",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
+    "encode_signed_auth_audit_bundle",
     "encode_signed_auth_bundle",
     "encode_signed_consistency",
     "encode_signed_prune",
@@ -106,6 +110,7 @@ __all__ = [
     "verify_consistency",
     "verify_inclusion",
     "verify_signed_audit_batch",
+    "verify_signed_auth_audit_bundle",
     "verify_signed_auth_bundle",
     "verify_signed_consistency",
     "verify_signed_prune",
@@ -203,6 +208,17 @@ _SIGNED_PRUNE_VERSION = 1
 # encode_auth_batch bytes, in that order and with nothing else.
 _SIGNED_AUTH_BUNDLE_MAGIC = b"auditchain/signed-auth-bundle/v1\0"
 _SIGNED_AUTH_BUNDLE_VERSION = 1
+
+# Binary framing of encode_signed_auth_audit_bundle /
+# decode_signed_auth_audit_bundle: a fixed magic, then the envelope version as
+# a u64 and two u64-length-prefixed blobs holding the complete canonical
+# encode_signed_auth_bundle and encode_signed_audit_batch bytes, in that order
+# and with nothing else. Unlike the signed-auth-bundle framing the two nested
+# packages do not name a common algorithm themselves: the audit side signs its
+# own snapshot, so the decoder additionally requires the auth bundle's hash
+# algorithm to equal the signed audit batch's algorithm.
+_SIGNED_AUTH_AUDIT_MAGIC = b"auditchain/auth-audit/v1\0"
+_SIGNED_AUTH_AUDIT_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -1038,6 +1054,46 @@ class SignedAuthBundle:
         _digest_size(self.hash_name)
         if not isinstance(self.items, tuple):
             raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
+
+
+@dataclass(frozen=True)
+class SignedAuthAuditBundle:
+    """Trusted delivery bundle of an auth bundle and a signed batch audit.
+
+    Merges the :class:`SignedAuthBundle` of
+    :meth:`AuditLog.signed_auth_bundle` with the :class:`SignedAuditBatch`
+    of :meth:`AuditLog.signed_audit_batch`, so an offline receiver holding
+    only a pre-trusted 32-byte Ed25519 public key gets — in one artifact —
+    both the forward-secure authentication of the selected entries and the
+    signed evidence that they belong to one snapshot:
+
+    - ``auth``: the :class:`SignedAuthBundle` carrying the signed stage-0
+      :class:`Verifier` and the selected ``(Entry, AuthTag)`` items,
+    - ``audit``: the :class:`SignedAuditBatch` carrying the selected
+      entries' batch inclusion proof and the signed snapshot checkpoint.
+
+    The two packages must be minted under one hash algorithm, and every
+    entry the auth package authenticates must be the very record the audit
+    package carries at the same absolute index; the audit package
+    additionally carries the snapshot's last entry (as every non-empty
+    batch receipt does). Whether all of that holds, and whether either
+    Ed25519 signature verifies, is left to
+    :func:`verify_signed_auth_audit_bundle`.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``auth`` must be a
+    :class:`SignedAuthBundle` and ``audit`` a :class:`SignedAuditBatch`, so
+    a field of the wrong type raises TypeError.
+    """
+
+    auth: SignedAuthBundle
+    audit: SignedAuditBatch
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.auth, SignedAuthBundle):
+            raise TypeError("auth must be a SignedAuthBundle")
+        if not isinstance(self.audit, SignedAuditBatch):
+            raise TypeError("audit must be a SignedAuditBatch")
 
 
 # Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
@@ -2218,6 +2274,89 @@ class AuditLog:
         batch = self.audit_batch(indices, size)
         checkpoint = self.sign_root(private_key, size)
         return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
+
+    def signed_auth_audit_bundle(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedAuthAuditBundle:
+        """Atomically issue a :class:`SignedAuthAuditBundle`.
+
+        The one-call fusion of :meth:`signed_auth_bundle` and
+        :meth:`signed_audit_batch`: it delivers the forward-secure tags and
+        signed stage-0 :class:`Verifier` of the selected entries together
+        with the signed batch audit of those same entries against one
+        snapshot, so the receiver gets authentication and snapshot evidence
+        as a single artifact. Both halves are built from the same validated
+        selection and the same ``size`` (defaulting to the current log
+        length): the audit half is exactly what
+        :meth:`signed_audit_batch` mints — it shares the snapshot's last
+        entry (index ``size - 1``) automatically even when ``indices`` does
+        not list it — and the auth half tags exactly the selected indices,
+        so it never gains a signing domain for that last entry. No new
+        signing message is introduced: the two embedded Ed25519 signatures
+        are byte-for-byte the ones :meth:`signed_auth_bundle` and
+        :meth:`signed_audit_batch` make.
+
+        ``indices`` must be an iterable of distinct non-bool integers each
+        satisfying ``retain_from <= index < size``; as with every batch
+        audit, an empty selection is accepted (the audit still carries the
+        last snapshot entry) and only the empty snapshot (``size == 0``)
+        yields an audit with no entries. ``private_key`` is a 32-byte
+        Ed25519 seed used for the two signatures and never stored. The
+        selection, seed, ``size`` and snapshot rebuildability are all
+        checked while building the read-only audit half, before the auth
+        half's one-shot signature and commit; the auth half then re-checks
+        stage capacity and the one-shot verifier-export eligibility. Either
+        way a failure consumes no export eligibility, never evolves the key
+        and leaves stored tags, entries and every other log object
+        untouched. On success the auth half consumes the one-shot export
+        and advances the stage exactly once per selected entry; the audit
+        half is read-only. A non-``bytes`` seed, a non-iterable
+        ``indices``, a non-integer/``bool`` index or a non-integer/``bool``
+        ``size`` raises TypeError; a seed that is not 32 bytes, duplicate
+        indices, a ``size`` outside ``0..len(log)``, an unrebuildable
+        snapshot, stage-capacity exhaustion, keyless mode, a non-zero stage
+        or a repeat export raises ValueError; an index outside the retained
+        snapshot range raises IndexError.
+        """
+        # Resolve and validate size exactly as audit_batch does: wrong type
+        # is TypeError, an out-of-range size ValueError, before the seed and
+        # the selection are touched.
+        size = self._resolve_size(size)
+        if isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        # Validate the selection against the snapshot range up front. The
+        # audit's automatic last entry is added only to the audit selection;
+        # the auth indices stay exactly the caller's distinct set, so the
+        # auth side never tags an entry the caller did not select.
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < size:
+                raise IndexError(
+                    f"no retained entry at index {index} in snapshot of size {size}"
+                )
+            selected.add(index)
+        # Build the read-only audit half first: it also re-checks the
+        # snapshot's rebuildability and adds size - 1 to the audit
+        # selection. It mutates nothing, so a failure here leaves the
+        # one-shot export and key state untouched.
+        audit = self.signed_audit_batch(tuple(sorted(selected)), private_key, size)
+        # signed_auth_bundle re-validates its own selection, seed, stage
+        # capacity and one-shot eligibility, then commits atomically; feed
+        # it exactly the caller's indices (without the audit's appended
+        # last entry), in any order — it sorts them itself.
+        auth = self.signed_auth_bundle(tuple(selected), private_key)
+        return SignedAuthAuditBundle(auth=auth, audit=audit)
 
     def signed_consistency(
         self,
@@ -4501,6 +4640,185 @@ def decode_signed_auth_bundle(data: Any) -> SignedAuthBundle:
             "auth batch hash_name does not match the signed verifier"
         )
     return SignedAuthBundle(verifier=verifier, hash_name=hash_name, items=items)
+
+
+def verify_signed_auth_audit_bundle(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedAuthAuditBundle` against a pre-trusted Ed25519 key.
+
+    Confirms the whole trusted-delivery bundle entirely offline, without
+    holding the log, in four steps:
+
+    1. :func:`verify_signed_verifier` checks the nested
+       :class:`SignedVerifier` signature with the 32-byte
+       ``public_key`` (explicitly, so even an empty auth selection cannot
+       pass vacuously), and :func:`verify_auth_batch` must return ``True``
+       at every item position;
+    2. :func:`verify_signed_audit_batch` verifies the signed batch audit —
+       its shared inclusion proof, its checkpoint signature and its
+       snapshot linkage;
+    3. both packages must name one hash algorithm: the auth bundle's
+       ``hash_name``, its signed verifier's algorithm and the audit
+       batch's ``hash_name`` must all agree;
+    4. every entry the auth package authenticates must be byte-for-byte
+       the :class:`Entry` the audit package carries at the same absolute
+       index (the audit package normally also carries the snapshot's last
+       entry, which the auth package need not tag).
+
+    A genuine bundle from the trusted key returns True; a structurally
+    valid bundle signed by another key, whose two packages disagree on the
+    algorithm or snapshot, whose entries differ at a shared index, or
+    whose signatures, tags, proof or entries have been altered returns
+    False. Input that is not a :class:`SignedAuthAuditBundle` (or whose
+    container fields have been bypassed to wrong types) raises TypeError;
+    nested structural violations raise exactly the exceptions of
+    :func:`verify_signed_auth_bundle` and
+    :func:`verify_signed_audit_batch` (TypeError or ValueError), and a
+    public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedAuthAuditBundle):
+        raise TypeError("bundle must be a SignedAuthAuditBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuthAuditBundle(bundle.auth, bundle.audit)
+
+    # Check the signed stage-0 verifier explicitly as well: with an empty
+    # auth selection verify_signed_auth_bundle reports an empty tuple, whose
+    # all() would otherwise pass vacuously.
+    if not verify_signed_verifier(checked.auth.verifier, public_key):
+        return False
+    if not all(verify_signed_auth_bundle(checked.auth, public_key)):
+        return False
+    if not verify_signed_audit_batch(checked.audit, public_key):
+        return False
+
+    auth = checked.auth
+    audit = checked.audit
+    audit_hash_name, _audit_size, _root, audit_entries, _proof = audit.batch
+    # The two packages must be minted under one hash algorithm. The
+    # verifier/audit equalities also cover the empty-selection cases that
+    # never carry per-item evidence.
+    if auth.hash_name != auth.verifier.verifier.hash_name:
+        return False
+    if auth.hash_name != audit_hash_name:
+        return False
+
+    # Every authenticated entry must be exactly the record the audit
+    # package carries at the same absolute index. verify_audit_batch has
+    # already guaranteed the audit entries are distinct and ascending, so a
+    # dict loses no correspondence. Entry equality covers the index (the
+    # lookup key) and all three byte fields.
+    audit_by_index = {entry.index: entry for entry in audit_entries}
+    for entry, _tag in auth.items:
+        if audit_by_index.get(entry.index) != entry:
+            return False
+    return True
+
+
+def encode_signed_auth_audit_bundle(x: Any) -> bytes:
+    """Encode a :class:`SignedAuthAuditBundle` into its canonical binary form.
+
+    The byte stream is ``D || U(1) || B(A) || B(M)`` with
+    ``D = b"auditchain/auth-audit/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the auth blob and the audit blob — nothing
+    may be omitted, reordered or appended. ``A`` is the complete canonical
+    output of :func:`encode_signed_auth_bundle` over ``x.auth`` and ``M``
+    the complete canonical output of :func:`encode_signed_audit_batch` over
+    ``x.audit``. No new signing message is introduced: encoding is
+    read-only and only re-uses the existing canonical encodings.
+
+    ``x`` must be a :class:`SignedAuthAuditBundle` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_signed_auth_bundle` and
+    :func:`encode_signed_audit_batch` (TypeError or ValueError). Encoding
+    is deterministic: re-encoding a decoded bundle reproduces the original
+    bytes exactly, and a structurally valid bundle whose signatures or tags
+    do not match encodes just as well.
+    """
+    if not isinstance(x, SignedAuthAuditBundle):
+        raise TypeError("x must be a SignedAuthAuditBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuthAuditBundle(x.auth, x.audit)
+    auth_blob = encode_signed_auth_bundle(checked.auth)
+    audit_blob = encode_signed_audit_batch(checked.audit)
+    return b"".join((
+        _SIGNED_AUTH_AUDIT_MAGIC,
+        _encode_u64(_SIGNED_AUTH_AUDIT_VERSION, "version"),
+        _encode_blob(auth_blob),
+        _encode_blob(audit_blob),
+    ))
+
+
+def decode_signed_auth_audit_bundle(data: Any) -> SignedAuthAuditBundle:
+    """Decode bytes produced by :func:`encode_signed_auth_audit_bundle`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/auth-audit/v1\\0"`` it must contain, strictly in order,
+    the u64 envelope version (only ``1`` is supported), one
+    length-prefixed auth blob and one length-prefixed audit blob, with no
+    trailing bytes. Each blob is handed whole to the existing decoder —
+    :func:`decode_signed_auth_bundle` and
+    :func:`decode_signed_audit_batch` respectively — so every nested
+    framing and structural rule is theirs, and the auth bundle's hash
+    algorithm must equal the audit batch's algorithm. A bad magic or
+    version, truncation, an oversized blob length, trailing bytes, an
+    illegal nested encoding or a hash algorithm disagreement between the
+    two packages raises ValueError.
+
+    The returned object is a frozen :class:`SignedAuthAuditBundle` whose
+    fields equal the originally encoded ones, and re-encoding reproduces
+    the original bytes exactly. A structurally sound encoding whose
+    signatures or tags simply do not verify still decodes;
+    :func:`verify_signed_auth_audit_bundle` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_AUTH_AUDIT_MAGIC):
+        raise ValueError("not an auditchain auth-audit encoding")
+    offset = len(_SIGNED_AUTH_AUDIT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_AUTH_AUDIT_VERSION:
+        raise ValueError(f"unsupported auth-audit version {version}")
+    auth_blob = read_blob("auth bundle")
+    audit_blob = read_blob("signed audit batch")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the auth-audit bundle")
+    # Decode both nested blobs with their existing decoders; their own
+    # magic, version, truncation/trailing-byte and structural checks apply
+    # verbatim (the auth decoder also pins its verifier algorithm).
+    auth = decode_signed_auth_bundle(auth_blob)
+    audit = decode_signed_audit_batch(audit_blob)
+    # The two packages must be minted under one hash algorithm.
+    if auth.hash_name != audit.batch[0]:
+        raise ValueError(
+            "signed audit batch hash_name does not match the auth bundle"
+        )
+    return SignedAuthAuditBundle(auth=auth, audit=audit)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

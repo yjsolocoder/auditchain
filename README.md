@@ -1134,6 +1134,40 @@ verify_signed_auth_audit_continuation(cont, other_key)  # False：未信任的�
   `SignedAuthAuditContinuation`（含绕过冻结构造器写入的容器字段类型错）抛
   `TypeError`，嵌套结构非法与公钥长度错沿用既有 `TypeError` / `ValueError`；
   调用只读，旧接口不变
+- `encode_signed_auth_audit_continuation(receipt)` /
+  `decode_signed_auth_audit_continuation(data)` 把整个跨快照续接凭据序列化为
+  只读、确定的规范二进制并原样还原，使续接凭据可落盘、跨进程恢复后继续凭预置
+  信任的 Ed25519 公钥离线验真，且不引入任何新的签名域：
+
+```python
+from auditchain import (
+    decode_signed_auth_audit_continuation,
+    encode_signed_auth_audit_continuation,
+)
+
+data = encode_signed_auth_audit_continuation(cont)       # bytes，可写文件/发网络
+restored = decode_signed_auth_audit_continuation(data)  # 冻结续接凭据
+restored == cont                                        # True：字段相等
+encode_signed_auth_audit_continuation(restored) == data # True：重编码逐字节相同
+verify_signed_auth_audit_continuation(restored, public_key)  # True：无需持有日志
+```
+
+  字节流严格为 `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/auth-audit-continuation/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；`A` 须逐字节等于
+  `encode_signed_auth_audit_bundle(bundle)` 的完整输出，`C` 为
+  `encode_signed_consistency(consistency)` 的完整输出，顺序固定为认证审计包在
+  前、一致性凭据在后，解码精确消费两个 blob 且**禁止尾随字节**，分别原样交给
+  `decode_signed_auth_audit_bundle` 与 `decode_signed_consistency`，嵌套异常
+  沿用对应既有编解码器。`encode_signed_auth_audit_continuation` 只接受
+  `SignedAuthAuditContinuation`（其余类型抛 `TypeError`，含绕过冻结构造器写入
+  的字段类型错），`decode_signed_auth_audit_continuation` 只接受 `bytes`
+  （含拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、长度、嵌套格式或
+  尾随非法均抛 `ValueError`；编解码不校验签名、标签、证明内容及 `new` 检查点
+  与审计检查点的关联，结构合法但验真不匹配仍可解码，
+  `verify_signed_auth_audit_continuation` 返回 `False`；冻结
+  `SignedAuthAuditContinuation(bundle, consistency)` 仍按字段相等，保留位置
+  构造及字段顺序，旧接口和签名域不变
 
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
@@ -1801,6 +1835,24 @@ python3 -m auditchain
   相同；编解码不校验签名与标签，结构合法但签名或标签不匹配仍可解码
   （`verify_signed_auth_bundle` 逐项返回 `False`）；编码携带明文验证密钥，须像
   裸 `Verifier` 一样保护；两个入口均为只读且确定
+- `encode_signed_auth_audit_continuation(receipt)` /
+  `decode_signed_auth_audit_continuation(data)` — 跨快照认证审计续接凭据的
+  规范二进制编码与解码，使 `SignedAuthAuditContinuation` 可落盘、跨进程恢复后
+  继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名域：字节流严格为
+  `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/auth-audit-continuation/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；`A` 须逐字节等于
+  `encode_signed_auth_audit_bundle(bundle)` 的完整输出，`C` 为
+  `encode_signed_consistency(consistency)` 的完整输出，认证审计包在前、一致性
+  凭据在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有
+  `decode_signed_auth_audit_bundle` 与 `decode_signed_consistency`，嵌套异常
+  沿用对应既有编解码器。前者只接受 `SignedAuthAuditContinuation`（其余类型抛
+  `TypeError`，含绕过冻结构造器写入的字段类型错），后者只接受 `bytes`（拒绝
+  `bytearray` / `memoryview`）；魔数、版本、截断、blob 长度、尾随或任一嵌套
+  格式非法抛 `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码
+  不校验签名、标签、证明内容及两部分的快照关联，结构合法但验真不匹配仍可解码
+  （`verify_signed_auth_audit_continuation` 返回 `False`）；两个入口均为只读
+  且确定，旧接口和签名域不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

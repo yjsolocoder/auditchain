@@ -12,6 +12,7 @@ inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 verify_rotation /
+verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -22,6 +23,8 @@ encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
+encode_rotation / decode_rotation /
+encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
@@ -80,6 +83,7 @@ __all__ = [
     "decode_continuations",
     "decode_prune_receipt",
     "decode_rotation",
+    "decode_rotations",
     "decode_signed_audit_batch",
     "decode_signed_auth_audit_bundle",
     "decode_signed_auth_audit_continuation",
@@ -104,6 +108,7 @@ __all__ = [
     "encode_continuations",
     "encode_prune_receipt",
     "encode_rotation",
+    "encode_rotations",
     "encode_signed_audit_batch",
     "encode_signed_auth_audit_bundle",
     "encode_signed_auth_audit_continuation",
@@ -135,6 +140,7 @@ __all__ = [
     "verify_continuation_chain",
     "verify_inclusion",
     "verify_rotation",
+    "verify_rotation_chain",
     "verify_signed_audit_batch",
     "verify_signed_auth_audit_bundle",
     "verify_signed_auth_audit_continuation",
@@ -216,6 +222,13 @@ _ROTATION_VERSION = 0x01
 # checkpoint and the 64-byte old-key authorization — with nothing else.
 _ROTATION_RECORD_MAGIC = b"auditchain/signer-rotation-record/v1\0"
 _ROTATION_RECORD_VERSION = 1
+
+# Binary framing of encode_rotations / decode_rotations: a fixed magic, then
+# the envelope version as a u64, the non-zero record count as a u64 and one
+# u64-length-prefixed blob per rotate_signer four-tuple, each blob holding the
+# complete canonical encode_rotation bytes — with nothing else.
+_ROTATION_CHAIN_MAGIC = b"auditchain/rotation-chain/v1\0"
+_ROTATION_CHAIN_VERSION = 1
 
 # Signed stage-0 verifier of AuditLog.export_signed_verifier /
 # verify_signed_verifier. An Ed25519 signature over the verifier's hash
@@ -4794,6 +4807,152 @@ def decode_rotation(data: Any) -> tuple[SignedRoot, bytes, SignedRoot, bytes]:
     old = decode_signed_root(old_blob)
     new = decode_signed_root(new_blob)
     return old, new_key, new, auth
+
+
+def verify_rotation_chain(items: Any, key: Any) -> bool:
+    """Verify an ordered, non-empty tuple of signer rotations offline.
+
+    ``items`` must be a non-empty ``tuple`` whose elements are the
+    ``(old, new_key, new, auth)`` four-tuples returned by
+    :meth:`AuditLog.rotate_signer`, kept in the caller's order, and ``key``
+    is the pre-trusted 32-byte Ed25519 public key of the very first signer.
+    The records are examined strictly in tuple order with
+    :func:`verify_rotation`: the first record is checked against ``key`` and
+    every later record against the preceding record's ``new_key`` — the
+    signer learned from one record is the only signer trusted to authorize
+    the next, so trust hops from key to final ``new_key`` exactly in order.
+    No record may be repeated: a four-tuple equal to an earlier one makes
+    the result False. Nothing is skipped, reordered or altered.
+
+    The check holds neither the log nor any checkpoint history and
+    introduces no new signing message of its own — it only re-uses
+    :func:`verify_rotation`, and it never mutates the items or the key. A
+    genuine chain returns True; a record that fails
+    :func:`verify_rotation` or a repeated record returns False. A non-tuple
+    (including a list, a generator or ``None``) or an element of the wrong
+    type raises TypeError, an empty tuple or a four-tuple whose length is
+    not 4 raises ValueError, and a key that is not 32 ``bytes`` raises
+    exactly as :func:`verify_rotation` does (TypeError for non-``bytes``,
+    ValueError for another length); every other nested structural
+    violation propagates from :func:`verify_rotation` unchanged.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple of rotation records")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple of rotation records")
+    # Pin the initial key to 32 bytes before the first use, exactly as
+    # verify_rotation pins every learned new_key, so a malformed anchor key
+    # raises identically whether or not the chain happens to be examined.
+    _load_ed25519_public(key)
+    current_key = key
+    seen: set[tuple] = set()
+    for item in items:
+        if item in seen:
+            return False
+        if not verify_rotation(item, current_key):
+            return False
+        seen.add(item)
+        # The verified record vouches for its new_key; it is the only key
+        # trusted to authorize the following record.
+        current_key = item[1]
+    return True
+
+
+def encode_rotations(items: Any) -> bytes:
+    """Encode a non-empty tuple of rotation four-tuples into canonical bytes.
+
+    The byte stream is ``D || U(1) || U(n) || B(R1) … B(Rn)`` with
+    ``D = b"auditchain/rotation-chain/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer, ``B(x) = U(len(x)) || x`` and ``n`` the non-zero
+    record count: the envelope ``version`` (always 1), then the count, then
+    one length-prefixed blob per rotation four-tuple in the tuple's own
+    order — nothing may be omitted, reordered or appended. Each ``Ri`` is
+    byte-for-byte the complete canonical output of :func:`encode_rotation`
+    over ``items[i]``; the framing introduces no new signing message and is
+    read-only.
+
+    ``items`` must be a non-empty ``tuple`` — a non-tuple raises TypeError
+    and an empty tuple raises ValueError. Element types and widths are
+    checked by :func:`encode_rotation`, so a malformed record raises
+    exactly its exceptions (TypeError or ValueError). Encoding is
+    deterministic: re-encoding a decoded tuple reproduces the original
+    bytes exactly, and a structurally valid chain whose signatures do not
+    verify encodes just as well.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple of rotation records")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple of rotation records")
+    parts = [
+        _ROTATION_CHAIN_MAGIC,
+        _encode_u64(_ROTATION_CHAIN_VERSION, "version"),
+        _encode_u64(len(items), "record count"),
+    ]
+    for item in items:
+        parts.append(_encode_blob(encode_rotation(item)))
+    return b"".join(parts)
+
+
+def decode_rotations(data: Any) -> tuple:
+    """Decode bytes produced by :func:`encode_rotations`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/rotation-chain/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the non-zero
+    u64 record count ``n`` and exactly ``n`` length-prefixed blobs, each
+    consumed whole with no trailing bytes. Every blob is handed whole to
+    :func:`decode_rotation`, so its magic, version, key and auth widths,
+    truncation/trailing-byte framing and nested signed-root rules all apply
+    verbatim. A bad magic or version, a zero count, truncation, an
+    oversized blob length, trailing bytes, an illegal key length or an
+    illegal nested record encoding raises ValueError.
+
+    Signatures and the cryptographic hop between records are not checked
+    here — only :func:`verify_rotation_chain` confirms the records join
+    into one authorized key-handoff sequence. The returned tuple
+    preserves the encoded order, its elements equal the originally
+    encoded four-tuples, and re-encoding reproduces the original bytes
+    exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ROTATION_CHAIN_MAGIC):
+        raise ValueError("not an auditchain rotation-chain encoding")
+    offset = len(_ROTATION_CHAIN_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ROTATION_CHAIN_VERSION:
+        raise ValueError(f"unsupported rotation-chain version {version}")
+    count = read_u64("record count")
+    if count == 0:
+        raise ValueError("rotation chain must contain at least one record")
+    items = []
+    for position in range(count):
+        blob = read_blob(f"rotation record {position}")
+        items.append(decode_rotation(blob))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the rotation chain")
+    return tuple(items)
 
 
 def encode_signed_verifier(receipt: Any) -> bytes:

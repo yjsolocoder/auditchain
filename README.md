@@ -402,6 +402,51 @@ verify_rotation(restored, old_public)   # True：无需持有日志
   相等且重编码逐字节相同，结构合法但验真失败仍可解码（`verify_rotation` 返回
   `False`）；两个入口均为只读
 
+### 多跳签名者信任链（逐跳转移）
+
+`verify_rotation_chain` 让只持**初始预置信任公钥**的离线方按顺序核验若干既有轮换
+记录，确认信任逐跳转移到最终签名者：全程不持有日志、不新增签名原文，仅顺序复用
+`verify_rotation`。`encode_rotations` / `decode_rotations` 把非空轮换四元组元组
+整体序列化落盘：
+
+```python
+from auditchain import verify_rotation_chain, encode_rotations, decode_rotations
+
+# items 为非空 tuple，每项都是 rotate_signer 返回的四元组
+r1 = log.rotate_signer(seed_a, seed_b, size=2)
+r2 = log.rotate_signer(seed_b, seed_c, size=3)
+items = (r1, r2)
+verify_rotation_chain(items, public_a)   # True：首项凭 public_a，次项凭 r1.new_key
+verify_rotation_chain(items, public_b)   # False：初始钥不是首项旧钥
+
+data = encode_rotations(items)            # bytes，可写文件/发网络
+restored = decode_rotations(data)         # 非空 tuple，保序还原
+restored == items                          # True
+encode_rotations(restored) == data         # True：重编码逐字节相同
+verify_rotation_chain(restored, public_a)  # True：无需持有日志
+```
+
+- `verify_rotation_chain(items, key)` 严格按元组顺序逐跳核验：首项以初始公钥
+  `key`（32 字节）调用 `verify_rotation`，后续每项以前一项的 `new_key` 调用——
+  一条记录背书的新钥是唯一有权授权下一条记录的签名者，信任从初始钥逐跳转移到
+  最终 `new_key`。任一记录验真失败返回 `False`；记录重复（与此前某项相等的四元
+  组）返回 `False`；不得跳过、重排或改动输入，全部通过才返回 `True`。`items` 非
+  `tuple`（含 list / 生成器 / `None`）抛 `TypeError`，空元组抛 `ValueError`；
+  初始钥与嵌套结构的异常沿用 `verify_rotation`（非 `bytes` 抛 `TypeError`，长度
+  非 32 或四元组长度非 4 等抛 `ValueError`）；调用只读，从不修改任何记录或密钥
+- 字节流为 `D || U(1) || U(n) || B(R1) … B(Rn)`，其中
+  `D = b"auditchain/rotation-chain/v1\0"`、`n > 0` 为记录数，`U` 为 8 字节无符号
+  大端整数、`B(x) = U(len(x)) || x`；每个 `Ri` 逐字节等于
+  `encode_rotation(items[i])` 的完整输出，解码逐项交给既有 `decode_rotation`，
+  框架本身不引入任何签名原文且只读
+- `encode_rotations` 只接受非空 `tuple`（非 `tuple` 抛 `TypeError`，空元组抛
+  `ValueError`），元素结构错误原样传播 `encode_rotation` 的 `TypeError` /
+  `ValueError`；`decode_rotations` 只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`，否则抛 `TypeError`）。空链（`n == 0`）、密钥长度、魔数、版本、
+  截断、blob 长度、嵌套记录格式或尾随非法均抛 `ValueError`；解码保序、逐字段
+  相等且重编码逐字节相同，结构合法但跳间接驳失败、记录重复或验真不匹配仍可解码
+  （`verify_rotation_chain` 返回 `False`）
+
 ### 可信紧凑批量审计包（Ed25519）
 
 `signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
@@ -2067,6 +2112,27 @@ python3 -m auditchain
   嵌套格式非法抛 `ValueError`；解码四元组字段相等且重编码逐字节相同；编解码不
   校验签名与新旧检查点关联，结构合法但验真不匹配仍可解码（`verify_rotation`
   返回 `False`）；两个入口均为只读且确定
+- `verify_rotation_chain(items, key)` — 凭初始预置信任的 32 字节 Ed25519
+  公钥 `key`，按顺序离线核验非空 `tuple` 中若干 `rotate_signer` 四元组，确认
+  信任逐跳转移、无需持有日志：严格按元组顺序，首项以 `key`、后续各项以前一项的
+  `new_key` 调用 `verify_rotation`，不跳过、不重排、不改写；任一记录验真失败
+  或记录重复（四元组相等）返回 `False`，全部通过返回 `True`。`items` 非 `tuple`
+  抛 `TypeError`，空元组抛 `ValueError`；密钥与嵌套记录的类型 / 长度 / 结构错误
+  沿用 `verify_rotation` 的既有 `TypeError` / `ValueError`；不新增签名原文，
+  调用只读
+- `encode_rotations(items)` / `decode_rotations(data)` — 非空轮换四元组元组的
+  规范二进制编码与解码，使多跳信任链可落盘、跨进程恢复后继续由
+  `verify_rotation_chain` 离线逐跳核验，且不新增签名原文：字节流严格为
+  `D || U(1) || U(n) || B(R1) … B(Rn)`，其中
+  `D = b"auditchain/rotation-chain/v1\0"`、`n > 0`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；每个 `Ri` 是既有 `encode_rotation(items[i])`
+  的完整规范字节，解码逐项交给既有 `decode_rotation`，禁止省略、换序或尾随字段。
+  前者只接受非空 `tuple`（非 `tuple` 抛 `TypeError`，空元组抛 `ValueError`，
+  嵌套记录非法沿用 `encode_rotation` 的 `TypeError` / `ValueError`），后者只
+  接受 `bytes`（拒绝 `bytearray` / `memoryview`）；空链、魔数、版本、`n == 0`、
+  截断、blob 长度、嵌套记录格式或尾随非法抛 `ValueError`；解码保序、字段相等且
+  重编码逐字节相同；编解码不校验签名与跳间接驳，结构合法但验真不匹配、断链或
+  重复仍可解码（`verify_rotation_chain` 返回 `False`）；两个入口均为只读且确定
 - `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
   Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
   无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）

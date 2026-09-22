@@ -7,7 +7,8 @@ SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
-verify_audit_batch / inspect_continuation_chain / inspect_anchors /
+verify_audit_batch / inspect_continuation_chain / inspect_rotated_chain /
+inspect_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
@@ -122,6 +123,7 @@ __all__ = [
     "inspect_anchored_continuations",
     "inspect_anchors",
     "inspect_continuation_chain",
+    "inspect_rotated_chain",
     "load_auth",
     "load_hybrid",
     "load_log",
@@ -1305,6 +1307,11 @@ class AnchoredContinuationChain:
 # equal the following package's start anchor, so the separately landed
 # packages cannot be spliced into one chain; its index is the global
 # position, across every package, of the later package's first receipt.
+# "rotation_duplicate", "rotation" and "rotation_link" are reported by
+# inspect_rotated_chain only: a boundary repeats an earlier rotation, the
+# boundary rotation fails verify_rotation against the currently trusted key,
+# or its two checkpoints do not join the segments on both sides on every
+# field; each carries the position of the following segment.
 _CHAIN_CODE_VERIFY = "verify"
 _CHAIN_CODE_GROWTH = "growth"
 _CHAIN_CODE_DUPLICATE = "duplicate"
@@ -1312,6 +1319,9 @@ _CHAIN_CODE_LINK = "link"
 _CHAIN_CODE_START = "start"
 _CHAIN_CODE_END = "end"
 _CHAIN_CODE_ANCHOR_LINK = "anchor_link"
+_CHAIN_CODE_ROTATION_DUPLICATE = "rotation_duplicate"
+_CHAIN_CODE_ROTATION = "rotation"
+_CHAIN_CODE_ROTATION_LINK = "rotation_link"
 _CHAIN_CODES = frozenset(
     {
         _CHAIN_CODE_VERIFY,
@@ -1321,6 +1331,9 @@ _CHAIN_CODES = frozenset(
         _CHAIN_CODE_START,
         _CHAIN_CODE_END,
         _CHAIN_CODE_ANCHOR_LINK,
+        _CHAIN_CODE_ROTATION_DUPLICATE,
+        _CHAIN_CODE_ROTATION,
+        _CHAIN_CODE_ROTATION_LINK,
     }
 )
 
@@ -1347,14 +1360,20 @@ class ContinuationChainReport:
       for ``"start"`` and the last segment's position for ``"end"``;
       ``None`` exactly when ``ok`` is ``True``;
     - ``code``: one of ``"verify"``, ``"growth"``, ``"duplicate"``,
-      ``"link"``, ``"start"``, ``"end"`` or ``"anchor_link"`` describing
-      that first failure; ``None`` exactly when ``ok`` is ``True``. A
-      ``"link"`` code identifies the boundary only and blames neither
-      segment. ``"start"`` and ``"end"`` are reported by
+      ``"link"``, ``"start"``, ``"end"``, ``"anchor_link"``,
+      ``"rotation_duplicate"``, ``"rotation"`` or ``"rotation_link"``
+      describing that first failure; ``None`` exactly when ``ok`` is
+      ``True``. A ``"link"`` code identifies the boundary only and blames
+      neither segment. ``"start"`` and ``"end"`` are reported by
       :func:`inspect_anchors` only, and ``"anchor_link"`` — a boundary at
       which two separately persisted packages fail to join, its ``index``
       the global receipt position of the later package's first receipt — by
-      :func:`inspect_anchor_set` only.
+      :func:`inspect_anchor_set` only. ``"rotation_duplicate"``,
+      ``"rotation"`` and ``"rotation_link"`` are reported by
+      :func:`inspect_rotated_chain` only — a boundary repeating an earlier
+      rotation, a rotation failing :func:`verify_rotation`, or its
+      checkpoints failing to join the segments on both sides — each with the
+      position of the following segment.
 
     Reports are immutable, may be built positionally and compare by all three
     fields. The success report is ``ContinuationChainReport(True, None, None)``.
@@ -1382,7 +1401,8 @@ class ContinuationChainReport:
             raise ValueError(
                 f"unknown chain code {self.code!r}; expected one of "
                 "'verify', 'growth', 'duplicate', 'link', 'start', 'end', "
-                "'anchor_link'"
+                "'anchor_link', 'rotation_duplicate', 'rotation', "
+                "'rotation_link'"
             )
         if not isinstance(self.index, int) or isinstance(self.index, bool):
             raise TypeError("index must be an integer or None")
@@ -6011,6 +6031,140 @@ def verify_rotated_chain(receipts: Any, rotations: Any, key: Any) -> bool:
             return False
         previous_new = consistency.new
     return True
+
+
+def inspect_rotated_chain(
+    receipts: Any, rotations: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose a rotated continuation chain, locating its first failure.
+
+    The read-only diagnostic counterpart of :func:`verify_rotated_chain`: an
+    offline party holding only one pre-trusted 32-byte Ed25519 public key
+    gets more than the bare bool — a frozen :class:`ContinuationChainReport`
+    locating the **first** failed segment or rotation boundary. Like
+    :func:`verify_rotated_chain` it holds neither the log nor any checkpoint
+    history, introduces no new signing message or wire format (it only reuses
+    :func:`verify_signed_auth_audit_continuation` and :func:`verify_rotation`)
+    and never mutates the receipts, the rotations or the key. A genuine
+    strictly growing chain whose every handoff is authorized reports
+    ``ContinuationChainReport(True, None, None)`` and only the earliest
+    problem is ever reported.
+
+    ``receipts`` and ``rotations`` have exactly the shapes accepted by
+    :func:`verify_rotated_chain`: a non-empty ``tuple`` of
+    :class:`SignedAuthAuditContinuation` segments in chain order and a
+    ``tuple`` of ``(old, new_key, new, auth)`` rotation four-tuples whose
+    length is exactly one less, ``rotations[i]`` connecting segment ``i`` to
+    segment ``i + 1``. They are examined strictly in tuple order, trust
+    hopping at most once per boundary:
+
+    - segment 0 is checked against the pre-trusted ``key``; every later
+      position ``i`` first examines ``rotations[i - 1]`` and only then
+      examines segment ``i`` against the rotation's verified ``new_key``;
+    - within a segment, in this order, verification with
+      :func:`verify_signed_auth_audit_continuation` against the key currently
+      trusted fails with ``"verify"``, ``old.size >= new.size`` fails with
+      ``"growth"``, and equality with any earlier receipt fails with
+      ``"duplicate"`` — the same three checks and order
+      :func:`inspect_continuation_chain` uses for its segments;
+    - within a boundary rotation, in this order, a rotation equal to an
+      earlier one fails with ``"rotation_duplicate"``,
+      :func:`verify_rotation` against the currently trusted key fails with
+      ``"rotation"``, and either seam fails — its ``old`` checkpoint not
+      equalling the previous segment's ``consistency.new`` or its ``new``
+      checkpoint not equalling the following segment's ``consistency.old``
+      on every field — with ``"rotation_link"``; the following segment is
+      examined only after all three pass.
+
+    Rotation codes carry the position of the **following** segment (the
+    boundary index plus one), and every report's three fields follow exactly
+    the rules of :class:`ContinuationChainReport`; a ``"rotation_link"``
+    code identifies the boundary and blames neither side.
+
+    A non-tuple ``receipts`` or ``rotations`` (including a list, a generator
+    or ``None``), a receipt of another type, a rotation element of another
+    type, or a ``key`` that is not ``bytes`` raises TypeError; an empty
+    ``receipts`` tuple, a ``rotations`` tuple whose length is not exactly
+    ``len(receipts) - 1`` or a key that is not 32 bytes raises ValueError.
+    Every other nested structural violation — a rotation four-tuple of the
+    wrong length, a wrongly typed or sized rotation field, or any structural
+    exception raised by
+    :func:`verify_signed_auth_audit_continuation` — propagates unchanged,
+    exactly as from :func:`verify_rotated_chain`. Types and shapes being
+    legal, any signature, authorization, growth, duplication or boundary
+    mismatch is reported, not raised.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if not isinstance(rotations, tuple):
+        raise TypeError("rotations must be a tuple of rotation records")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    if len(rotations) != len(receipts) - 1:
+        raise ValueError(
+            "rotations must contain exactly one record per segment boundary "
+            f"({len(rotations)} given for {len(receipts)} segments)"
+        )
+    for receipt in receipts:
+        if not isinstance(receipt, SignedAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedAuthAuditContinuation"
+            )
+    # As in verify_rotated_chain, the raw four-tuples have no dedicated
+    # class: only the container type is checked here, length and element
+    # validation belong to verify_rotation and propagate unchanged.
+    for rotation in rotations:
+        if not isinstance(rotation, tuple):
+            raise TypeError(
+                "each rotation must be a (old, new_key, new, auth) tuple"
+            )
+    # Pin the initial key to 32 bytes before the first use; every learned
+    # new_key is pinned in turn by verify_rotation at its boundary.
+    _load_ed25519_public(key)
+    current_key = key
+    seen_receipts: set[SignedAuthAuditContinuation] = set()
+    seen_rotations: set[tuple] = set()
+    previous_new: SignedRoot | None = None
+    for index, receipt in enumerate(receipts):
+        if index > 0:
+            # The boundary is examined before the segment it authorizes:
+            # repetition, then authorization by the key currently trusted,
+            # then the two full-field seams, each reported at the following
+            # segment's position.
+            rotation = rotations[index - 1]
+            if rotation in seen_rotations:
+                return ContinuationChainReport(
+                    False, index, _CHAIN_CODE_ROTATION_DUPLICATE
+                )
+            seen_rotations.add(rotation)
+            if not verify_rotation(rotation, current_key):
+                return ContinuationChainReport(
+                    False, index, _CHAIN_CODE_ROTATION
+                )
+            if (
+                rotation[0] != previous_new
+                or rotation[2] != receipt.consistency.old
+            ):
+                return ContinuationChainReport(
+                    False, index, _CHAIN_CODE_ROTATION_LINK
+                )
+            # verify_rotation succeeded and pinned new_key to 32 bytes: it is
+            # now the only signer trusted for the following segment.
+            current_key = rotation[1]
+        # The segment proper: verify, then strict growth, then repetition,
+        # matching inspect_continuation_chain's per-segment ordering.
+        if not verify_signed_auth_audit_continuation(receipt, current_key):
+            return ContinuationChainReport(False, index, _CHAIN_CODE_VERIFY)
+        consistency = receipt.consistency
+        if consistency.old.size >= consistency.new.size:
+            return ContinuationChainReport(False, index, _CHAIN_CODE_GROWTH)
+        if receipt in seen_receipts:
+            return ContinuationChainReport(
+                False, index, _CHAIN_CODE_DUPLICATE
+            )
+        seen_receipts.add(receipt)
+        previous_new = consistency.new
+    return ContinuationChainReport(True, None, None)
 
 
 def inspect_continuation_chain(

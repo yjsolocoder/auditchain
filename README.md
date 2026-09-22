@@ -368,11 +368,38 @@ verify_rotation((old, new_key, new, auth), other_key)    # False：未信任的�
   被信任），并要求 `old` / `new` 除 `signature` 外逐字段全等——两者必须描述同一
   快照。结构合法但任一签名不符、`new_key` 与授权不匹配或两个检查点不是同一快照，均
   返回 `False`（绝不抛异常）
-- `item` 必须是 `(old, new_key, new, auth)` 四元组：`old` / `new` 必须是
+- `item` 必须是 `(old, new_key, new, auth)` 四元组：`item` 不是 tuple 抛
+  `TypeError`，tuple 长度非 4 抛 `ValueError`；`old` / `new` 必须是
   `SignedRoot`，`new_key` / `auth` 必须是 `bytes`，否则抛 `TypeError`；`new_key`
   非 32 字节、`auth` 非 64 字节、信任公钥非 32 字节抛 `ValueError`，嵌套
   `SignedRoot` 的结构非法沿用 `verify_signed_root` 的既有异常（`TypeError` /
   `ValueError`）
+- `encode_rotation(item)` / `decode_rotation(data)` 把轮换四元组序列化为规范
+  二进制并原样还原，使旧钥授权可落盘、跨进程恢复后继续由 `verify_rotation`
+  凭预置信任的旧公钥离线核验，且不引入任何新的签名原文：
+
+```python
+from auditchain import encode_rotation, decode_rotation
+
+data = encode_rotation(item)          # bytes，可写文件/发网络
+restored = decode_rotation(data)      # (old, new_key, new, auth)，字段与原四元组相等
+restored == item                      # True
+encode_rotation(restored) == data     # True：重编码逐字节相同
+verify_rotation(restored, old_public) # True：无需持有日志
+```
+
+  字节流以魔数 `b"auditchain/signer-rotation-record/v1\0"` 开头，随后**严格依次**
+  写 `U(1) || B(O) || B(K) || B(N) || B(A)`（不允许省略、换序或附加尾随字段）；
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`。`O` 与 `N` 逐字节就是既有
+  `encode_signed_root(old)` 与 `encode_signed_root(new)` 输出的完整规范字节，解码时
+  分别交给 `decode_signed_root`；`K` 与 `A` 分别是 `new_key` 与 `auth` 的原字节，
+  解码精确消费四个 blob 且**禁止尾随字节**。`encode_rotation` 只接受 `tuple`（`list`
+  等抛 `TypeError`）、`decode_rotation` 只接受 `bytes`（含拒绝 `bytearray` /
+  `memoryview`）；非 tuple 或元素类型错（`old` / `new` 非 `SignedRoot`、
+  `new_key` / `auth` 非 `bytes`）抛 `TypeError`，四元组长度非 4、`new_key` 非
+  32 字节、`auth` 非 64 字节、魔数、版本、截断、blob 长度、嵌套格式或尾随错误抛
+  `ValueError`；编解码均不校验签名与各字段关联，结构合法但验真失败仍可解码，
+  `verify_rotation` 返回 `False`。两个入口均为只读且确定
 
 ### 可信紧凑批量审计包（Ed25519）
 
@@ -2018,10 +2045,25 @@ python3 -m auditchain
   `auth` 授权签名，`item` 中的 `new_key`（32 字节）验证 `new` 的快照签名——新钥只有经
   旧钥授权后才被信任；并要求 `old` 与 `new` 除 `signature` 外五个字段全等（同一快照）。
   任一签名不符、`new_key` 与授权不匹配或两个检查点描述的不是同一快照，返回 `False`，匹配
-  返回 `True`。`item` 不是四元组、`old` / `new` 不是 `SignedRoot`、`new_key` /
-  `auth` 不是 `bytes` 抛 `TypeError`；`new_key` 非 32 字节、`auth` 非 64 字节、公钥
-  长度非 32 字节或嵌套 `SignedRoot` 结构非法抛 `ValueError`（沿用
+  返回 `True`。`item` 不是 tuple、`old` / `new` 不是 `SignedRoot`、`new_key` /
+  `auth` 不是 `bytes` 抛 `TypeError`；tuple 长度非 4、`new_key` 非 32 字节、`auth`
+  非 64 字节、公钥长度非 32 字节或嵌套 `SignedRoot` 结构非法抛 `ValueError`（沿用
   `verify_signed_root` 的既有异常）；调用只读
+- `encode_rotation(item)` / `decode_rotation(data)` — 签名轮换四元组
+  `(old, new_key, new, auth)` 的规范二进制编码与解码，使旧钥授权可落盘、跨进程
+  恢复后继续凭预置信任的旧公钥由 `verify_rotation` 离线核验，且不新增签名原文：
+  字节流为 `D || U(1) || B(O) || B(K) || B(N) || B(A)`，其中
+  `D = b"auditchain/signer-rotation-record/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则），字段顺序沿用
+  `rotate_signer` 四元组；`O` / `N` 分别是既有 `encode_signed_root(old)` /
+  `encode_signed_root(new)` 的完整规范字节，解码分别交给
+  `decode_signed_root`，`K` / `A` 分别是 `new_key` 与 `auth` 原字节，解码精确
+  消费四个 blob 并禁止尾随字节。前者只接受 `tuple`（非 tuple 抛 `TypeError`，
+  长度非 4 抛 `ValueError`），后者只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；元素类型错抛 `TypeError`，字段宽度、魔数、版本、截断、blob
+  长度、嵌套格式或尾随非法抛 `ValueError`；解码四元组逐字段相等且重编码逐字节
+  相同；编解码不校验签名及字段关联，结构合法但验真失败仍可解码（
+  `verify_rotation` 返回 `False`）；两个入口均为只读且确定
 - `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
   Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
   无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）

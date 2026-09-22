@@ -12,6 +12,7 @@ inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 verify_rotation /
+encode_rotation / decode_rotation /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -79,6 +80,7 @@ __all__ = [
     "decode_auth_batch",
     "decode_continuations",
     "decode_prune_receipt",
+    "decode_rotation",
     "decode_signed_audit_batch",
     "decode_signed_auth_audit_bundle",
     "decode_signed_auth_audit_continuation",
@@ -102,6 +104,7 @@ __all__ = [
     "encode_auth_batch",
     "encode_continuations",
     "encode_prune_receipt",
+    "encode_rotation",
     "encode_signed_audit_batch",
     "encode_signed_auth_audit_bundle",
     "encode_signed_auth_audit_continuation",
@@ -205,6 +208,11 @@ _ED25519_SIGNATURE_BYTES = 64
 # signature domain is introduced.
 _ROTATION_DOMAIN = b"auditchain/signer-rotation/v1\0"
 _ROTATION_VERSION = 0x01
+# Binary framing of encode_rotation / decode_rotation: a fixed magic, then the
+# envelope version as a u64 and four u64-length-prefixed blobs holding, in
+# rotate_signer tuple order, the complete canonical encode_signed_root bytes of
+# the old and new checkpoints and the raw new_key and auth bytes.
+_ROTATION_RECORD_MAGIC = b"auditchain/signer-rotation-record/v1\0"
 
 # Signed stage-0 verifier of AuditLog.export_signed_verifier /
 # verify_signed_verifier. An Ed25519 signature over the verifier's hash
@@ -4286,18 +4294,19 @@ def verify_rotation(item: Any, key: Any) -> bool:
 
     A genuine rotation returns True; a signature that does not verify, a
     ``new_key`` vouched for by a different old key, or two checkpoints of
-    different snapshots returns False. ``item`` that is not a four-tuple,
-    whose elements have the wrong types (``old``/``new`` must be
+    different snapshots returns False. ``item`` that is not a tuple raises
+    TypeError; a tuple whose length is not 4 (shorter, longer or empty)
+    raises ValueError. Wrong element types (``old``/``new`` must be
     :class:`SignedRoot` instances, ``new_key`` and ``auth`` ``bytes``)
     raises TypeError; a ``new_key`` that is not 32 bytes, an ``auth`` that
     is not 64 bytes, or any nested structural violation raises exactly the
     exceptions of :func:`verify_signed_root`. The call is read-only and
     never mutates the item.
     """
-    if not isinstance(item, tuple) or len(item) != 4:
-        raise TypeError(
-            "item must be a 4-tuple (old, new_key, new, auth)"
-        )
+    if not isinstance(item, tuple):
+        raise TypeError("item must be a tuple (old, new_key, new, auth)")
+    if len(item) != 4:
+        raise ValueError("item must be a 4-tuple (old, new_key, new, auth)")
     old, new_key, new, auth = item
     if not isinstance(old, SignedRoot):
         raise TypeError("old must be a SignedRoot")
@@ -4359,6 +4368,134 @@ def verify_rotation(item: Any, key: Any) -> bool:
     except InvalidSignature:
         return False
     return True
+
+
+def encode_rotation(item: Any) -> bytes:
+    """Encode a signer-rotation four-tuple into its canonical binary form.
+
+    ``item`` is exactly the ``(old, new_key, new, auth)`` four-tuple returned
+    by :meth:`AuditLog.rotate_signer`, in that order. The byte stream starts
+    with the magic ``b"auditchain/signer-rotation-record/v1\\0"``; it then
+    writes, strictly in order, the envelope ``version`` (always 1) as an
+    unsigned 8-byte big-endian integer and four blobs ``B(O) || B(K) ||
+    B(N) || B(A)`` — nothing may be omitted, reordered or appended. Each blob
+    is a u64 byte length followed by the raw bytes: ``O`` and ``N`` are the
+    complete canonical output of :func:`encode_signed_root` over ``old`` and
+    ``new`` respectively, and ``K`` and ``A`` are the carried ``new_key`` and
+    ``auth`` bytes verbatim. No new signing message is introduced: encoding is
+    read-only and only re-uses the existing canonical checkpoint encoding.
+
+    ``item`` must be a tuple — anything else, including a ``list``, raises
+    TypeError — whose length is not 4 (shorter, longer or empty) raises
+    ValueError. ``old``/``new`` must be :class:`SignedRoot` instances and
+    ``new_key``/``auth`` ``bytes`` (a wrong element type raises TypeError); a
+    ``new_key`` that is not 32 bytes, an ``auth`` that is not 64 bytes, or any
+    nested checkpoint problem raises exactly the exceptions of
+    :func:`encode_signed_root` (ValueError). Encoding is deterministic:
+    re-encoding a decoded tuple reproduces the original bytes exactly, and a
+    structurally valid tuple whose signatures do not match encodes just as
+    well.
+    """
+    if not isinstance(item, tuple):
+        raise TypeError("item must be a tuple (old, new_key, new, auth)")
+    if len(item) != 4:
+        raise ValueError("item must be a 4-tuple (old, new_key, new, auth)")
+    old, new_key, new, auth = item
+    if not isinstance(old, SignedRoot):
+        raise TypeError("old must be a SignedRoot")
+    if not isinstance(new, SignedRoot):
+        raise TypeError("new must be a SignedRoot")
+    if not isinstance(new_key, bytes):
+        raise TypeError("new_key must be bytes")
+    if not isinstance(auth, bytes):
+        raise TypeError("auth must be bytes")
+    if len(new_key) != _ED25519_KEY_BYTES:
+        raise ValueError(f"new_key must be {_ED25519_KEY_BYTES} bytes")
+    if len(auth) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(f"auth must be {_ED25519_SIGNATURE_BYTES} bytes")
+    # Re-validate both checkpoints even for instances built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructors would, and record their
+    # canonical bytes verbatim as the O and N blobs.
+    old_blob = encode_signed_root(old)
+    new_blob = encode_signed_root(new)
+    return b"".join((
+        _ROTATION_RECORD_MAGIC,
+        _encode_u64(_ROTATION_VERSION, "version"),
+        _encode_blob(old_blob),
+        _encode_blob(new_key),
+        _encode_blob(new_blob),
+        _encode_blob(auth),
+    ))
+
+
+def decode_rotation(data: Any) -> tuple[SignedRoot, bytes, SignedRoot, bytes]:
+    """Decode bytes produced by :func:`encode_rotation`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signer-rotation-record/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported) and exactly four
+    length-prefixed blobs — the old checkpoint, ``new_key``, the new
+    checkpoint and ``auth`` — with no trailing bytes. The two checkpoint blobs
+    are handed whole to :func:`decode_signed_root`, so every nested framing and
+    structural rule is theirs; ``new_key`` must be exactly 32 bytes and
+    ``auth`` exactly 64 bytes. A bad magic or version, truncation, an
+    oversized blob length, trailing bytes, a field of the wrong width, or an
+    illegal nested checkpoint encoding raises ValueError.
+
+    Signatures and the association between the two checkpoints, ``new_key``
+    and ``auth`` are not checked here. The returned four-tuple is exactly
+    ``(old, new_key, new, auth)`` in :meth:`AuditLog.rotate_signer` order with
+    every field equal to the originally encoded one, and re-encoding
+    reproduces the original bytes byte-for-byte. A structurally sound encoding
+    whose signatures simply do not verify or whose checkpoints describe
+    different snapshots still decodes; :func:`verify_rotation` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ROTATION_RECORD_MAGIC):
+        raise ValueError("not an auditchain signer-rotation-record encoding")
+    offset = len(_ROTATION_RECORD_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ROTATION_VERSION:
+        raise ValueError(f"unsupported signer-rotation-record version {version}")
+    old_blob = read_blob("old checkpoint")
+    new_key = read_blob("new_key")
+    new_blob = read_blob("new checkpoint")
+    auth = read_blob("auth")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signer rotation record")
+    if len(new_key) != _ED25519_KEY_BYTES:
+        raise ValueError(f"new_key must be {_ED25519_KEY_BYTES} bytes")
+    if len(auth) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(f"auth must be {_ED25519_SIGNATURE_BYTES} bytes")
+    # Decode both nested checkpoint blobs with the existing decoder; its own
+    # magic, version, truncation/trailing-byte and structural checks apply
+    # verbatim.
+    old = decode_signed_root(old_blob)
+    new = decode_signed_root(new_blob)
+    return old, new_key, new, auth
 
 
 def verify_signed_audit_batch(receipt: Any, public_key: Any) -> bool:

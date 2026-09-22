@@ -1169,6 +1169,63 @@ verify_signed_auth_audit_continuation(restored, public_key)  # True：无需持�
   `SignedAuthAuditContinuation(bundle, consistency)` 仍按字段相等，保留位置
   构造及字段顺序，旧接口和签名域不变
 
+#### 连续只追加历史的续接链离线核验（Ed25519）
+
+单个 `SignedAuthAuditContinuation` 只证明"一个旧快照只追加续接到一个新快照"。
+顶层 `verify_continuation_chain(receipts, public_key) -> bool` 接收一个**非空
+tuple** 的既有冻结续接凭据（保持调用方给定顺序），离线核验它们描述的是同一条
+连续只追加历史，全程只读、不持有日志，也**不新增任何签名域**：
+
+```python
+from auditchain import verify_continuation_chain
+
+# 三段：size 0 → 2 → 5 → 8；每段由同一日志内容在同一预置密钥下签发
+chain = (
+    log0.signed_auth_audit_continuation(0, (), seed, size=2),
+    log1.signed_auth_audit_continuation(2, (), seed, size=5),
+    log2.signed_auth_audit_continuation(5, (), seed, size=8),
+)
+verify_continuation_chain(chain, public_key)       # True
+verify_continuation_chain(chain, other_public_key) # False：未信任的公钥
+```
+
+- 首参只收非空 `tuple`：非 `tuple`（含 list、生成器、`None`）抛 `TypeError`，
+  空 tuple 抛 `ValueError`；元素必须均为 `SignedAuthAuditContinuation`，否则抛
+  `TypeError`。逐项调用 `verify_signed_auth_audit_continuation`，任一项返回
+  `False`（或嵌套结构非法按既有规则抛 `TypeError` / `ValueError`，公钥长度错
+  抛 `ValueError`、非 `bytes` 抛 `TypeError`）整体即不成立
+- 每段还须满足 `consistency.old.size < consistency.new.size`（等长段不描述任何
+  追加）；相邻两段要求前段 `consistency.new` 与后段 `consistency.old` **全字段
+  相等**（`version`、`hash_name`、`size`、`root`、`head` 及 Ed25519 签名本身）；
+  tuple 中出现重复段（含非相邻的重复凭据）返回 `False`。任一关系不符返回
+  `False`，调用只读，旧接口不变
+- `encode_continuations(receipts) -> bytes` /
+  `decode_continuations(data) -> tuple` 把整条续接链序列化为只读、确定的规范
+  二进制并按凭据 tuple 的原有顺序原样还原：
+
+```python
+from auditchain import decode_continuations, encode_continuations
+
+data = encode_continuations(chain)        # bytes，可写文件/发网络
+restored = decode_continuations(data)     # tuple，顺序与逐字段均不变
+restored == chain                         # True
+encode_continuations(restored) == data    # True：重编码逐字节相同
+verify_continuation_chain(restored, public_key)  # True：无需持有日志
+```
+
+  字节流严格为 `D || U(1) || U(n) || B(R1) … B(Rn)`，其中
+  `D = b"auditchain/cont-chain/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`，`n` 为非零凭据计数；每个 `Ri` 须逐字节等于既有
+  `encode_signed_auth_audit_continuation(receipt_i)` 的完整输出，按 tuple 顺序
+  排列。解码精确消费全部 `Ri` 与所有外层字节、**禁止尾随字节**，每个 blob 原样
+  交给 `decode_signed_auth_audit_continuation`，嵌套异常沿用既有解码器。
+  `encode_continuations` 只收非空 `SignedAuthAuditContinuation` tuple（非 tuple
+  或元素类型错抛 `TypeError`，空 tuple 抛 `ValueError`），`decode_continuations`
+  只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、零计数、截断、
+  长度、嵌套格式或尾随非法均抛 `ValueError`；编解码不校验签名、证明及相邻段
+  关联，结构合法但验真不匹配仍可解码，由 `verify_continuation_chain` 返回
+  `False`；两个入口均只读且确定，旧接口和签名域不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1853,6 +1910,31 @@ python3 -m auditchain
   不校验签名、标签、证明内容及两部分的快照关联，结构合法但验真不匹配仍可解码
   （`verify_signed_auth_audit_continuation` 返回 `False`）；两个入口均为只读
   且确定，旧接口和签名域不变
+- `verify_continuation_chain(receipts, public_key)` — 离线核验一个非空续接
+  tuple 描述同一条连续只追加历史，只读且不新增签名域：首参只收非空 `tuple`
+  （非 tuple 抛 `TypeError`，空 tuple 抛 `ValueError`），元素均须为既有冻结
+  `SignedAuthAuditContinuation`（否则抛 `TypeError`）并保持输入顺序；逐项调用
+  `verify_signed_auth_audit_continuation`，任一返回 `False` 整体即 `False`
+  （嵌套验真异常与公钥长度/类型错沿用既有规则传播）。每段还须满足
+  `consistency.old.size < consistency.new.size`，相邻段要求前段
+  `consistency.new` 与后段 `consistency.old` 全字段相等（含签名本身）；重复段
+  或任一关系不符返回 `False`
+- `encode_continuations(receipts)` / `decode_continuations(data)` — 续接链的
+  规范二进制编码与解码，使非空续接凭据 tuple 可落盘、跨进程恢复后继续凭预置
+  信任的 Ed25519 公钥由 `verify_continuation_chain` 离线验真，且不新增签名域：
+  字节流严格为 `D || U(1) || U(n) || B(R1) … B(Rn)`，其中
+  `D = b"auditchain/cont-chain/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则），`n` 为非零计数，
+  `Ri` 为既有 `encode_signed_auth_audit_continuation` 的完整规范输出并按 tuple
+  顺序排列；解码精确消费各 `Ri` 及全部外层字节、禁止尾随字节，分别交给既有
+  `decode_signed_auth_audit_continuation`，嵌套异常沿用该解码器。前者只收非空
+  `SignedAuthAuditContinuation` tuple（非 tuple 或元素类型错抛 `TypeError`，空
+  tuple 抛 `ValueError`），后者只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、零计数、截断、blob 长度、嵌套格式或尾随非法抛
+  `ValueError`；解码保持凭据 tuple 的原有顺序、字段相等且重编码逐字节相同；
+  编解码不校验签名、证明及相邻段关联，结构合法但验真不匹配仍可解码
+  （`verify_continuation_chain` 返回 `False`）；两个入口均为只读且确定，旧
+  接口和签名域不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

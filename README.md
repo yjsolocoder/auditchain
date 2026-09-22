@@ -1134,6 +1134,24 @@ verify_signed_auth_audit_continuation(cont, other_key)  # False：未信任的�
   `SignedAuthAuditContinuation`（含绕过冻结构造器写入的容器字段类型错）抛
   `TypeError`，嵌套结构非法与公钥长度错沿用既有 `TypeError` / `ValueError`；
   调用只读，旧接口不变
+- `encode_signed_auth_audit_continuation(receipt)` /
+  `decode_signed_auth_audit_continuation(data)` 序列化并原样还原，使续接凭据
+  可落盘、跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，**不新增签名域
+  也不新增签名原文**：字节流为 `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/auth-audit-continuation/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；`A` 须逐字节等于既有
+  `encode_signed_auth_audit_bundle(bundle)` 的完整规范输出，`C` 为既有
+  `encode_signed_consistency(consistency)` 的完整规范输出，包在前、一致性凭据
+  在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有
+  `decode_signed_auth_audit_bundle` 与 `decode_signed_consistency`
+- `encode` 只接受 `SignedAuthAuditContinuation`，`decode` 只接受 `bytes`
+  （含拒绝 `bytearray` / `memoryview`），类型错抛 `TypeError`；魔数、版本、
+  截断、尾随、blob 长度或任一嵌套格式非法抛 `ValueError`，嵌套异常沿用对应
+  既有编解码器；解码对象按字段相等、冻结、保留位置构造与字段顺序，重编码逐
+  字节相同；编解码均不校验签名、标签、证明内容与两包关联，结构合法但验真
+  不匹配（含一致性 `new` 检查点与审计检查点不等、两半异钥）仍可正常解码，
+  `verify_signed_auth_audit_continuation` 返回 `False`；两个入口均为只读且
+  确定，旧接口和签名域不变
 
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
@@ -1801,6 +1819,25 @@ python3 -m auditchain
   相同；编解码不校验签名与标签，结构合法但签名或标签不匹配仍可解码
   （`verify_signed_auth_bundle` 逐项返回 `False`）；编码携带明文验证密钥，须像
   裸 `Verifier` 一样保护；两个入口均为只读且确定
+- `encode_signed_auth_audit_continuation(receipt)` /
+  `decode_signed_auth_audit_continuation(data)` — 跨快照认证审计续接凭据的
+  规范二进制编码与解码，使冻结的 `SignedAuthAuditContinuation` 可落盘、跨
+  进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名域或签名
+  原文：字节流为 `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/auth-audit-continuation/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；`A` 须逐字节等于既有
+  `encode_signed_auth_audit_bundle(bundle)` 的完整规范输出，`C` 为既有
+  `encode_signed_consistency(consistency)` 的完整规范输出，包在前、一致性
+  凭据在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有
+  `decode_signed_auth_audit_bundle` 与 `decode_signed_consistency`，嵌套异常
+  沿用对应既有编解码器。前者只接受 `SignedAuthAuditContinuation`（外层或
+  容器字段类型错抛 `TypeError`），后者只接受 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、截断、尾随、blob 长度或任一嵌套格式非法抛
+  `ValueError`；解码对象按两字段相等、冻结、保留位置构造与字段顺序，重
+  编码逐字节相同；编解码均不校验签名、标签、证明内容与两包关联，结构合法
+  但验真不匹配（含一致性 `new` 检查点与审计检查点不等、两半异钥）仍可
+  解码，`verify_signed_auth_audit_continuation` 返回 `False`；两个入口均为
+  只读且确定，旧接口和签名域不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

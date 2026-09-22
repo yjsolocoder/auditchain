@@ -329,6 +329,51 @@ verify_signed_root(restored, public_key)   # True：无需持有日志
   宽度非法抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，
   `verify_signed_root` 返回 `False`。两个入口均为只读
 
+### 签名密钥轮换（Ed25519，旧钥授新钥）
+
+`rotate_signer` 在**同一个快照**上由旧、新两把 Ed25519 种子各自签发一个
+`SignedRoot`，再由旧种子对“旧签名 ‖ 新公钥 ‖ 新签名”追加一条授权签名；
+接收方凭旧公钥即可**完全离线**核验新公钥确由旧钥授权，无需持有日志，也不
+落盘任何私钥、不向日志写入任何记录（`SignedRoot` 的签名域与接口保持不变）：
+
+```python
+from auditchain import verify_rotation
+
+old_seed, new_seed = bytes(range(1, 33)), bytes(range(33, 65))
+old, new_key, new, auth = log.rotate_signer(old_seed, new_seed)  # size 默认 len(log)
+# old / new 是除 signature 外逐字段相等的两个 SignedRoot，同指一个快照
+old.version == new.version and old.hash_name == new.hash_name     # True
+old.size == new.size and old.root == new.root and old.head == new.head  # True
+len(new_key) == 32 and len(auth) == 64                            # True
+verify_rotation((old, new_key, new, auth), old_public_key)        # True：无需持有日志
+verify_rotation((old, new_key, new, auth), other_public_key)      # False：旧钥不受信任
+# 轮换可链：下一次轮换由新种子授权给更新的种子
+verify_rotation(log.rotate_signer(new_seed, newer_seed), new_key) # True
+```
+
+- `rotate_signer(old_seed, new_seed, size=None)` 只读；`size` 默认当前日志长度，
+  须为非 `bool` 整数且 `0 <= size <= len(log)`，快照仍可重建（已裁剪前缀抛
+  `ValueError`）。两个 `SignedRoot` 均直接由 `sign_root` 对同一快照产生，
+  故两者除 `signature` 外全等，签名原文仍是
+  `auditchain/signed-root/v1` 域
+- 返回 `(old, new_key, new, auth)`：`old` / `new` 为两个检查点；`new_key`
+  是新种子对应的 32 字节原始 Ed25519 公钥；`auth` 是旧种子对
+  `D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)` 的
+  64 字节 Ed25519 签名，其中 `D = b"auditchain/signer-rotation/v1\0"`，
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`；授权域独立，签成
+  signed-root 域或其他快照的签名不能复用
+- `verify_rotation(item, key)` 完全离线核验四元组：两个检查点除 `signature`
+  外全等；旧检查点与 `auth` 均由预置信任的旧公钥 `key` 验过，新检查点由元组
+  内 `new_key` 验过（两处检查点都走普通 `verify_signed_root` 检查）。旧钥不
+  受信任、两检查点描述不同快照、内嵌新钥或任一签名被替换 / 篡改，均返回
+  `False`；核验只读，不改变元组、检查点或日志
+- 类型与长度边界只接受 `bytes`：两个种子、`key`、`new_key` 与 `auth` 传入
+  `str` / `bytearray` / `memoryview` 等抛 `TypeError`；种子或公钥不是 32
+  字节、`auth` 不是 64 字节、`size` 类型或范围错、快照不可重建，或检查点
+  结构非法（版本、算法、宽度等，沿用 `SignedRoot` 与 `verify_signed_root`
+  的既有约定）抛 `ValueError`；`item` 不是四元组、检查点位置不是
+  `SignedRoot` 抛 `TypeError`
+
 ### 可信紧凑批量审计包（Ed25519）
 
 `signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
@@ -1873,6 +1918,16 @@ python3 -m auditchain
     `version` 恒为 1。私钥种子只用于这一次签名、从不保存或返回；`size` 越界或快照
     已裁剪抛 `ValueError`（空快照 `size=0` 始终可签），种子类型错抛 `TypeError`、
     长度非 32 抛 `ValueError`；调用只读，离线用 `verify_signed_root` 凭预信任公钥验真
+  - `rotate_signer(old_seed, new_seed, size=None)` — 只读完成 Ed25519 签名密钥
+    轮换（旧钥授新钥，双方对同一快照 `sign_root`）：两个种子必须都是 32
+    `bytes`（类型错抛 `TypeError`、长度非 32 抛 `ValueError`），`size` 默认
+    当前长度、须为非 `bool` 整数且 `0 <= size <= len(log)`、快照仍可重建
+    （类型错抛 `TypeError`、越界或已裁剪抛 `ValueError`）；返回
+    `(old, new_key, new, auth)`，`old`/`new` 为除 `signature` 外全等的
+    `SignedRoot`，`new_key` 为新种子的 32 字节原始公钥，`auth` 为旧种子对
+    `D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)`
+    （`D = b"auditchain/signer-rotation/v1\0"`）的 64 字节签名；离线用
+    `verify_rotation` 凭旧公钥验真
   - `signed_audit_batch(indices, private_key, size=None)` — 只读签发可信紧凑批量
     审计包，返回不可变 `SignedAuditBatch`：先调用 `audit_batch(indices, size)`，
     再调用 `sign_root(private_key, size)`（`size` 默认当前长度），据此构造
@@ -1958,6 +2013,17 @@ python3 -m auditchain
   返回 `True`。入参不是 `SignedRoot` 或公钥不是 `bytes` 抛 `TypeError`；版本、
   未知算法、`size` 范围、摘要宽度、签名长度或公钥长度（非 32 字节）非法抛
   `ValueError`；调用只读
+- `verify_rotation(item, key)` — 凭预先信任的旧签名方 32 字节 Ed25519 公钥
+  离线验证 `AuditLog.rotate_signer` 的四元组 `(old, new_key, new, auth)`，无需
+  持有日志：`old`/`new` 必须是除 `signature` 外全等的 `SignedRoot`，旧检查点
+  与 `auth` 用 `key` 按普通 `verify_signed_root` 及轮换授权原文
+  `D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)`
+  （`D = b"auditchain/signer-rotation/v1\0"`）核验，新检查点用元组内 32 字节
+  `new_key` 核验。旧钥不受信任、两检查点描述不同快照、内嵌新钥 / 检查点签名 /
+  `auth` 被替换或篡改返回 `False`，匹配返回 `True`。`item` 不是四元组或检查点
+  位置不是 `SignedRoot`、`new_key`/`auth`/公钥不是 `bytes` 抛 `TypeError`；
+  `new_key` 或公钥非 32 字节、`auth` 非 64 字节、检查点结构非法（沿用
+  `verify_signed_root` 的既有约定）抛 `ValueError`；调用只读
 - `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
   Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
   无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）

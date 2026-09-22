@@ -13,6 +13,7 @@ from auditchain import (
     encode_signed_verifier,
     verify_auth_batch,
     verify_signed_auth_bundle,
+    verify_signed_verifier,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
@@ -453,6 +454,291 @@ class DecodeSignedAuthBundleTest(unittest.TestCase):
         data = encode_signed_auth_bundle(bundle)
         decode_signed_auth_bundle(data)
         self.assertEqual(encode_signed_auth_bundle(bundle), data)
+
+
+class SignedAuthBundleIssuanceTest(unittest.TestCase):
+    def _log(self, n=5, key=_KEY, hash_name="sha256"):
+        log = AuditLog(key=key, hash_name=hash_name)
+        for record in range(n):
+            log.append(f"record-{record}")
+        return log
+
+    def _snapshot(self, log):
+        return (
+            log.stage,
+            log._key,
+            dict(log._tags),
+            log.head,
+            len(log),
+            log._verifier_exported,
+        )
+
+    def test_returns_frozen_bundle_equal_to_two_step_issuance(self):
+        bundle = self._log().signed_auth_bundle((4, 0, 2), _SEED_A)
+        self.assertIsInstance(bundle, SignedAuthBundle)
+        self.assertEqual(bundle, _bundle(indices=(0, 2, 4)))
+        self.assertEqual(bundle.hash_name, "sha256")
+        self.assertIsInstance(bundle.items, tuple)
+        self.assertEqual([entry.index for entry, _ in bundle.items], [0, 2, 4])
+
+    def test_verifier_is_signed_stage_zero_material(self):
+        log = self._log()
+        bundle = log.signed_auth_bundle((0, 2, 4), _SEED_A)
+        self.assertIsInstance(bundle.verifier, SignedVerifier)
+        self.assertEqual(bundle.verifier.version, 1)
+        self.assertEqual(bundle.verifier.verifier.key, _KEY)
+        self.assertEqual(bundle.verifier.verifier.hash_name, "sha256")
+        self.assertEqual(len(bundle.verifier.signature), 64)
+        self.assertEqual(
+            verify_signed_auth_bundle(bundle, _public_key(_SEED_A)),
+            (True, True, True),
+        )
+
+    def test_signature_reuses_signed_verifier_domain(self):
+        # The embedded signature is byte-for-byte the one
+        # export_signed_verifier makes; no new signing message exists.
+        bundle = self._log().signed_auth_bundle((0, 2, 4), _SEED_A)
+        self.assertEqual(bundle.verifier, _bundle().verifier)
+        self.assertTrue(
+            verify_signed_verifier(bundle.verifier, _public_key(_SEED_A))
+        )
+
+    def test_stages_run_from_zero_and_items_equal_consecutive_auth(self):
+        log = self._log()
+        bundle = log.signed_auth_bundle((4, 0, 2), _SEED_A)
+        self.assertEqual([tag.stage for _, tag in bundle.items], [0, 1, 2])
+        # Byte-for-byte what consecutive ascending auth() calls produce from
+        # a fresh stage-0 log with the same key.
+        reference = self._log()
+        reference.export_signed_verifier(_SEED_A)
+        expected = tuple(
+            (reference.entry(i), reference.auth(i)) for i in (0, 2, 4)
+        )
+        self.assertEqual(bundle.items, expected)
+        self.assertEqual(log.stage, 3)
+        self.assertEqual(reference.stage, 3)
+        self.assertEqual(sorted(log._tags), [0, 2, 4])
+        for index, (_, tag) in zip((0, 2, 4), bundle.items):
+            self.assertEqual(log._tags[index], tag)
+
+    def test_items_verify_offline_against_delivered_verifier(self):
+        bundle = self._log().signed_auth_bundle((4, 1, 3), _SEED_A)
+        self.assertEqual(
+            verify_auth_batch(bundle.items, bundle.verifier.verifier),
+            (True, True, True),
+        )
+
+    def test_accepts_a_generator_and_sorts_ascending(self):
+        bundle = self._log().signed_auth_bundle(
+            (i for i in (4, 0)), _SEED_A
+        )
+        self.assertEqual([entry.index for entry, _ in bundle.items], [0, 4])
+
+    def test_encoding_is_the_existing_bundle_codec(self):
+        bundle = self._log().signed_auth_bundle((0, 2, 4), _SEED_A)
+        expected = (
+            MAGIC
+            + u64(1)
+            + blob(encode_signed_verifier(bundle.verifier))
+            + blob(encode_auth_batch(bundle.items, hash_name=bundle.hash_name))
+        )
+        data = encode_signed_auth_bundle(bundle)
+        self.assertEqual(data, expected)
+        restored = decode_signed_auth_bundle(data)
+        self.assertEqual(restored, bundle)
+        self.assertEqual(
+            verify_signed_auth_bundle(restored, _public_key(_SEED_A)),
+            (True, True, True),
+        )
+
+    def test_empty_selection_delivers_material_without_advancing_stage(self):
+        log = self._log()
+        bundle = log.signed_auth_bundle((), _SEED_A)
+        self.assertEqual(bundle.items, ())
+        self.assertEqual(log.stage, 0)
+        self.assertTrue(
+            verify_signed_verifier(bundle.verifier, _public_key(_SEED_A))
+        )
+        self.assertEqual(
+            verify_signed_auth_bundle(bundle, _public_key(_SEED_A)), ()
+        )
+        # The export was consumed: a later batch still starts at stage 0 and
+        # neither export entry point works again.
+        items = log.auth_batch((0,))
+        self.assertEqual(items[0][1].stage, 0)
+        self.assertEqual(log.stage, 1)
+        with self.assertRaises(ValueError):
+            log.export_verifier()
+        with self.assertRaises(ValueError):
+            log.export_signed_verifier(_SEED_A)
+
+    def test_success_consumes_the_shared_one_shot_eligibility(self):
+        log = self._log()
+        log.signed_auth_bundle((1,), _SEED_A)
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((2,), _SEED_A)
+        with self.assertRaises(ValueError):
+            log.export_verifier()
+        with self.assertRaises(ValueError):
+            log.export_signed_verifier(_SEED_A)
+
+    def test_prior_export_disqualifies(self):
+        log = self._log()
+        log.export_verifier()
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((0,), _SEED_A)
+        log = self._log()
+        log.export_signed_verifier(_SEED_A)
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((0,), _SEED_A)
+
+    def test_prior_evolution_disqualifies_without_changing_on_failure(self):
+        log = self._log()
+        log.auth(0)
+        before = self._snapshot(log)
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((1,), _SEED_A)
+        self.assertEqual(self._snapshot(log), before)
+        log = self._log()
+        log.rotate_key()
+        before = self._snapshot(log)
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((0,), _SEED_A)
+        self.assertEqual(self._snapshot(log), before)
+
+    def test_keyless_mode_raises_value_error(self):
+        log = AuditLog()
+        log.append("a")
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((0,), _SEED_A)
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((), _SEED_A)
+
+    def test_private_key_type_errors(self):
+        log = self._log()
+        for bad in ("0" * 32, bytearray(_SEED_A), memoryview(_SEED_A), None, 1):
+            with self.assertRaises(TypeError, msg=bad):
+                log.signed_auth_bundle((0,), bad)
+
+    def test_private_key_length_raises_value_error(self):
+        log = self._log()
+        for bad in (b"", _SEED_A[:-1], _SEED_A + b"\x00"):
+            with self.assertRaises(ValueError):
+                log.signed_auth_bundle((0,), bad)
+
+    def test_indices_type_errors(self):
+        log = self._log()
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle(5, _SEED_A)
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle(None, _SEED_A)
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle(["0"], _SEED_A)
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle([1.0], _SEED_A)
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle([True], _SEED_A)
+        with self.assertRaises(TypeError):
+            log.signed_auth_bundle([0, False], _SEED_A)
+
+    def test_duplicate_index_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self._log().signed_auth_bundle([1, 2, 1], _SEED_A)
+
+    def test_non_retained_index_raises_index_error(self):
+        log = self._log(5)
+        with self.assertRaises(IndexError):
+            log.signed_auth_bundle([5], _SEED_A)
+        with self.assertRaises(IndexError):
+            log.signed_auth_bundle([-1], _SEED_A)
+        log.prune(2, log.seal(2))
+        with self.assertRaises(IndexError):
+            log.signed_auth_bundle([1, 3], _SEED_A)
+
+    def test_pruned_log_selection_starts_at_stage_zero(self):
+        log = self._log(6)
+        log.prune(2, log.seal(2))
+        bundle = log.signed_auth_bundle((5, 2), _SEED_A)
+        self.assertEqual([entry.index for entry, _ in bundle.items], [2, 5])
+        self.assertEqual([tag.stage for _, tag in bundle.items], [0, 1])
+        self.assertEqual(
+            verify_signed_auth_bundle(bundle, _public_key(_SEED_A)),
+            (True, True),
+        )
+
+    def test_stage_capacity_checked_before_eligibility(self):
+        log = self._log(3)
+        log._stage = (1 << 64) - 1
+        with self.assertRaises(ValueError):
+            log.signed_auth_bundle((0,), _SEED_A)
+
+    def test_failure_is_atomic_and_preserves_eligibility(self):
+        for call, error in (
+            (lambda log: log.signed_auth_bundle(["0"], _SEED_A), TypeError),
+            (lambda log: log.signed_auth_bundle([True], _SEED_A), TypeError),
+            (lambda log: log.signed_auth_bundle(5, _SEED_A), TypeError),
+            (lambda log: log.signed_auth_bundle([0, 0], _SEED_A), ValueError),
+            (lambda log: log.signed_auth_bundle([9], _SEED_A), IndexError),
+            (lambda log: log.signed_auth_bundle([-1], _SEED_A), IndexError),
+            (lambda log: log.signed_auth_bundle([0], "0" * 32), TypeError),
+            (lambda log: log.signed_auth_bundle([0], b"short"), ValueError),
+        ):
+            log = self._log()
+            before = self._snapshot(log)
+            with self.assertRaises(error):
+                call(log)
+            self.assertEqual(self._snapshot(log), before)
+            # No export consumed and no key evolution: the retry with the
+            # same selection delivers a bundle starting at stage 0.
+            bundle = log.signed_auth_bundle((0, 2, 4), _SEED_A)
+            self.assertEqual(
+                [tag.stage for _, tag in bundle.items], [0, 1, 2]
+            )
+            self.assertEqual(
+                verify_signed_auth_bundle(bundle, _public_key(_SEED_A)),
+                (True, True, True),
+            )
+
+    def test_failure_does_not_touch_chain_state(self):
+        log = self._log()
+        head = log.head
+        root = log.merkle_root()
+        entries = log.entries()
+        for call, error in (
+            (lambda: log.signed_auth_bundle([9], _SEED_A), IndexError),
+            (lambda: log.signed_auth_bundle([0, 0], _SEED_A), ValueError),
+            (lambda: log.signed_auth_bundle([0], b"bad"), ValueError),
+        ):
+            with self.assertRaises(error):
+                call()
+        self.assertEqual(log.head, head)
+        self.assertEqual(log.merkle_root(), root)
+        self.assertEqual(log.entries(), entries)
+        self.assertEqual(len(log), 5)
+        self.assertTrue(log.verify())
+
+    def test_success_does_not_change_chain_state(self):
+        log = self._log()
+        head = log.head
+        root = log.merkle_root()
+        entries = log.entries()
+        log.signed_auth_bundle((0, 2, 4), _SEED_A)
+        self.assertEqual(log.head, head)
+        self.assertEqual(log.merkle_root(), root)
+        self.assertEqual(log.entries(), entries)
+        self.assertEqual(len(log), 5)
+        self.assertTrue(log.verify())
+
+    def test_alternate_hash_algorithm(self):
+        log = self._log(3, hash_name="sha512")
+        bundle = log.signed_auth_bundle((2, 0), _SEED_A)
+        self.assertEqual(bundle.hash_name, "sha512")
+        self.assertEqual(bundle.verifier.verifier.hash_name, "sha512")
+        self.assertEqual([tag.stage for _, tag in bundle.items], [0, 1])
+        self.assertEqual(
+            verify_signed_auth_bundle(bundle, _public_key(_SEED_A)),
+            (True, True),
+        )
 
 
 if __name__ == "__main__":

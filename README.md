@@ -973,6 +973,49 @@ verify_signed_auth_bundle(restored, other_key)    # (False, False)：验签失�
   `False`。验证密钥在字节流中明文携带（只认证来源、不加密），须像裸 `Verifier`
   一样保护；两个入口均只读且确定，旧接口不变
 
+`SignedAuthBundle` 也可由日志**原子签发**：`AuditLog.signed_auth_bundle(indices,
+private_key) -> SignedAuthBundle` 在一次调用内同时交付已签名的 stage-0 验证材料
+与按绝对索引升序的前向安全标签，避免先 `export_signed_verifier` 再 `auth_batch`
+分步执行留下"资格已消耗却未发标签"或"密钥已演进却无签名材料"的半提交状态：
+
+```python
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d"):
+    log.append(record)
+bundle = log.signed_auth_bundle([3, 1], seed)   # 一次调用完成签发
+
+# 等价于在同型 stage-0 日志上分步执行 export_signed_verifier + auth_batch
+twin = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d"):
+    twin.append(record)
+stepwise = SignedAuthBundle(
+    twin.export_signed_verifier(seed), twin.hash_name, twin.auth_batch([3, 1])
+)
+bundle == stepwise                             # True：签名与标签逐字节相同
+verify_signed_auth_bundle(bundle, public_key)   # (True, True)：逐项核验
+```
+
+- `AuditLog.signed_auth_bundle(indices, private_key)` 与
+  `export_signed_verifier` 共用同一份一次性导出资格：仅限带 `key` 的日志在
+  `stage == 0` 且尚未导出验证材料时调用；成功即消耗资格，此后
+  `export_verifier` / `export_signed_verifier` 均不可再用。`indices` 为互异非
+  `bool` 整数的可迭代项（含生成器），允许空选择；返回的冻结包与手工组装的
+  `SignedAuthBundle` 同型，`verifier` 即本次签发的 stage-0 材料，`hash_name`
+  为日志算法，`items` 按绝对索引升序
+- **不新增签名原文**：嵌套 `SignedVerifier` 的 Ed25519 签名逐字节复用
+  `export_signed_verifier` 的签名原文
+  （`D || 0x01 || B(hash_name 的 UTF-8) || B(key)`）；第 j 项（j 从 0 起）使用
+  `stage == j`，HMAC、u64 大端 stage 与密钥演进顺序逐字节沿用 `auth_batch`，
+  各项等于从初始密钥连续升序调用 `auth` 的结果，成功恰推进所选条数
+- **空选择仍交付签名材料**：`items == ()`、验证照常离线验真，但 `stage` 保持
+  `0`；导出资格同样被消耗，之后的 `auth_batch` 仍从 stage 0 起
+- 所有校验（私钥、索引、重复、保留范围、stage 容量与导出资格）均在签名与任何
+  状态变更之前完成：任何失败都**不消耗导出资格、不演进密钥，且不改标签、条目等
+  日志状态**。`private_key` 或 `indices` 类型错、索引非整数或为 `bool` 抛
+  `TypeError`；种子非 32 字节、索引重复、stage 容量不足、无密钥模式、已演进或
+  重复导出抛 `ValueError`；非保留索引沿用 `auth_batch` 的 `IndexError`。成功不
+  改哈希链、Merkle 根或搜索索引；既有接口及包编解码不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1549,7 +1592,9 @@ python3 -m auditchain
   `SignedRoot` / `verify_signed_root` 的既有异常（`TypeError` /
   `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
 - `verify_signed_auth_bundle(bundle, public_key)` — 凭预先信任的 32 字节
-  Ed25519 公钥离线核验 `SignedAuthBundle` 可信认证批次交付包，无需持有日志、
+  Ed25519 公钥离线核验 `SignedAuthBundle` 可信认证批次交付包（可由
+  `AuditLog.signed_auth_bundle(indices, private_key)` 原子签发，或用
+  `export_signed_verifier` 与 `auth_batch` 的结果手工构造），无需持有日志、
   不新增签名原文：先用 `verify_signed_verifier` 核验嵌套的已签名 stage-0 验证
   材料，验签失败逐项返回 `False`（长度与 `items` 相同，空批次为 `()`）；验签
   成功且 `bundle.hash_name` 与签名验证材料的算法一致时，复用

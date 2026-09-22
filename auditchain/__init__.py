@@ -1319,6 +1319,33 @@ class AuditLog:
         self._stage += 1
         return tag
 
+    def _resolve_auth_indices(self, indices: Any) -> list[int]:
+        """Validate an :meth:`auth_batch` selection: distinct non-bool ints.
+
+        Returns the indices sorted ascending; every index is also checked
+        against the retained range up front, so a bad index aborts before the
+        key evolves even once. Wrong index types raise TypeError; a non-
+        iterable argument raises TypeError; duplicates raise ValueError; a
+        non-retained index raises IndexError, exactly as :meth:`entry`.
+        """
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        ordered: list[int] = []
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < len(self):
+                raise IndexError(f"no retained entry at index {index}")
+            selected.add(index)
+            ordered.append(index)
+        ordered.sort()
+        return ordered
+
     def auth_batch(
         self, indices: Iterable[int]
     ) -> tuple[tuple[Entry, AuthTag], ...]:
@@ -1344,24 +1371,7 @@ class AuditLog:
         IndexError, exactly as :meth:`auth`); keyless mode raises ValueError.
         """
         key = self._require_key()
-        try:
-            iterator = iter(indices)
-        except TypeError:
-            raise TypeError("indices must be an iterable of integers") from None
-        selected: set[int] = set()
-        ordered: list[int] = []
-        for index in iterator:
-            if not isinstance(index, int) or isinstance(index, bool):
-                raise TypeError("indices must be non-bool integers")
-            if index in selected:
-                raise ValueError(f"duplicate index {index}")
-            # entry() also type- and range-checks, but resolve every entry up
-            # front so a bad index aborts before the key evolves even once.
-            if not self._retain_from <= index < len(self):
-                raise IndexError(f"no retained entry at index {index}")
-            selected.add(index)
-            ordered.append(index)
-        ordered.sort()
+        ordered = self._resolve_auth_indices(indices)
         count = len(ordered)
         if self._stage + count >= _MAX_STAGE:
             raise ValueError("stage limit reached; cannot evolve the key that far")
@@ -1451,6 +1461,93 @@ class AuditLog:
             verifier=verifier,
             signature=signature,
         )
+
+    def signed_auth_bundle(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+    ) -> SignedAuthBundle:
+        """Atomically issue a :class:`SignedAuthBundle`.
+
+        The one-call fusion of :meth:`export_signed_verifier` and
+        :meth:`auth_batch`: it delivers the signed stage-0
+        :class:`SignedVerifier` together with the forward-secure tags of the
+        selected entries in ascending absolute-index order, so a caller never
+        observes the half-committed states a separate export-then-batch
+        sequence can leave (a consumed export with no tags, or an evolved key
+        with no signed material). No new signing message is introduced: the
+        embedded signature is byte-for-byte the Ed25519 signature
+        :meth:`export_signed_verifier` makes over
+        ``D || 0x01 || B(UTF-8(hash_name)) || B(key)`` with
+        ``D = b"auditchain/signed-verifier/v1\\0"``, and the j-th tag reuses
+        exactly :meth:`auth_batch`'s HMAC, 8-byte big-endian stage encoding
+        and key evolution — the items are byte-for-byte what j consecutive
+        ascending :meth:`auth` calls from the initial key produce, with the
+        j-th tag at ``stage == j``.
+
+        The same one-shot export eligibility as :meth:`export_signed_verifier`
+        applies: a keyed log still at ``stage == 0`` with the verifier not yet
+        exported. ``private_key`` is a 32-byte Ed25519 seed used for this one
+        signature and never stored. Every check — key mode, seed, indices,
+        duplicates, retained range, stage capacity and export eligibility —
+        runs before the signature is made or any state changes: a failure
+        consumes no export eligibility, never evolves the key and leaves
+        stored tags, entries and every other log object untouched. An empty
+        selection still delivers the signed stage-0 material (consuming the
+        export) while the stage does not advance; a non-empty selection
+        advances the stage exactly once per selected entry, exactly like
+        :meth:`auth_batch`. A non-``bytes`` seed, a non-iterable
+        ``indices`` or a non-integer/``bool`` index raises TypeError; a seed
+        that is not 32 bytes, duplicate indices, stage-capacity exhaustion,
+        keyless mode, a non-zero stage or a repeat export raises ValueError;
+        a non-retained index raises IndexError, exactly as
+        :meth:`auth_batch`.
+        """
+        key = self._require_key()
+        signing_key = _load_ed25519_seed(private_key)
+        ordered = self._resolve_auth_indices(indices)
+        count = len(ordered)
+        if self._stage + count >= _MAX_STAGE:
+            raise ValueError("stage limit reached; cannot evolve the key that far")
+        if self._stage != 0 or self._verifier_exported:
+            raise ValueError(
+                "verifier can only be exported once and before the first key evolution"
+            )
+        # All validation passed. Build the signature and every tag against
+        # local variables first, so nothing below mutates the log until the
+        # single commit at the end: a failure here cannot leave a consumed
+        # export or a half-evolved key.
+        verifier = Verifier(key=key, hash_name=self._hash_name)
+        message = _signed_verifier_message(self._hash_name, key)
+        receipt = SignedVerifier(
+            version=_SIGNED_VERIFIER_VERSION,
+            verifier=verifier,
+            signature=signing_key.sign(message),
+        )
+        current_key = key
+        items: list[tuple[Entry, AuthTag]] = []
+        new_tags: dict[int, AuthTag] = {}
+        for position, index in enumerate(ordered):
+            stage = position
+            entry = self._entries[index - self._retain_from]
+            tag = AuthTag(
+                stage=stage,
+                tag=_auth_tag(stage, entry.entry_hash, current_key, self._hash_name),
+            )
+            items.append((entry, tag))
+            new_tags[index] = tag
+            current_key = _evolve_key(current_key, self._hash_name)
+        bundle = SignedAuthBundle(
+            verifier=receipt,
+            hash_name=self._hash_name,
+            items=tuple(items),
+        )
+        # Commit the export and the whole batch atomically.
+        self._verifier_exported = True
+        self._tags.update(new_tags)
+        self._key = current_key
+        self._stage += count
+        return bundle
 
     def entries(self) -> list[Entry]:
         return list(self._entries)

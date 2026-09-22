@@ -946,6 +946,24 @@ verify_signed_auth_bundle(restored, public_key)   # (True, True)：逐项核验
 verify_signed_auth_bundle(restored, other_key)    # (False, False)：验签失败逐项 False
 ```
 
+也可一步原子签发：`log.signed_auth_bundle(indices, private_key)` 在一次调用内同时
+交付已签名的 stage-0 验证材料与按绝对索引升序的前向安全标签，直接返回冻结的
+`SignedAuthBundle`，避免分步执行留下半提交状态：
+
+```python
+bundle = log.signed_auth_bundle([1, 3], seed)   # 原子签发，等价于上面两步的合并
+```
+
+- `signed_auth_bundle(indices, private_key)` 是 `export_signed_verifier` 与
+  `auth_batch` 的原子融合：签名原文逐字节复用 `export_signed_verifier` 的
+  Ed25519 签名消息，标签逐字节复用 `auth_batch` 的 HMAC 域、u64 大端 stage 与
+  key-evolve 顺序，不新增任何签名域；`verifier` 为本次签发的 stage-0 材料，
+  `hash_name` 为日志算法，`items` 按绝对索引升序、第 j 项用 `stage=j`。资格为
+  两者的并集（带 key、`stage == 0`、未导出过、`stage + 条数 < 2**64`）；私钥、
+  索引、重复、保留范围、资格与容量全部先校验，任何失败都不消耗导出资格、不演进
+  密钥、不改标签或日志状态；空选择仍交付签名材料并消耗导出资格但 stage 不变，
+  成功则消耗资格并恰推进所选条数。`private_key` 或索引类型错抛 `TypeError`，
+  种子非 32 字节、重复、容量或资格不符抛 `ValueError`，非保留索引抛 `IndexError`
 - 交付包为冻结的 `SignedAuthBundle(verifier, hash_name, items)`，支持位置构造、
   按全部三个字段相等；`verifier` 必须是 `SignedVerifier`，`hash_name` 必须是已知
   固定输出算法名，`items` 即 `auth_batch` 的结果元组（必须是 `tuple`）。容器字段
@@ -1407,6 +1425,13 @@ python3 -m auditchain
     所有校验先于签名和资格消耗，失败不消耗资格、不演进密钥、不改日志。种子类型错
     抛 `TypeError`、长度非 32 抛 `ValueError`；无密钥模式、已演进或重复导出抛
     `ValueError`；离线用 `verify_signed_verifier` 凭预信任公钥验真
+  - `signed_auth_bundle(indices, private_key)` — `export_signed_verifier` 与
+    `auth_batch` 的原子融合：一次调用交付冻结 `SignedAuthBundle`（本次签发的
+    stage-0 签名验证材料 + 按绝对索引升序的前向安全标签，第 j 项 `stage=j`），
+    签名原文与标签域逐字节复用两者，不新增签名域；资格为两者并集，全部校验先于
+    任何计算与资格消耗，失败不消耗资格、不演进密钥、不改日志；空选择仍交付签名
+    材料（stage 不变），成功恰推进所选条数；类型错抛 `TypeError`，种子非 32
+    字节、重复、容量或资格不符抛 `ValueError`，非保留索引抛 `IndexError`
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量

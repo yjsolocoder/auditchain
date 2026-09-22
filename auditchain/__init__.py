@@ -1452,6 +1452,102 @@ class AuditLog:
             signature=signature,
         )
 
+    def signed_auth_bundle(
+        self, indices: Iterable[int], private_key: Any
+    ) -> SignedAuthBundle:
+        """Atomically issue a signed stage-0 verifier and an auth batch.
+
+        The one-call fusion of :meth:`export_signed_verifier` and
+        :meth:`auth_batch`: a successful call consumes the one-shot export
+        eligibility and mints forward-secure tags for the selected entries,
+        returning both halves as a single frozen :class:`SignedAuthBundle`
+        so no interleaved state can observe one half without the other. The
+        signed message is byte-for-byte the :meth:`export_signed_verifier`
+        one and each tag reuses exactly the HMAC domain, 8-byte big-endian
+        stage encoding and key-evolution of :meth:`auth` — no new signing
+        or authentication domain is introduced. ``verifier`` carries the
+        stage-0 material of this very issuance, ``hash_name`` is the log's
+        algorithm and ``items`` lists the ``(Entry, AuthTag)`` pairs in
+        ascending absolute index order, the j-th item minted at stage j,
+        byte-for-byte equal to what j consecutive ascending :meth:`auth`
+        calls from the initial key would have produced.
+
+        ``indices`` is an iterable of distinct non-bool integers and
+        ``private_key`` a 32-byte Ed25519 seed used for this one signature
+        only. Eligibility is the union of both fused calls: a keyed log,
+        still at ``stage == 0`` with the verifier not yet exported, and
+        ``stage + count < 2**64``. Every check — key mode, the seed, each
+        index, duplicates, the retained range, eligibility and the stage
+        capacity — runs before anything is computed or consumed: a failure
+        leaves the export eligibility, key, stage, stored tags, entries and
+        every other log state untouched. An empty selection still delivers
+        the signed material (with ``items == ()``) and consumes the export
+        eligibility but leaves the stage unchanged; otherwise the stage
+        advances exactly once per selected entry. A non-``bytes`` seed or a
+        wrong index type raises TypeError; a seed that is not 32 bytes, a
+        duplicate index, an exhausted stage space or a failed eligibility
+        raises ValueError; a non-retained index raises IndexError, exactly
+        as :meth:`auth_batch`.
+        """
+        key = self._require_key()
+        signing_key = _load_ed25519_seed(private_key)
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        ordered: list[int] = []
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            # Resolve every index up front so a bad one aborts before the
+            # export eligibility is consumed or the key evolves even once.
+            if not self._retain_from <= index < len(self):
+                raise IndexError(f"no retained entry at index {index}")
+            selected.add(index)
+            ordered.append(index)
+        ordered.sort()
+        count = len(ordered)
+        if self._stage != 0 or self._verifier_exported:
+            raise ValueError(
+                "verifier can only be exported once and before the first key evolution"
+            )
+        if self._stage + count >= _MAX_STAGE:
+            raise ValueError("stage limit reached; cannot evolve the key that far")
+        # All validation passed; sign and mint against the current key, then
+        # commit eligibility, tags, key and stage in one final state swap.
+        verifier = Verifier(key=key, hash_name=self._hash_name)
+        message = _signed_verifier_message(self._hash_name, key)
+        signature = signing_key.sign(message)
+        current_key = key
+        items: list[tuple[Entry, AuthTag]] = []
+        new_tags: dict[int, AuthTag] = {}
+        for position, index in enumerate(ordered):
+            stage = self._stage + position
+            entry = self._entries[index - self._retain_from]
+            tag = AuthTag(
+                stage=stage,
+                tag=_auth_tag(stage, entry.entry_hash, current_key, self._hash_name),
+            )
+            items.append((entry, tag))
+            new_tags[index] = tag
+            current_key = _evolve_key(current_key, self._hash_name)
+        self._verifier_exported = True
+        self._tags.update(new_tags)
+        self._key = current_key
+        self._stage += count
+        return SignedAuthBundle(
+            verifier=SignedVerifier(
+                version=_SIGNED_VERIFIER_VERSION,
+                verifier=verifier,
+                signature=signature,
+            ),
+            hash_name=self._hash_name,
+            items=tuple(items),
+        )
+
     def entries(self) -> list[Entry]:
         return list(self._entries)
 

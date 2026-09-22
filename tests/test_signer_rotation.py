@@ -300,12 +300,26 @@ class VerifyRotationTest(unittest.TestCase):
 
     def test_item_shape_validation(self):
         old, new_key, new, auth = self.item
-        not_tuples = ([], None, "x", object())
-        wrong_shapes = ((), (old,), (old, new_key), (old, new_key, new))
-        five_tuple = (old, new_key, new, auth, b"extra")
-        for bad in (*not_tuples, *wrong_shapes, five_tuple, [old, new_key, new, auth]):
+        # Anything that is not a tuple at all raises TypeError, even a list
+        # holding the right four elements.
+        not_tuples = ([], None, "x", object(), [old, new_key, new, auth])
+        for bad in not_tuples:
             with self.subTest(bad=type(bad)):
                 with self.assertRaises(TypeError):
+                    verify_rotation(bad, self.old_public)
+
+    def test_wrong_tuple_length_raises_value_error(self):
+        old, new_key, new, auth = self.item
+        wrong_shapes = (
+            (),
+            (old,),
+            (old, new_key),
+            (old, new_key, new),
+            (old, new_key, new, auth, b"extra"),
+        )
+        for bad in wrong_shapes:
+            with self.subTest(length=len(bad)):
+                with self.assertRaises(ValueError):
                     verify_rotation(bad, self.old_public)
 
     def test_element_type_validation(self):

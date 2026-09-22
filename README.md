@@ -890,6 +890,30 @@ verify_auth(log.entry(0), tag, receipt.verifier)  # True：交付的材料照常
   `bytearray` / `memoryview` 等抛 `TypeError`；二者不是 32 字节、`version` 非 `1`、
   嵌套字段类型或宽度非法、空 `key`、未知摘要算法或 `signature` 不是 64 字节抛
   `ValueError`；验签入口为只读
+- `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` 把回执序列化为
+  规范二进制并原样还原，使 stage-0 验证材料可落盘、跨进程传输后继续凭预信任公钥
+  由 `verify_signed_verifier` 离线验真：
+
+```python
+from auditchain import encode_signed_verifier, decode_signed_verifier
+
+data = encode_signed_verifier(receipt)         # bytes，可写文件/发网络
+restored = decode_signed_verifier(data)        # SignedVerifier，字段与原回执相等
+restored == receipt                            # True
+encode_signed_verifier(restored) == data       # True：重编码逐字节相同
+verify_signed_verifier(restored, public_key)   # True：无需持有日志
+```
+
+  编码以魔数 `b"auditchain/signed-verifier/v1\0"` 开头，依次写 `version`（恒为
+  `1`）、`hash_name` 的 UTF-8 blob、`verifier.key` blob、`signature` blob；所有
+  整数为 8 字节无符号大端，每个 blob 为 u64 字节长度前缀加原始字节（零长度也是
+  全零 u64）。编码只认证来源、**不加密**其中密钥，字节流须像裸 `Verifier` 一样
+  保护。`encode_signed_verifier` 只接受 `SignedVerifier`、
+  `decode_signed_verifier` 只接受 `bytes`（含拒绝 `bytearray` / `memoryview`），
+  非对应类型或绕过构造器写入的字段类型错抛 `TypeError`；魔数、版本、UTF-8、未知
+  算法、截断、尾随、blob 长度、空 `key` 或签名宽度非法抛 `ValueError`；结构合法
+  但签名与字段不匹配仍可解码，`verify_signed_verifier` 返回 `False`。两个入口
+  均为只读
 
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
@@ -1461,6 +1485,17 @@ python3 -m auditchain
   不是 `bytes` 抛 `TypeError`；嵌套结构非法沿用 `PruneReceipt` /
   `SignedRoot` / `verify_signed_root` 的既有异常（`TypeError` /
   `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
+- `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
+  stage-0 验证材料的规范二进制编码与解码：魔数
+  `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
+  UTF-8 blob、verifier.key blob、signature blob；整数为 8 字节无符号大端，blob 为
+  u64 长度前缀加原始字节（零长度也写全零 u64）。解码结果字段与原回执相等、类型为
+  `bytes`，重编码逐字节相同，并可继续由 `verify_signed_verifier` 离线验真。编码
+  只认证来源、不加密其中密钥。前者只接受 `SignedVerifier`，后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；非对应类型或字段类型错（含绕过冻结构造器
+  的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、blob 长度、
+  空 `key` 或签名宽度非法抛 `ValueError`；结构合法但签名不匹配仍可解码，验签
+  返回 `False`；两个入口均为只读
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head

@@ -1226,6 +1226,43 @@ verify_continuation_chain(restored, public_key)  # True：无需持有日志
   关联，结构合法但验真不匹配仍可解码，由 `verify_continuation_chain` 返回
   `False`；两个入口均只读且确定，旧接口和签名域不变
 
+#### 续接链只读诊断（定位首个失败段或断裂边界）
+
+`verify_continuation_chain` 只回答"整条链是否成立"。顶层
+`inspect_continuation_chain(receipts, public_key) -> ContinuationChainReport`
+是它的只读诊断对应物：同样的入参、同样的核验规则，但返回一个冻结报告，定位
+**最早**出现问题的段或断裂边界，全程不持有日志、不修改凭据，也**不新增任何
+签名域**（所有密码学检查仍委托既有
+`verify_signed_auth_audit_continuation`）：
+
+```python
+from auditchain import inspect_continuation_chain
+
+report = inspect_continuation_chain(chain, public_key)
+report == ContinuationChainReport(True, None, None)   # 有效链：成功报告
+report.ok                                             # True
+
+bad = inspect_continuation_chain((chain[0], chain[0]), public_key)
+bad == ContinuationChainReport(False, 1, "duplicate") # 第 1 段重复
+```
+
+- 冻结 `ContinuationChainReport(ok, index, code)` 按位置构造、按三字段相等与
+  哈希；成功报告恒为 `(True, None, None)`。失败报告的 `index` 是本段位置，
+  `code` 取 `"verify"` / `"growth"` / `"duplicate"` / `"link"` 之一；未知
+  `code` 抛 `ValueError`
+- 诊断分两阶段，只报告最早问题：先按序逐段调用
+  `verify_signed_auth_audit_continuation`，验真失败报 `"verify"`，
+  `old.size >= new.size`（等长或回退，不描述任何追加）报 `"growth"`；随后
+  在全部真实且增长的段上查找重复凭据（报 `"duplicate"`），并比较前段
+  `consistency.new` 与本段 `consistency.old` 全字段（`version`、
+  `hash_name`、`size`、`root`、`head` 及 Ed25519 签名本身），不符报
+  `"link"`。`"link"` 的 `index` 取本段位置，但只标识断裂边界、不归责于某一
+  段
+- 入参约定与 `verify_continuation_chain` 完全一致：首参只收非空 `tuple`
+  （非 `tuple` 或元素类型错抛 `TypeError`，空 tuple 抛 `ValueError`），公钥
+  须为 32 字节 `bytes`（非 `bytes` 抛 `TypeError`，长度错抛 `ValueError`），
+  嵌套结构异常按既有核验规则原样传播。调用只读，旧接口与编解码不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带

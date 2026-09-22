@@ -11,6 +11,7 @@ encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_auth_batch / decode_auth_batch /
+encode_signed_verifier / decode_signed_verifier /
 encode_signed_root / decode_signed_root /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_consistency / decode_signed_consistency /
@@ -66,6 +67,7 @@ __all__ = [
     "decode_signed_consistency",
     "decode_signed_prune",
     "decode_signed_root",
+    "decode_signed_verifier",
     "decrypt_entry",
     "dump_auth",
     "dump_hybrid",
@@ -83,6 +85,7 @@ __all__ = [
     "encode_signed_consistency",
     "encode_signed_prune",
     "encode_signed_root",
+    "encode_signed_verifier",
     "entry_digest",
     "load_auth",
     "load_hybrid",
@@ -164,7 +167,11 @@ _ED25519_SIGNATURE_BYTES = 64
 # Signed stage-0 verifier of AuditLog.export_signed_verifier /
 # verify_signed_verifier. An Ed25519 signature over the verifier's hash
 # algorithm and stage-0 key; the signature authenticates the source only, it
-# does not encrypt the key it carries.
+# does not encrypt the key it carries. The same domain is the magic of the
+# encode_signed_verifier / decode_signed_verifier binary framing: the magic,
+# then the envelope version as a u64 and the hash_name, verifier key and
+# signature as u64-length-prefixed blobs, in that order and with nothing
+# else.
 _SIGNED_VERIFIER_DOMAIN = b"auditchain/signed-verifier/v1\0"
 _SIGNED_VERIFIER_VERSION = 1
 
@@ -3677,6 +3684,101 @@ def verify_signed_prune(item: Any, public_key: Any) -> bool:
         and receipt.size == checkpoint.size
         and hmac.compare_digest(receipt.merkle_root, checkpoint.root)
         and hmac.compare_digest(receipt.chain_hash, checkpoint.head)
+    )
+
+
+def encode_signed_verifier(receipt: Any) -> bytes:
+    """Encode a :class:`SignedVerifier` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-verifier/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear in the
+    order ``version`` (always 1), ``hash_name`` (UTF-8 blob), ``verifier.key``
+    blob and ``signature`` blob. ``receipt`` must be a :class:`SignedVerifier`
+    — anything else, or a receipt whose fields have been bypassed to wrong
+    types, raises TypeError; a version other than 1, an unknown hash
+    algorithm, an empty key or a signature that is not 64 bytes raises
+    ValueError. The encoding carries the stage-0 key in the clear — it
+    authenticates provenance only and does not encrypt the key — so the bytes
+    must be protected exactly like the receipt itself. The call is read-only
+    and deterministic: it never mutates the receipt, and re-encoding a
+    decoded one reproduces the original bytes exactly.
+    """
+    if not isinstance(receipt, SignedVerifier):
+        raise TypeError("receipt must be a SignedVerifier")
+    # Re-validate every field even for a receipt built with object.__setattr__
+    # bypassing the frozen constructor (the constructor also re-validates the
+    # nested Verifier), so structural corruption raises exactly as the
+    # constructor would.
+    checked = SignedVerifier(
+        receipt.version,
+        receipt.verifier,
+        receipt.signature,
+    )
+    return b"".join((
+        _SIGNED_VERIFIER_DOMAIN,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.verifier.hash_name.encode("utf-8")),
+        _encode_blob(checked.verifier.key),
+        _encode_blob(checked.signature),
+    ))
+
+
+def decode_signed_verifier(data: Any) -> SignedVerifier:
+    """Decode bytes produced by :func:`encode_signed_verifier`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown hash algorithm, truncation,
+    trailing bytes, an oversized blob length, an empty key or a signature
+    that is not 64 bytes raises ValueError. The decoded receipt's fields
+    equal the originally encoded ones, re-encoding reproduces the original
+    bytes exactly, and it verifies under :func:`verify_signed_verifier`
+    whenever the original did; a structurally sound encoding whose signature
+    does not match the claimed fields still decodes, and verification
+    returns False. The encoding carries the stage-0 key in the clear, so
+    ``data`` must be protected exactly like the receipt itself.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_VERIFIER_DOMAIN):
+        raise ValueError("not an auditchain signed-verifier encoding")
+    offset = len(_SIGNED_VERIFIER_DOMAIN)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    key = read_blob("verifier.key")
+    signature = read_blob("signature")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed verifier")
+    return SignedVerifier(
+        version=version,
+        verifier=Verifier(key=key, hash_name=hash_name),
+        signature=signature,
     )
 
 

@@ -8,7 +8,8 @@ ContinuationChainReport / AnchoredContinuationChain /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
 verify_audit_batch / inspect_continuation_chain / inspect_anchors /
-inspect_anchored_continuations / verify_signed_verifier / verify_signed_root /
+inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
+verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
@@ -109,6 +110,7 @@ __all__ = [
     "encode_signed_root",
     "encode_signed_verifier",
     "entry_digest",
+    "inspect_anchor_set",
     "inspect_anchored_continuations",
     "inspect_anchors",
     "inspect_continuation_chain",
@@ -120,6 +122,7 @@ __all__ = [
     "load_pruned_log",
     "load_secure_log",
     "load_secure_pruned",
+    "merge_anchor_set",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -1246,13 +1249,18 @@ class AnchoredContinuationChain:
 # expected anchor; "end" — the last segment's new checkpoint is not the
 # expected anchor. "link" names only the boundary between segments, it does
 # not blame either one. "start" and "end" are reported by inspect_anchors
-# only, never by inspect_continuation_chain.
+# only, never by inspect_continuation_chain. "anchor_link" names the boundary
+# between two separately persisted packages in an anchor set — the prior
+# package's end anchor not equalling the following package's start anchor —
+# and is reported only by inspect_anchor_set, at the global position of the
+# following package's first receipt.
 _CHAIN_CODE_VERIFY = "verify"
 _CHAIN_CODE_GROWTH = "growth"
 _CHAIN_CODE_DUPLICATE = "duplicate"
 _CHAIN_CODE_LINK = "link"
 _CHAIN_CODE_START = "start"
 _CHAIN_CODE_END = "end"
+_CHAIN_CODE_ANCHOR_LINK = "anchor_link"
 _CHAIN_CODES = frozenset(
     {
         _CHAIN_CODE_VERIFY,
@@ -1261,6 +1269,7 @@ _CHAIN_CODES = frozenset(
         _CHAIN_CODE_LINK,
         _CHAIN_CODE_START,
         _CHAIN_CODE_END,
+        _CHAIN_CODE_ANCHOR_LINK,
     }
 )
 
@@ -1285,12 +1294,16 @@ class ContinuationChainReport:
       ``old`` boundary does not join its predecessor's ``new`` for
       ``"link"``; for the anchor codes of :func:`inspect_anchors` it is ``0``
       for ``"start"`` and the last segment's position for ``"end"``;
+      for ``"anchor_link"`` it is the global position, across all packages,
+      of the following package's first receipt;
       ``None`` exactly when ``ok`` is ``True``;
     - ``code``: one of ``"verify"``, ``"growth"``, ``"duplicate"``,
-      ``"link"``, ``"start"`` or ``"end"`` describing that first failure;
-      ``None`` exactly when ``ok`` is ``True``. A ``"link"`` code identifies
-      the boundary only and blames neither segment. ``"start"`` and
-      ``"end"`` are reported by :func:`inspect_anchors` only.
+      ``"link"``, ``"start"``, ``"end"`` or ``"anchor_link"`` describing
+      that first failure; ``None`` exactly when ``ok`` is ``True``. A
+      ``"link"`` code identifies the boundary only and blames neither
+      segment. ``"start"`` and ``"end"`` are reported by
+      :func:`inspect_anchors` only, and ``"anchor_link"`` — the boundary
+      between two persisted packages — by :func:`inspect_anchor_set` only.
 
     Reports are immutable, may be built positionally and compare by all three
     fields. The success report is ``ContinuationChainReport(True, None, None)``.
@@ -1317,7 +1330,8 @@ class ContinuationChainReport:
         if self.code not in _CHAIN_CODES:
             raise ValueError(
                 f"unknown chain code {self.code!r}; expected one of "
-                "'verify', 'growth', 'duplicate', 'link', 'start', 'end'"
+                "'verify', 'growth', 'duplicate', 'link', 'start', 'end', "
+                "'anchor_link'"
             )
         if not isinstance(self.index, int) or isinstance(self.index, bool):
             raise TypeError("index must be an integer or None")
@@ -5786,6 +5800,130 @@ def decode_anchored_continuations(data: Any) -> AnchoredContinuationChain:
     if offset != len(data):
         raise ValueError("trailing bytes after the anchored continuations")
     return AnchoredContinuationChain(receipts, start, end)
+
+
+def inspect_anchor_set(
+    items: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose an ordered set of persisted anchored chains as one span.
+
+    When a long continuation chain has been persisted in **batches** — each
+    batch an :class:`AnchoredContinuationChain` carrying its own receipts and
+    ``start``/``end`` anchors — an offline party holding only the
+    pre-trusted key can confirm in one call that the batches, in the given
+    package order, both verify individually and join end-to-end into one
+    continuous span. It is exactly as read-only as
+    :func:`inspect_anchored_continuations`, which it delegates to: it holds
+    neither the log nor any checkpoint history, introduces no new Ed25519 or
+    HMAC signing domain and never mutates the packages or the key.
+
+    The packages are examined in the tuple's own order. Each package is first
+    diagnosed independently by
+    :func:`inspect_anchored_continuations`; a failing report is returned with
+    its **local** index translated to the credential's **global** position —
+    the failed package's index plus the number of receipts in every earlier
+    package — while its code (``"verify"``, ``"growth"``, ``"duplicate"``,
+    ``"link"``, ``"start"`` or ``"end"``) is unchanged, so the first failing
+    segment or anchor is located exactly as if the packages were one chain.
+    Only once a package is itself sound is the seam before it compared: the
+    previous package's ``end`` anchor must equal this package's ``start``
+    anchor on all six :class:`SignedRoot` fields (``version``,
+    ``hash_name``, ``size``, ``root``, ``head`` and the Ed25519
+    ``signature``) — a mismatch reports ``"anchor_link"`` at the global
+    position of this package's first receipt. The code names the boundary
+    between the two packages and blames neither one. When every package
+    verifies and every seam joins, the report is
+    ``ContinuationChainReport(True, None, None)``.
+
+    ``items`` must be a non-empty ``tuple`` of
+    :class:`AnchoredContinuationChain` objects: a non-tuple (including a
+    list, a single package, a generator or ``None``) or an element of another
+    type raises TypeError, and an empty tuple raises ValueError. ``key`` must
+    be a 32-byte ``bytes`` Ed25519 key: a non-``bytes`` value (including
+    ``bytearray``) raises TypeError and a ``bytes`` value of another length
+    raises ValueError. Nested structural violations raised while diagnosing a
+    package propagate unchanged (TypeError or ValueError) rather than
+    becoming a report.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError(
+            "items must be a non-empty tuple of AnchoredContinuationChain"
+        )
+    if len(items) == 0:
+        raise ValueError(
+            "items must be a non-empty tuple of AnchoredContinuationChain"
+        )
+    for item in items:
+        if not isinstance(item, AnchoredContinuationChain):
+            raise TypeError("each item must be an AnchoredContinuationChain")
+    if not isinstance(key, bytes):
+        raise TypeError("key must be a 32-byte Ed25519 public key")
+    if len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+    # Each package must independently verify — including spanning its own two
+    # anchors — before the seam before it is trusted to mean anything; a
+    # package-local failure keeps its code and is translated to the receipt's
+    # global position across the package order.
+    credential_offset = 0
+    previous_end: SignedRoot | None = None
+    for bundle in items:
+        report = inspect_anchored_continuations(bundle, key)
+        if not report.ok:
+            return ContinuationChainReport(
+                False, credential_offset + report.index, report.code
+            )
+        if previous_end is not None and bundle.start != previous_end:
+            return ContinuationChainReport(
+                False, credential_offset, _CHAIN_CODE_ANCHOR_LINK
+            )
+        previous_end = bundle.end
+        credential_offset += len(bundle.receipts)
+    return ContinuationChainReport(True, None, None)
+
+
+def merge_anchor_set(
+    items: Any, key: Any
+) -> AnchoredContinuationChain:
+    """Merge an ordered, verified anchor set into one persisted chain.
+
+    The constructive counterpart of :func:`inspect_anchor_set`: once the
+    batches of a long continuation chain persisted separately all verify and
+    join in order, this returns a single new frozen
+    :class:`AnchoredContinuationChain` spanning the whole set — the receipts
+    concatenated in package order and, within each package, in the package's
+    own receipt order, with ``start`` taken from the first package and
+    ``end`` from the last. The result is persisted with the existing
+    :func:`encode_anchored_continuations` exactly like any single package: no
+    new format, framing or signing domain is introduced.
+
+    The packages are first diagnosed by :func:`inspect_anchor_set`; the merge
+    proceeds only when it returns ``ContinuationChainReport(True, None,
+    None)`` — any failure (a package-local failure or an
+    ``"anchor_link"`` seam) raises ValueError. The call is strictly
+    read-only: it never mutates an input package, its receipts or its
+    anchors, and the returned chain is a new object that merely references
+    the existing immutable receipts and endpoint checkpoints.
+
+    ``items`` and ``key`` are validated exactly as in
+    :func:`inspect_anchor_set`, whose TypeError/ValueError rules and nested
+    structural exceptions apply and propagate unchanged: a non-tuple or a
+    wrongly typed package raises TypeError, while an empty tuple, a key of
+    another length than 32 bytes or a failed diagnosis raises ValueError.
+    """
+    report = inspect_anchor_set(items, key)
+    if not report.ok:
+        raise ValueError(
+            f"anchor set cannot be merged: {report.code!r} at global index "
+            f"{report.index}"
+        )
+    receipts = tuple(
+        receipt for bundle in items for receipt in bundle.receipts
+    )
+    return AnchoredContinuationChain(receipts, items[0].start, items[-1].end)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

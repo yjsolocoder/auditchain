@@ -1353,6 +1353,60 @@ inspect_anchored_continuations(restored, key)
   异常原样传播。解码不校验签名、证明、段间相邻与锚定关系，结构合法但
   验真不匹配仍可解码，由 `inspect_anchored_continuations` 报告而非抛出
 
+#### 多包锚定续接链：分批落盘的包按序核验、合并为单一制品
+
+一条很长的续接链若**分批落盘**——每批各自是一个带首尾锚点的
+`AnchoredContinuationChain`——离线方可凭预置信任公钥，用顶层
+`inspect_anchor_set(items, key) -> ContinuationChainReport`
+一次性确认这些包在给定包序下既各自成立、又首尾相接成一条连续跨度；
+随后用顶层
+`merge_anchor_set(items, key) -> AnchoredContinuationChain`
+把它们合并为**单一可持久化制品**。两者全程离线、只读：不持有日志与任何
+检查点历史、不修改任一输入包、不新增任何签名域或格式。
+
+```python
+from auditchain import (
+    inspect_anchor_set,
+    merge_anchor_set,
+    encode_anchored_continuations,
+    decode_anchored_continuations,
+)
+
+inspect_anchor_set((batch0, batch1, batch2), key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+merged = merge_anchor_set((batch0, batch1, batch2), key)
+merged.start == batch0.start                 # 端点取首包 start
+merged.end == batch2.end                     # 与末包 end
+merged.receipts == batch0.receipts + batch1.receipts + batch2.receipts
+# 合并结果沿用既有编码，不设新格式：
+decode_anchored_continuations(encode_anchored_continuations(merged)) == merged
+```
+
+- `inspect_anchor_set` 按 tuple 的包序、对每包调用既有
+  `inspect_anchored_continuations`；某包失败时其码（`"verify"`、
+  `"growth"`、`"duplicate"`、`"link"`、`"start"`、`"end"`）不变，
+  `index` 由**包内位置**换算为凭据的**全局位置**——加上此前各包的凭据数
+- 仅当一包自身成立后才比较其前接缝：前一包的 `end` 必须与本包 `start`
+  按 `SignedRoot` 全六字段（`version`、`hash_name`、`size`、`root`、
+  `head` 及 Ed25519 `signature`）全等；不符报新码 `"anchor_link"`，
+  `index` 取**后包首凭据的全局位置**，该码只标识两包之间的边界、不归责
+  任一包。所有包均成立且所有接缝相接时返回 `(True, None, None)`
+- `ContinuationChainReport` 的构造与相等规则不变，合法码集合仅新增
+  `"anchor_link"`（仅由 `inspect_anchor_set` 报告）；旧码与旧接口不变
+- `merge_anchor_set` 先调用 `inspect_anchor_set`，**仅在诊断成功**时
+  返回新的冻结 `AnchoredContinuationChain`：按包序、包内序拼接
+  `receipts`，`start` 取首包、`end` 取末包；合并结果沿用既有
+  `encode_anchored_continuations`，不引入新格式。诊断失败抛
+  `ValueError`。调用只读，不修改任何输入包（返回对象仅引用既有的不可变
+  凭据与端点）
+- 调用前校验：`items` 必须是锚定包的非空 `tuple`——非 `tuple`（含单个
+  包、list、生成器、`None`）或元素非 `AnchoredContinuationChain` 抛
+  `TypeError`，空集抛 `ValueError`；`key` 须为恰好 32 字节 `bytes`：
+  非 `bytes`（含 `bytearray`）抛 `TypeError`，长度不符抛 `ValueError`；
+  空集、密钥长度不符或合并诊断失败均抛 `ValueError`。结构非法凭据的嵌套
+  异常按既有规则**原样传播**
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -2106,6 +2160,21 @@ python3 -m auditchain
   与首错顺序完全沿用 `inspect_anchors`；`bundle` 非
   `AnchoredContinuationChain` 抛 `TypeError`，`key` 及各字段校验与嵌套
   异常原样传播；离线、只读、不新增签名域
+- `inspect_anchor_set(items, key)` / `merge_anchor_set(items, key)` —
+  多包锚定续接链的按序核验与合并，使分批落盘的
+  `AnchoredContinuationChain` 可离线确认首尾相接并合并为单一可持久化
+  制品：前者按包序逐包调用 `inspect_anchored_continuations`，包内失败码
+  （`"verify"`、`"growth"`、`"duplicate"`、`"link"`、`"start"`、
+  `"end"`）不变、`index` 加上此前各包凭据数换算为全局位置；相邻包的
+  前包 `end` 与后包 `start` 须按 `SignedRoot` 全六字段全等，否则报新码
+  `"anchor_link"`（`index` 取后包首凭据的全局位置，只标识边界）；全部
+  成立返回 `(True, None, None)`。后者仅在诊断成功时返回新冻结对象：按
+  包序、包内序拼接 `receipts`，端点取首包 `start` 与末包 `end`，沿用既有
+  `encode_anchored_continuations`、不设新格式，诊断失败抛 `ValueError`。
+  `items` 须为锚定包的非空 `tuple`（非 `tuple`/元素类型错抛
+  `TypeError`，空集抛 `ValueError`），`key` 须为 32 字节 `bytes`
+  （非 `bytes` 抛 `TypeError`，长度错抛 `ValueError`），嵌套异常原样
+  传播；两者只读、不修改任一输入包、不新增签名域，旧接口与原码不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

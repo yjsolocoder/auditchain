@@ -915,6 +915,64 @@ verify_signed_verifier(restored, public_key)   # True：无需持有日志
   但签名与字段不匹配仍可解码，`verify_signed_verifier` 返回 `False`。两个入口
   均为只读
 
+#### 可信认证批次交付包（Ed25519）
+
+`SignedVerifier` 解决"验证材料从哪来"，`auth_batch` 解决"批量签发"，但两者仍要
+分别交付、分别核对。`SignedAuthBundle(verifier, hash_name, items)` 把已签名的
+stage-0 验证材料与前向安全认证批次合并成**一个**不可变交付包：离线方只凭预置信任
+的 32 字节 Ed25519 公钥先确认来源，再逐项核验标签，全程不持有日志、也不新增任何
+签名原文（签名仍是 `SignedVerifier` 里那一份）：
+
+```python
+from auditchain import (
+    SignedAuthBundle,
+    decode_signed_auth_bundle,
+    encode_signed_auth_bundle,
+    verify_signed_auth_bundle,
+)
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d"):
+    log.append(record)
+receipt = log.export_signed_verifier(seed)   # 已签名的 stage-0 验证材料
+items = log.auth_batch([1, 3])               # 前向安全认证批次
+bundle = SignedAuthBundle(receipt, log.hash_name, items)
+
+data = encode_signed_auth_bundle(bundle)     # bytes，可写文件/发网络
+restored = decode_signed_auth_bundle(data)   # 冻结 SignedAuthBundle，字段相等
+restored == bundle                           # True
+encode_signed_auth_bundle(restored) == data  # True：重编码逐字节相同
+verify_signed_auth_bundle(restored, public_key)   # (True, True)：逐项核验
+verify_signed_auth_bundle(restored, other_key)    # (False, False)：验签失败逐项 False
+```
+
+- 交付包为冻结的 `SignedAuthBundle(verifier, hash_name, items)`，支持位置构造、
+  按全部三个字段相等；`verifier` 必须是 `SignedVerifier`，`hash_name` 必须是已知
+  固定输出算法名，`items` 即 `auth_batch` 的结果元组（必须是 `tuple`）。容器字段
+  类型错抛 `TypeError`；项内部的结构契约沿用 `verify_auth_batch`，构造器不重复
+  校验
+- `verify_signed_auth_bundle(bundle, public_key) -> tuple[bool, ...]` 完全离线：
+  先用 `verify_signed_verifier` 以预信任公钥核验嵌套验证材料的签名，**验签失败
+  逐项返回 `False`**（结果长度与 `items` 相同，空批次为 `()`）；验签成功且
+  `bundle.hash_name` 与签名验证材料的算法一致时，复用 `verify_auth_batch` 以交付的
+  `Verifier` 逐项核验标签。算法不一致同样逐项 `False`，绝不抛异常冒充结构错误。
+  入参不是 `SignedAuthBundle`（含绕过构造器的容器字段类型错）或公钥不是 `bytes`
+  抛 `TypeError`；公钥不是 32 字节或嵌套结构非法沿用 `verify_signed_verifier` /
+  `verify_auth_batch` 的既有异常（`TypeError` / `ValueError`）；调用只读
+- `encode_signed_auth_bundle(x)` / `decode_signed_auth_bundle(data)` 把交付包
+  序列化为规范字节并原样还原，**不新增签名原文**：字节流为
+  `D || U(1) || B(S) || B(A)`，其中 `D = b"auditchain/signed-auth-bundle/v1\0"`，
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`（沿用 u64/blob 公开规则）；
+  `S`、`A` 依次为既有 `encode_signed_verifier(verifier)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的完整规范字节，验证材料在前、
+  认证批次在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有解码器
+- 类型错抛 `TypeError`（`encode` 只接受 `SignedAuthBundle`，`decode` 只接受
+  `bytes`，含拒绝 `bytearray` / `memoryview`）；公钥长度、魔数、版本、UTF-8、
+  未知算法、截断、尾随、blob 长度、嵌套格式或**嵌套算法不一致**（批次算法与签名
+  验证材料算法不符）抛 `ValueError`；签名或标签不匹配仍可正常解码，核验逐项
+  `False`。验证密钥在字节流中明文携带（只认证来源、不加密），须像裸 `Verifier`
+  一样保护；两个入口均只读且确定，旧接口不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1254,6 +1312,11 @@ python3 -m auditchain
   `signature` 只接受恰好 64 字节的精确 `bytes`（拒绝 `bytearray` /
   `memoryview`）；签名只认证来源、不加密其中密钥。类型非法抛 `TypeError`，版本非
   1、空 `key`、未知算法或 `signature` 不是 64 字节抛 `ValueError`
+- `SignedAuthBundle(verifier, hash_name, items)` — 不可变的可信认证批次交付包，
+  按全部三个字段相等、支持位置构造；`verifier` 为已签名的 stage-0 验证材料
+  （必须是 `SignedVerifier`），`hash_name` 为认证批次签发所用算法（必须是已知
+  固定输出算法名），`items` 即 `auth_batch` 的结果元组（必须是 `tuple`）；容器
+  字段类型错抛 `TypeError`，项内部的结构契约由 `verify_auth_batch` 校验
 - `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
@@ -1485,6 +1548,17 @@ python3 -m auditchain
   不是 `bytes` 抛 `TypeError`；嵌套结构非法沿用 `PruneReceipt` /
   `SignedRoot` / `verify_signed_root` 的既有异常（`TypeError` /
   `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
+- `verify_signed_auth_bundle(bundle, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥离线核验 `SignedAuthBundle` 可信认证批次交付包，无需持有日志、
+  不新增签名原文：先用 `verify_signed_verifier` 核验嵌套的已签名 stage-0 验证
+  材料，验签失败逐项返回 `False`（长度与 `items` 相同，空批次为 `()`）；验签
+  成功且 `bundle.hash_name` 与签名验证材料的算法一致时，复用
+  `verify_auth_batch` 以交付的 `Verifier` 逐项核验标签并返回同序
+  `tuple[bool, ...]`；算法不一致同样逐项 `False`。入参不是 `SignedAuthBundle`
+  （含绕过构造器的容器字段类型错）或公钥不是 `bytes` 抛 `TypeError`；公钥长度
+  非 32 字节抛 `ValueError`，嵌套结构非法沿用 `verify_signed_verifier` /
+  `verify_auth_batch` 的既有异常（`TypeError` / `ValueError`）；签名只认证
+  来源、不加密其中密钥，调用只读
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
@@ -1547,6 +1621,22 @@ python3 -m auditchain
   `ValueError`；解码对象字段相等、冻结且重编码逐字节相同；编解码不校验签名
   及两部分关联，结构合法但两部分不一致或签名不匹配仍可解码（
   `verify_signed_prune` 返回 `False`）；两个入口均为只读且确定
+- `encode_signed_auth_bundle(x)` / `decode_signed_auth_bundle(data)` — 可信
+  认证批次交付包的规范二进制编码与解码，使 `SignedAuthBundle` 可落盘、跨进程
+  恢复后继续凭预置信任的 Ed25519 公钥离线逐项核验，且不新增签名原文：字节流为
+  `D || U(1) || B(S) || B(A)`，其中 `D = b"auditchain/signed-auth-bundle/v1\0"`，
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`（沿用 u64 大端与既有
+  blob 规则）；`S` 与 `A` 分别是既有 `encode_signed_verifier(verifier)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的完整规范字节，验证材料在前、
+  认证批次在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有
+  `decode_signed_verifier` 与 `decode_auth_batch`，且批次算法必须与签名验证
+  材料的算法一致。前者只接受 `SignedAuthBundle`（其余类型抛 `TypeError`，嵌套
+  错误沿用既有编码器的 `TypeError` / `ValueError`），后者只接受 `bytes`（拒绝
+  `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度、任一嵌套
+  格式或两部分算法不一致抛 `ValueError`；解码对象字段相等、冻结且重编码逐字节
+  相同；编解码不校验签名与标签，结构合法但签名或标签不匹配仍可解码
+  （`verify_signed_auth_bundle` 逐项返回 `False`）；编码携带明文验证密钥，须像
+  裸 `Verifier` 一样保护；两个入口均为只读且确定
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

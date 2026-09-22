@@ -53,6 +53,7 @@ __all__ = [
     "IntegrityReport",
     "PruneReceipt",
     "SignedAuditBatch",
+    "SignedAuthBundle",
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
@@ -64,6 +65,7 @@ __all__ = [
     "decode_auth_batch",
     "decode_prune_receipt",
     "decode_signed_audit_batch",
+    "decode_signed_auth_bundle",
     "decode_signed_consistency",
     "decode_signed_prune",
     "decode_signed_root",
@@ -82,6 +84,7 @@ __all__ = [
     "encode_auth_batch",
     "encode_prune_receipt",
     "encode_signed_audit_batch",
+    "encode_signed_auth_bundle",
     "encode_signed_consistency",
     "encode_signed_prune",
     "encode_signed_root",
@@ -103,6 +106,7 @@ __all__ = [
     "verify_consistency",
     "verify_inclusion",
     "verify_signed_audit_batch",
+    "verify_signed_auth_bundle",
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
@@ -192,6 +196,13 @@ _SIGNED_CONSISTENCY_VERSION = 1
 # that order and with nothing else.
 _SIGNED_PRUNE_MAGIC = b"auditchain/signed-prune/v1\0"
 _SIGNED_PRUNE_VERSION = 1
+
+# Binary framing of encode_signed_auth_bundle / decode_signed_auth_bundle:
+# a fixed magic, then the envelope version as a u64 and two u64-length-prefixed
+# blobs holding the complete canonical encode_signed_verifier and
+# encode_auth_batch bytes, in that order and with nothing else.
+_SIGNED_AUTH_BUNDLE_MAGIC = b"auditchain/signed-auth-bundle/v1\0"
+_SIGNED_AUTH_BUNDLE_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -985,6 +996,48 @@ class SignedVerifier:
             raise ValueError(
                 f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
             )
+
+
+@dataclass(frozen=True)
+class SignedAuthBundle:
+    """Trusted delivery bundle of signed stage-0 material and an auth batch.
+
+    Merges the :class:`SignedVerifier` of
+    :meth:`AuditLog.export_signed_verifier` with the ``(Entry, AuthTag)``
+    item tuple of :meth:`AuditLog.auth_batch`, so an offline receiver
+    holding only a pre-trusted 32-byte Ed25519 public key can confirm where
+    the stage-0 verification material came from and then check every tag
+    against it — one artifact, no new signing message:
+
+    - ``verifier``: the :class:`SignedVerifier` carrying the signed stage-0
+      :class:`Verifier`,
+    - ``hash_name``: the hash algorithm the auth batch was minted under
+      (must agree with the nested verifier's algorithm for verification to
+      succeed),
+    - ``items``: the ``((Entry, AuthTag), ...)`` tuple produced by
+      :meth:`AuditLog.auth_batch`.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. Only the container shape is validated here: ``verifier``
+    must be a :class:`SignedVerifier`, ``hash_name`` a known hash algorithm
+    name and ``items`` a tuple; the items' own structural contract is left
+    to :func:`verify_auth_batch`, so a field of the wrong type raises
+    TypeError. The signature authenticates provenance only; the verifier
+    key travels in the clear.
+    """
+
+    verifier: SignedVerifier
+    hash_name: str
+    items: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verifier, SignedVerifier):
+            raise TypeError("verifier must be a SignedVerifier")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        _digest_size(self.hash_name)
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
 
 
 # Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
@@ -3683,6 +3736,46 @@ def verify_signed_prune(item: Any, public_key: Any) -> bool:
     )
 
 
+def verify_signed_auth_bundle(bundle: Any, public_key: Any) -> tuple[bool, ...]:
+    """Verify a :class:`SignedAuthBundle` against a pre-trusted Ed25519 key.
+
+    Confirms the trusted-delivery auth bundle entirely offline, without
+    holding the log: :func:`verify_signed_verifier` first checks the nested
+    :class:`SignedVerifier` against the pre-trusted 32-byte ``public_key``,
+    so the receiver learns the stage-0 verification material genuinely came
+    from the log holder. Only when that signature verifies *and* the
+    bundle's ``hash_name`` agrees with the signed verifier's algorithm are
+    the items checked, by reusing :func:`verify_auth_batch` with the
+    verified verifier; the per-item results come back as a tuple of
+    booleans in item order, ``()`` for an empty bundle. A signature that
+    does not verify, or a bundle whose ``hash_name`` disagrees with the
+    signed verifier's algorithm, yields ``False`` at every item position —
+    provenance failure is never silently upgraded to per-item detail.
+
+    Input that is not a :class:`SignedAuthBundle` (or whose container
+    fields have been bypassed to wrong types) raises TypeError; nested
+    structural violations raise exactly the exceptions of
+    :func:`verify_signed_verifier` and :func:`verify_auth_batch`
+    (TypeError or ValueError), and a public key that is not 32 ``bytes``
+    raises ValueError (a non-``bytes`` key TypeError). The signature
+    authenticates provenance only, not confidentiality: the verifier key
+    travels in the clear and must be protected by the caller. The call is
+    read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedAuthBundle):
+        raise TypeError("bundle must be a SignedAuthBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuthBundle(bundle.verifier, bundle.hash_name, bundle.items)
+    if not verify_signed_verifier(checked.verifier, public_key):
+        return tuple(False for _ in checked.items)
+    verifier = checked.verifier.verifier
+    if checked.hash_name != verifier.hash_name:
+        return tuple(False for _ in checked.items)
+    return verify_auth_batch(checked.items, verifier)
+
+
 def encode_signed_root(receipt: Any) -> bytes:
     """Encode a :class:`SignedRoot` into its canonical binary form.
 
@@ -4201,6 +4294,116 @@ def decode_signed_prune(data: Any) -> SignedPrune:
     receipt = decode_prune_receipt(receipt_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedPrune(receipt=receipt, checkpoint=checkpoint)
+
+
+def encode_signed_auth_bundle(bundle: Any) -> bytes:
+    """Encode a :class:`SignedAuthBundle` into its canonical binary form.
+
+    The byte stream is ``D || U(1) || B(S) || B(A)`` with
+    ``D = b"auditchain/signed-auth-bundle/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the verifier blob and the auth-batch blob
+    — nothing may be omitted, reordered or appended. ``S`` is the complete
+    canonical output of :func:`encode_signed_verifier` over
+    ``bundle.verifier`` and ``A`` the complete canonical output of
+    :func:`encode_auth_batch` over ``bundle.items`` with
+    ``hash_name=bundle.hash_name``. No new signing message is introduced:
+    encoding is read-only and only re-uses the existing canonical
+    encodings.
+
+    ``bundle`` must be a :class:`SignedAuthBundle` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_signed_verifier` and :func:`encode_auth_batch`
+    (TypeError or ValueError). The encoding carries the verifier key in
+    the clear — it authenticates provenance only, never encrypts — so the
+    bytes must be protected exactly like a bare :class:`Verifier`.
+    Encoding is deterministic: re-encoding a decoded bundle reproduces the
+    original bytes exactly, and a structurally valid bundle whose
+    signature or tags do not match encodes just as well.
+    """
+    if not isinstance(bundle, SignedAuthBundle):
+        raise TypeError("bundle must be a SignedAuthBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuthBundle(bundle.verifier, bundle.hash_name, bundle.items)
+    verifier_blob = encode_signed_verifier(checked.verifier)
+    batch_blob = encode_auth_batch(checked.items, hash_name=checked.hash_name)
+    return b"".join((
+        _SIGNED_AUTH_BUNDLE_MAGIC,
+        _encode_u64(_SIGNED_AUTH_BUNDLE_VERSION, "version"),
+        _encode_blob(verifier_blob),
+        _encode_blob(batch_blob),
+    ))
+
+
+def decode_signed_auth_bundle(data: Any) -> SignedAuthBundle:
+    """Decode bytes produced by :func:`encode_signed_auth_bundle`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-auth-bundle/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed verifier blob and one length-prefixed auth-batch blob,
+    with no trailing bytes. Each blob is handed whole to the existing
+    decoder — :func:`decode_signed_verifier` and :func:`decode_auth_batch`
+    respectively — so every nested framing and structural rule is theirs,
+    and the hash algorithm named by the auth batch must equal the signed
+    verifier's algorithm. A bad magic or version, truncation, an oversized
+    blob length, trailing bytes, an illegal nested encoding or a hash
+    algorithm disagreement between the two parts raises ValueError.
+
+    The returned object is a frozen :class:`SignedAuthBundle` whose fields
+    equal the originally encoded ones, and re-encoding reproduces the
+    original bytes exactly. A structurally sound encoding whose signature
+    or tags simply do not verify still decodes;
+    :func:`verify_signed_auth_bundle` reports False per item.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_AUTH_BUNDLE_MAGIC):
+        raise ValueError("not an auditchain signed-auth-bundle encoding")
+    offset = len(_SIGNED_AUTH_BUNDLE_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_AUTH_BUNDLE_VERSION:
+        raise ValueError(
+            f"unsupported signed-auth-bundle version {version}"
+        )
+    verifier_blob = read_blob("verifier")
+    batch_blob = read_blob("auth batch")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed auth bundle")
+    # Decode both nested blobs with their existing decoders; their own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    verifier = decode_signed_verifier(verifier_blob)
+    hash_name, items = decode_auth_batch(batch_blob)
+    # The two parts must describe one delivery: the batch's hash algorithm
+    # is the one the signed stage-0 verifier mints tags under.
+    if hash_name != verifier.verifier.hash_name:
+        raise ValueError(
+            "auth batch hash_name does not match the signed verifier"
+        )
+    return SignedAuthBundle(verifier=verifier, hash_name=hash_name, items=items)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

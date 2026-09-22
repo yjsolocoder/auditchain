@@ -20,6 +20,7 @@ dump_secure_log / load_secure_log /
 dump_pruned_log / load_pruned_log /
 dump_secure_pruned / load_secure_pruned /
 dump_auth / load_auth /
+dump_hybrid / load_hybrid /
 dump_pruned_auth / load_pruned_auth.
 """
 
@@ -66,6 +67,7 @@ __all__ = [
     "decode_signed_root",
     "decrypt_entry",
     "dump_auth",
+    "dump_hybrid",
     "dump_log",
     "dump_pruned_auth",
     "dump_pruned_log",
@@ -81,6 +83,7 @@ __all__ = [
     "encode_signed_root",
     "entry_digest",
     "load_auth",
+    "load_hybrid",
     "load_log",
     "load_pruned_auth",
     "load_pruned_log",
@@ -245,6 +248,20 @@ _AUTH_LOG_VERSION = 1
 # B(root) || B(head) || U(stage) || B(K) || U(x) as dump_auth.
 _PRUNED_AUTH_MAGIC = b"auditchain/pruned-auth/v1\0"
 _PRUNED_AUTH_VERSION = 1
+
+# Binary framing of dump_hybrid / load_hybrid: the encrypt-capable counterpart
+# of the auth-log framing — the same symmetric AES-256-GCM wire form
+# D || 0x01 || N || C with AAD D || 0x01 || N, but for an unpruned keyed log
+# whose history may contain entries appended with AuditLog.encrypt. After
+# B(hash_name) the plaintext carries the complete nonce history — U(q)
+# followed by q lexicographically ordered 12-byte B(nonce) blobs — then U(n)
+# and the n entries in the dump_secure_log E record order (U(index),
+# B(payload), B(previous_hash), B(entry_hash) and B(locator), an empty blob
+# marking a plain entry and a non-empty blob the digest-width encrypted-locator
+# HMAC), and finally the same auth-state tail as dump_auth:
+# B(root) || B(head) || U(stage) || B(K) || U(x).
+_HYBRID_MAGIC = b"auditchain/hybrid/v1\0"
+_HYBRID_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -5665,6 +5682,386 @@ def load_pruned_auth(data: Any, key: Any) -> AuditLog:
                 f"entry chain is inconsistent at index {expected_index}"
             )
         previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the exported head")
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the exported root")
+    log._stage = stage
+    log._verifier_exported = bool(exported)
+    return log
+
+
+def dump_hybrid(log: Any, key: Any, nonce: Any = None) -> bytes:
+    """Export an unpruned, keyed log that may contain encrypted history.
+
+    The encrypt-capable counterpart of :func:`dump_auth`: the export is sealed
+    symmetrically with AES-256-GCM under the 32-byte ``key`` (which must be
+    supplied out of band to :func:`load_hybrid`). Only an :class:`AuditLog`
+    that holds its complete, unpruned history (``retain_from == 0``) and was
+    **constructed with an authentication key** qualifies; unlike
+    :func:`dump_auth`, its history may freely mix plain entries with entries
+    appended with :meth:`AuditLog.encrypt` (under any per-entry encryption
+    key, which is never carried). The plaintext framing preserves everything
+    needed to continue both sides of the log in a fresh process: the complete
+    ``encrypt`` nonce history (so a nonce can never repeat in the restored
+    log), the per-entry encrypted locators, the current forward-secure
+    evolution key and stage, and the verifier-exported flag.
+
+    The wire form is ``D || 0x01 || N || C`` where
+    ``D = b"auditchain/hybrid/v1\\0"``, ``0x01`` is the one-byte AES-256-GCM
+    algorithm id, ``N`` is the 12-byte nonce and ``C`` is the AESGCM output
+    (``ciphertext || 16-byte tag``) over the plaintext framing ``P``, with the
+    AEAD additional authenticated data ``D || 0x01 || N``. When ``nonce`` is
+    ``None`` a fresh ``os.urandom(12)`` nonce is generated; an explicit nonce
+    must be 12 ``bytes`` and the caller is responsible for never reusing it
+    under the same key.
+
+    The plaintext framing is
+    ``P = B(h) || U(q) || B(nonce_1) || … || B(nonce_q) || U(n) ||
+    E1…En || B(root) || B(head) || U(stage) || B(K) || U(x)``: ``h`` is the
+    UTF-8 encoding of the hash algorithm name; the ``q`` nonces are the
+    complete nonce history, each exactly 12 bytes, in lexicographic (byte)
+    order; ``n`` is the entry count; and ``root`` / ``head`` are the Merkle
+    root and chain head of the size-``n`` snapshot. Each ``Ei`` reuses the
+    exact field encoding and locator classification of
+    :func:`dump_secure_log` — ``U(index) || B(payload) ||
+    B(previous_hash) || B(entry_hash) || B(locator)`` — where an empty
+    locator blob marks a plain entry and a non-empty blob is the
+    digest-width encrypted-locator HMAC. The tail is exactly the
+    :func:`dump_auth` auth state: ``stage`` the current key-evolution stage,
+    ``K`` the current evolution key and ``x`` the verifier-exported flag,
+    encoded as a u64 with value ``0`` or ``1``. ``U`` is an unsigned 8-byte
+    big-endian integer and ``B(v) = U(len(v)) || v``; entry indices must be
+    exactly ``0..n-1``.
+
+    The call is read-only: it never mutates the log. A non-:class:`AuditLog`
+    value or a non-``bytes`` key/nonce raises TypeError; a key that is not 32
+    bytes, a nonce that is not 12 bytes, a pruned or keyless log, or an
+    internal locator/nonce inconsistency raises ValueError. Nothing is
+    changed on failure.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    _check_key(key)
+    if nonce is None:
+        nonce = os.urandom(_NONCE_BYTES)
+    else:
+        _check_nonce(nonce)
+    # Eligibility: the format restores an unpruned, keyed, forward-secure log
+    # that may additionally carry encrypt history, so it requires the same
+    # complete-history/keyed conditions as dump_auth but no longer rejects the
+    # encrypted indexes or the nonce history — those are carried explicitly.
+    if log._retain_from != 0:
+        raise ValueError(
+            "only an unpruned log holding its complete history can be dumped"
+        )
+    if log._key is None:
+        raise ValueError(
+            "only a log constructed with an authentication key can be dumped"
+        )
+    hash_name = log._hash_name
+    digest_size = log._digest_size
+    size = len(log)
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    # The complete lifetime nonce history, sorted lexicographically; the log
+    # is unpruned, so every used nonce also has its ciphertext in the entries.
+    nonce_history = sorted(log._used_nonces)
+    for used_nonce in nonce_history:
+        if len(used_nonce) != _NONCE_BYTES:
+            raise ValueError(f"encrypted nonce must be {_NONCE_BYTES} bytes")
+    history = set(nonce_history)
+    # Every ciphertext must carry a recoverable 12-byte nonce accounted for by
+    # the history section; classification is driven by the locator exactly as
+    # in dump_secure_log.
+    for entry in log._entries:
+        locator = log._encrypted_locators.get(entry.index, b"")
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+            _algorithm, used_nonce, _sealed = _parse_envelope(entry.payload)
+            if len(used_nonce) != _NONCE_BYTES or used_nonce not in history:
+                raise ValueError(
+                    "ciphertext nonce is missing from the nonce history"
+                )
+    parts = [
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(len(nonce_history), "nonce history count"),
+    ]
+    for used_nonce in nonce_history:
+        parts.append(_encode_blob(used_nonce))
+    parts.append(_encode_u64(size, "entries count"))
+    for entry in log._entries:
+        locator = log._encrypted_locators.get(entry.index, b"")
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        parts.append(_encode_blob(locator))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    parts.append(_encode_u64(log._stage, "stage"))
+    parts.append(_encode_blob(log._key))
+    parts.append(_encode_u64(1 if log._verifier_exported else 0, "exported flag"))
+    plaintext = b"".join(parts)
+    aad = _HYBRID_MAGIC + bytes((_HYBRID_VERSION,)) + nonce
+    sealed = AESGCM(key).encrypt(nonce, plaintext, aad)
+    return (
+        _HYBRID_MAGIC
+        + bytes((_HYBRID_VERSION,))
+        + nonce
+        + sealed
+    )
+
+
+def load_hybrid(data: Any, key: Any) -> AuditLog:
+    """Restore an independent, mutable keyed :class:`AuditLog` from
+    :func:`dump_hybrid`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) and ``key`` must be 32 ``bytes``. The
+    stream must start with ``D = b"auditchain/hybrid/v1\\0"`` followed by the
+    one-byte algorithm id ``0x01`` (AES-256-GCM), a 12-byte nonce ``N`` and
+    the AESGCM output ``C`` (``ciphertext || 16-byte tag``); it is decrypted
+    with the AEAD additional authenticated data ``D || 0x01 || N``. GCM
+    authentication always runs before the plaintext is parsed, so a wrong key
+    or any tampering raises ValueError without any further processing.
+
+    The decrypted plaintext must parse, strictly in order and with no trailing
+    bytes, as
+    ``B(h) || U(q) || B(nonce_1) || … || B(nonce_q) || U(n) ||
+    E1…En || B(root) || B(head) || U(stage) || B(K) || U(x)``: the ``q``
+    history nonces must each be exactly 12 bytes in strictly ascending
+    lexicographic order without duplicates; each ``Ei`` is the
+    :func:`dump_secure_log` record
+    ``U(index) || B(payload) || B(previous_hash) || B(entry_hash) ||
+    B(locator)`` with indices exactly ``0..n-1``; an empty locator marks a
+    plain entry, while a non-empty locator must be exactly the digest width
+    and its payload must parse as an encrypted-entry envelope whose 12-byte
+    nonce occurs in the history. Every history nonce must be recovered from
+    exactly one envelope: the dumped log is unpruned, so the history set must
+    equal the nonces recovered from the entries — neither a dangling history
+    nonce nor a ciphertext nonce missing from the history is accepted. Every
+    chain digest must have the width of the named hash algorithm, ``stage``
+    must be a u64, ``K`` (the current evolution key) must be non-empty — at
+    stage 0 it is the construction key, which may have any non-zero length,
+    and after any evolution it is one hash-digest wide — and ``x`` must be
+    ``0`` or ``1``.
+
+    Under the named ``hash_name`` every :func:`entry_digest` and predecessor
+    link is then recomputed from genesis, and the resulting chain head and
+    Merkle root must match ``head`` / ``root``. Only then is a fresh keyed
+    :class:`AuditLog` built by replaying the payloads through the normal
+    append / encrypted-entry recovery path, with the full nonce history and
+    encrypted locator index restored and with ``K`` installed as the current
+    key, ``stage`` and the exported flag restored, so its length, head,
+    Merkle root, find index, encrypted locator index, nonce history and
+    stage are exactly those of the dumped log and both forward-secure
+    evolution and further :meth:`~AuditLog.encrypt` calls continue from the
+    same point; the result is fully mutable and shares no state with the
+    caller's buffers.
+
+    A non-``bytes`` ``data`` or key raises TypeError; a key that is not 32
+    bytes, a bad magic/algorithm id, truncation, trailing bytes, a bad UTF-8
+    or unknown hash name, wrong digest widths, an out-of-order or
+    wrong-width history nonce, a ciphertext nonce missing from the history,
+    a dangling history nonce, a duplicate entry nonce, an out-of-order
+    index, an out-of-range stage or flag, a wrong-width evolution key, an
+    AEAD failure or a recomputed chain/root mismatch raises ValueError. The
+    call never mutates its inputs; on failure no partial log escapes.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    _check_key(key)
+    if not data.startswith(_HYBRID_MAGIC):
+        raise ValueError("not an auditchain hybrid encoding")
+    offset = len(_HYBRID_MAGIC)
+    if len(data) <= offset:
+        raise ValueError("truncated encoding: missing algorithm byte")
+    version = data[offset]
+    offset += 1
+    if version != _HYBRID_VERSION:
+        raise ValueError(f"unsupported hybrid version {version}")
+    nonce_end = offset + _NONCE_BYTES
+    if len(data) < nonce_end + _GCM_TAG_BYTES:
+        raise ValueError("truncated encoding: missing nonce or ciphertext")
+    nonce = data[offset:nonce_end]
+    sealed = data[nonce_end:]
+    aad = _HYBRID_MAGIC + bytes((_HYBRID_VERSION,)) + nonce
+    # Authenticate the whole framing before parsing any plaintext field.
+    try:
+        plaintext = AESGCM(key).decrypt(nonce, sealed, aad)
+    except InvalidTag as error:
+        raise ValueError(
+            "hybrid authentication failed: wrong key or corrupted export"
+        ) from error
+
+    cursor = 0
+
+    def read_u64(name: str) -> int:
+        nonlocal cursor
+        end = cursor + _U64_BYTES
+        if end > len(plaintext):
+            raise ValueError(f"truncated plaintext: expected 8 bytes for {name}")
+        value = int.from_bytes(plaintext[cursor:end], "big")
+        cursor = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal cursor
+        length = read_u64(f"{name} length")
+        end = cursor + length
+        if end > len(plaintext):
+            raise ValueError(f"truncated plaintext: {name} is {length} bytes")
+        blob = plaintext[cursor:end]
+        cursor = end
+        return blob
+
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    # Nonce history: one B(nonce) length-prefixed blob per nonce, each
+    # carrying exactly 12 bytes, in strictly ascending lexicographic order,
+    # which also rules out duplicates.
+    history_count = read_u64("nonce history count")
+    nonce_history: list[bytes] = []
+    previous_nonce: bytes | None = None
+    for _ in range(history_count):
+        used_nonce = read_blob("encrypted nonce")
+        if len(used_nonce) != _NONCE_BYTES:
+            raise ValueError(f"encrypted nonce must be {_NONCE_BYTES} bytes")
+        if previous_nonce is not None and used_nonce <= previous_nonce:
+            raise ValueError(
+                "nonce history must be strictly ascending 12-byte nonces without duplicates"
+            )
+        nonce_history.append(used_nonce)
+        previous_nonce = used_nonce
+    nonce_history_set = set(nonce_history)
+    count = read_u64("entries count")
+    raw_entries: list[tuple[int, bytes, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        locator = read_blob("entry.locator")
+        raw_entries.append((index, payload, previous_hash, entry_hash, locator))
+    root = read_blob("root")
+    head = read_blob("head")
+    stage = read_u64("stage")
+    evolution_key = read_blob("evolution key")
+    exported = read_u64("exported flag")
+    if cursor != len(plaintext):
+        raise ValueError("trailing bytes in the hybrid plaintext")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    if not evolution_key:
+        raise ValueError("evolution key must be non-empty")
+    if stage > 0 and len(evolution_key) != digest_size:
+        raise ValueError(
+            f"evolution key must be {digest_size} bytes after the first evolution"
+        )
+    if exported not in (0, 1):
+        raise ValueError("exported flag must be 0 or 1")
+
+    # Re-derive the whole chain from genesis under the named hash algorithm,
+    # validate each record's locator/nonce, and simultaneously replay the
+    # payloads into a fresh keyed log so every auxiliary structure (find
+    # index, encrypted locator index, nonce history, Merkle frontier, head,
+    # length) is rebuilt exactly as the normal append / encrypt paths build
+    # it. The evolution key, stage and verifier-exported flag are only
+    # installed after the replay succeeds, so a failure leaves no partially
+    # restored log behind.
+    log = AuditLog(key=evolution_key, hash_name=hash_name)
+    log._used_nonces = set(nonce_history_set)
+    previous = bytes(digest_size)
+    recovered_nonces: set[bytes] = set()
+    for position, (index, payload, recorded_previous, recorded_hash, locator) in enumerate(
+        raw_entries
+    ):
+        if index != position:
+            raise ValueError("entries must occupy indices 0..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {position}")
+        recomputed = entry_digest(
+            position,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {position}")
+        # Classification is driven by the locator, never by the payload, with
+        # the same rules load_secure_log applies; the recovered nonce must
+        # additionally be covered by the serialized history and unique among
+        # the entries.
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+            _algorithm, used_nonce, _sealed = _parse_envelope(payload)
+            if len(used_nonce) != _NONCE_BYTES:
+                raise ValueError(
+                    f"encrypted nonce must be {_NONCE_BYTES} bytes"
+                )
+            if used_nonce not in nonce_history_set:
+                raise ValueError(
+                    "ciphertext nonce is missing from the nonce history"
+                )
+            if used_nonce in recovered_nonces:
+                raise ValueError("duplicate encrypted nonce among entries")
+            recovered_nonces.add(used_nonce)
+            # Replay the same commit encrypt() performs, seeding the nonce
+            # history (already restored above) and encrypted locator index
+            # without any encryption key.
+            entry = Entry(
+                index=position,
+                payload=payload,
+                previous_hash=previous,
+                entry_hash=recomputed,
+            )
+            log._entries.append(entry)
+            log._index.setdefault(
+                _locator_digest(payload, hash_name), []
+            ).append(position)
+            log._encrypted_index.setdefault(locator, []).append(position)
+            log._encrypted_locators[position] = locator
+            log._used_nonces.add(used_nonce)
+            log._head = recomputed
+        else:
+            # Ordinary entry: replay through the normal append path so the
+            # find index and every other structure match a live append.
+            replayed = log.append(payload)
+            if (
+                replayed.index != index
+                or replayed.previous_hash != recorded_previous
+                or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+            ):
+                raise ValueError(
+                    f"entry chain is inconsistent at index {position}"
+                )
+        previous = recomputed
+    # The dumped log was unpruned, so the serialized history must account
+    # for exactly the ciphertexts present in the entries: no dangling
+    # history nonces and none left unrecovered.
+    if recovered_nonces != nonce_history_set:
+        raise ValueError(
+            "nonce history does not match the nonces of the encrypted entries"
+        )
     if not hmac.compare_digest(previous, head):
         raise ValueError("recomputed chain head does not match the exported head")
     if not hmac.compare_digest(log.merkle_root(), root):

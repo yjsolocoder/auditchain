@@ -11,6 +11,7 @@ verify_audit_batch / inspect_continuation_chain / inspect_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
+verify_rotation /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -131,6 +132,7 @@ __all__ = [
     "verify_consistency",
     "verify_continuation_chain",
     "verify_inclusion",
+    "verify_rotation",
     "verify_signed_audit_batch",
     "verify_signed_auth_audit_bundle",
     "verify_signed_auth_audit_continuation",
@@ -195,6 +197,14 @@ _SIGNED_ROOT_DOMAIN = b"auditchain/signed-root/v1\0"
 _SIGNED_ROOT_VERSION = 1
 _ED25519_KEY_BYTES = 32
 _ED25519_SIGNATURE_BYTES = 64
+
+# Old-signer authorization of an Ed25519 signer rotation
+# (AuditLog.rotate_signer / verify_rotation). The old seed signs a message
+# binding its own snapshot signature, the new signer's 32-byte public key and
+# the new seed's signature over the very same snapshot; no new snapshot
+# signature domain is introduced.
+_ROTATION_DOMAIN = b"auditchain/signer-rotation/v1\0"
+_ROTATION_VERSION = 0x01
 
 # Signed stage-0 verifier of AuditLog.export_signed_verifier /
 # verify_signed_verifier. An Ed25519 signature over the verifier's hash
@@ -467,6 +477,22 @@ def _signed_verifier_message(hash_name: str, key: bytes) -> bytes:
         + bytes((0x01,))
         + _encode_blob(hash_name.encode("utf-8"))
         + _encode_blob(key)
+    )
+
+
+def _rotation_message(old_signature: bytes, new_key: bytes, new_signature: bytes) -> bytes:
+    """M of AuditLog.rotate_signer / verify_rotation's ``auth`` signature.
+
+    ``D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)``
+    with ``D = b"auditchain/signer-rotation/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``.
+    """
+    return (
+        _ROTATION_DOMAIN
+        + bytes((_ROTATION_VERSION,))
+        + _encode_blob(old_signature)
+        + _encode_blob(new_key)
+        + _encode_blob(new_signature)
     )
 
 
@@ -2371,6 +2397,77 @@ class AuditLog:
             signature=signature,
         )
 
+    def rotate_signer(
+        self, old_seed: Any, new_seed: Any, size: int | None = None
+    ) -> tuple[SignedRoot, bytes, SignedRoot, bytes]:
+        """Rotate the snapshot signing key, old key authorizing the new one.
+
+        Produces two :class:`SignedRoot` checkpoints over the very same
+        snapshot — same ``hash_name``, ``size``, ``root`` and ``head`` — one
+        signed by ``old_seed`` and one signed by ``new_seed``, plus an
+        Ed25519 authorization by which a verifier holding only the old public
+        key learns the new one offline:
+
+        ``(old, new_key, new, auth)`` where ``new_key`` is the 32-byte raw
+        public key of ``new_seed`` and ``auth`` is the 64-byte Ed25519
+        signature of ``old_seed`` over
+        ``D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)``
+        with ``D = b"auditchain/signer-rotation/v1\\0"``, ``U`` an unsigned
+        8-byte big-endian integer and ``B(x) = U(len(x)) || x``. Verify the
+        artifact offline, without holding the log, with
+        :func:`verify_rotation`.
+
+        ``size`` defaults to the current log length; it must be a non-bool
+        integer in ``0..len(log)`` and the snapshot must still be rebuildable
+        (a prefix released by :meth:`prune` is not). Neither seed is stored,
+        copied into log state or returned; the :class:`SignedRoot` signature
+        domain and interface are unchanged — ``old`` and ``new`` are exactly
+        what :meth:`sign_root` produces for each seed and size. The call is
+        read-only: entries, head, authentication state, Merkle roots and
+        proofs are all left untouched. A non-``bytes`` seed raises TypeError;
+        a seed that is not 32 bytes, a bool or otherwise out-of-range
+        ``size``, or a pruned, unrebuildable snapshot raises ValueError.
+        """
+        old_signing_key = _load_ed25519_seed(old_seed)
+        new_signing_key = _load_ed25519_seed(new_seed)
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        # _resolve_size rejects the remaining non-integers; validate the seeds
+        # first so neither snapshot is built from a bad key.
+        size = self._resolve_size(size)
+        if size == 0:
+            root = _hash_parts(self._hash_name, _EMPTY_DOMAIN)
+        else:
+            self._require_retained_snapshot(size)
+            root = self._fold_occupied(self._occupied_at(size))
+        head = self._chain_head_at(size)
+        message = _signed_root_message(self._hash_name, size, root, head)
+        old_signature = old_signing_key.sign(message)
+        new_signature = new_signing_key.sign(message)
+        old = SignedRoot(
+            version=_SIGNED_ROOT_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            head=head,
+            signature=old_signature,
+        )
+        new = SignedRoot(
+            version=_SIGNED_ROOT_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            head=head,
+            signature=new_signature,
+        )
+        new_key = new_signing_key.public_key().public_bytes(
+            encoding=Encoding.Raw, format=PublicFormat.Raw
+        )
+        auth = old_signing_key.sign(
+            _rotation_message(old_signature, new_key, new_signature)
+        )
+        return old, new_key, new, auth
+
     def audit_receipt(self, indices: Iterable[int], size: int | None = None) -> AuditReceipt:
         """Issue an offline :class:`AuditReceipt` for entries of a snapshot.
 
@@ -4163,6 +4260,102 @@ def verify_signed_root(receipt: Any, public_key: Any) -> bool:
     )
     try:
         verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def verify_rotation(item: Any, key: Any) -> bool:
+    """Verify an Ed25519 signer rotation against a pre-trusted old public key.
+
+    ``item`` is the ``(old, new_key, new, auth)`` four-tuple returned by
+    :meth:`AuditLog.rotate_signer` and ``key`` is the pre-trusted 32-byte
+    Ed25519 public key of the old signer; the new signer's 32-byte public key
+    is learned from ``new_key`` in the item itself. The whole claim is
+    checked entirely offline, without holding the log: :func:`verify_signed_root`
+    verifies the ``old`` checkpoint against ``key`` and the ``new``
+    checkpoint against ``new_key``, and ``key`` verifies ``auth`` — the
+    64-byte Ed25519 signature over
+    ``D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)`` with
+    ``D = b"auditchain/signer-rotation/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x`` — so ``new_key`` is only
+    trusted after the old key vouches for it. The two checkpoints must be
+    identical except for their signatures (same ``version``, ``hash_name``,
+    ``size``, ``root`` and ``head``), since both attest to the very same
+    snapshot.
+
+    A genuine rotation returns True; a signature that does not verify, a
+    ``new_key`` vouched for by a different old key, or two checkpoints of
+    different snapshots returns False. ``item`` that is not a four-tuple,
+    whose elements have the wrong types (``old``/``new`` must be
+    :class:`SignedRoot` instances, ``new_key`` and ``auth`` ``bytes``)
+    raises TypeError; a ``new_key`` that is not 32 bytes, an ``auth`` that
+    is not 64 bytes, or any nested structural violation raises exactly the
+    exceptions of :func:`verify_signed_root`. The call is read-only and
+    never mutates the item.
+    """
+    if not isinstance(item, tuple) or len(item) != 4:
+        raise TypeError(
+            "item must be a 4-tuple (old, new_key, new, auth)"
+        )
+    old, new_key, new, auth = item
+    if not isinstance(old, SignedRoot):
+        raise TypeError("old must be a SignedRoot")
+    if not isinstance(new, SignedRoot):
+        raise TypeError("new must be a SignedRoot")
+    if not isinstance(auth, bytes):
+        raise TypeError("auth must be bytes")
+    if len(auth) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(f"auth must be {_ED25519_SIGNATURE_BYTES} bytes")
+    # Re-validate every field even for a receipt built with object.__setattr__
+    # bypassing the frozen constructor, so structural corruption raises
+    # exactly as the constructor would and only genuine mismatches return
+    # False below. _load_ed25519_public also pins new_key and key to 32 bytes.
+    checked_old = SignedRoot(
+        old.version,
+        old.hash_name,
+        old.size,
+        old.root,
+        old.head,
+        old.signature,
+    )
+    checked_new = SignedRoot(
+        new.version,
+        new.hash_name,
+        new.size,
+        new.root,
+        new.head,
+        new.signature,
+    )
+    old_verification_key = _load_ed25519_public(key)
+    # Pins new_key to exactly 32 bytes before it is used for the first time:
+    # the new signer is trusted only if verify_signed_root and auth pass.
+    _load_ed25519_public(new_key)
+    # Both SignedRoots must describe the same snapshot; only their signatures
+    # are allowed to differ, since each is signed by a different key.
+    if (
+        checked_old.version,
+        checked_old.hash_name,
+        checked_old.size,
+        checked_old.root,
+        checked_old.head,
+    ) != (
+        checked_new.version,
+        checked_new.hash_name,
+        checked_new.size,
+        checked_new.root,
+        checked_new.head,
+    ):
+        return False
+    if not verify_signed_root(checked_old, key):
+        return False
+    if not verify_signed_root(checked_new, new_key):
+        return False
+    message = _rotation_message(
+        checked_old.signature, new_key, checked_new.signature
+    )
+    try:
+        old_verification_key.verify(auth, message)
     except InvalidSignature:
         return False
     return True

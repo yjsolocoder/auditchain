@@ -329,6 +329,51 @@ verify_signed_root(restored, public_key)   # True：无需持有日志
   宽度非法抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，
   `verify_signed_root` 返回 `False`。两个入口均为只读
 
+### Ed25519 签名钥轮换（旧钥授新钥）
+
+`rotate_signer` 在**同一快照**上分别用旧、新两个 32 字节 Ed25519 种子各签一个
+`SignedRoot`，再由旧种子对一份授权消息签名，使只持有旧公钥的验证方可以离线学会并
+信任新公钥；`SignedRoot` 的签名域与接口完全不变，轮换不引入日志状态、不产生任何日志：
+
+```python
+from auditchain import verify_rotation
+
+# 返回 (old, new_key, new, auth)
+old, new_key, new, auth = log.rotate_signer(old_seed, new_seed)  # size 默认 len(log)
+old.version == new.version          # True
+old.hash_name == new.hash_name    # True：同一日志
+old.size == new.size             # True：同一快照
+old.root == new.root              # True：同一 Merkle 根
+old.head == new.head              # True：同一链头
+old.signature != new.signature    # True：仅签名不同（两把种子签同一消息）
+len(new_key) == 32                 # True：新种子的原始 32 字节公钥
+len(auth) == 64                   # True：旧种子的 Ed25519 授权签名
+verify_rotation((old, new_key, new, auth), old_public)  # True：无需持有日志
+verify_rotation((old, new_key, new, auth), other_key)    # False：未信任的旧公钥
+```
+
+- 授权原文为
+  `D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)`，
+  其中 `D = b"auditchain/signer-rotation/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`auth` 为旧种子对该消息的确定性 64 字节 Ed25519 签名。
+  新旧两个检查点各自签的仍是 `sign_root` 的原文，签名域和 `SignedRoot` 接口不变
+- `rotate_signer(old_seed, new_seed, size=None)` 的 `size` 默认当前日志长度，须为非
+  `bool` 整数且满足 `0 <= size <= len(log)`、快照仍可重建（已裁剪前缀抛
+  `ValueError`，空快照 `size=0` 始终可签）；两个种子参数都只接受 32 字节
+  `bytes`（`str` / `bytearray` / `memoryview` 等抛 `TypeError`，长度非 32 抛
+  `ValueError`），种子从不保存、返回或写入日志。调用只读，不改变条目、`head`、
+  认证状态、Merkle 根或证明
+- `verify_rotation(item, key)` 完全离线、只读核验：用预信任的旧公钥 `key` 验证
+  `old` 与 `auth`，从 `item` 中取出 `new_key` 验证 `new`（新钥只有经旧钥授权后才
+  被信任），并要求 `old` / `new` 除 `signature` 外逐字段全等——两者必须描述同一
+  快照。结构合法但任一签名不符、`new_key` 与授权不匹配或两个检查点不是同一快照，均
+  返回 `False`（绝不抛异常）
+- `item` 必须是 `(old, new_key, new, auth)` 四元组：`old` / `new` 必须是
+  `SignedRoot`，`new_key` / `auth` 必须是 `bytes`，否则抛 `TypeError`；`new_key`
+  非 32 字节、`auth` 非 64 字节、信任公钥非 32 字节抛 `ValueError`，嵌套
+  `SignedRoot` 的结构非法沿用 `verify_signed_root` 的既有异常（`TypeError` /
+  `ValueError`）
+
 ### 可信紧凑批量审计包（Ed25519）
 
 `signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
@@ -1873,6 +1918,15 @@ python3 -m auditchain
     `version` 恒为 1。私钥种子只用于这一次签名、从不保存或返回；`size` 越界或快照
     已裁剪抛 `ValueError`（空快照 `size=0` 始终可签），种子类型错抛 `TypeError`、
     长度非 32 抛 `ValueError`；调用只读，离线用 `verify_signed_root` 凭预信任公钥验真
+  - `rotate_signer(old_seed, new_seed, size=None)` — 只读完成 Ed25519 签名钥轮换，
+    返回四元组 `(old, new_key, new, auth)`：在**同一快照**（默认当前长度）上分别用
+    旧、新种子各签一个 `SignedRoot`（两者与各自调用 `sign_root(seed, size)` 逐字节相同，
+    签名域与接口不变），`new_key` 为新种子的 32 字节原始公钥，`auth` 为旧种子对
+    `D || 0x01 || B(old.signature) || B(new_key) || B(new.signature)`
+    （`D = b"auditchain/signer-rotation/v1\0"`，`U` 为 8 字节无符号大端、
+    `B(x) = U(len(x)) || x`）的确定性 64 字节签名。两粒种子从不保存或返回；种子类型错
+    抛 `TypeError`、长度非 32 或 `size` 越界 / 快照已裁剪抛 `ValueError`（`size` 须为
+    非 `bool` 整数），任何失败都不改变日志状态；离线用 `verify_rotation` 凭旧公钥验真
   - `signed_audit_batch(indices, private_key, size=None)` — 只读签发可信紧凑批量
     审计包，返回不可变 `SignedAuditBatch`：先调用 `audit_batch(indices, size)`，
     再调用 `sign_root(private_key, size)`（`size` 默认当前长度），据此构造
@@ -1958,6 +2012,16 @@ python3 -m auditchain
   返回 `True`。入参不是 `SignedRoot` 或公钥不是 `bytes` 抛 `TypeError`；版本、
   未知算法、`size` 范围、摘要宽度、签名长度或公钥长度（非 32 字节）非法抛
   `ValueError`；调用只读
+- `verify_rotation(item, key)` — 凭预先信任的旧签名者 32 字节 Ed25519 公钥 `key`，
+  完全离线验证 `AuditLog.rotate_signer` 返回的四元组
+  `(old, new_key, new, auth)`，无需持有日志：旧公钥 `key` 验证 `old` 的快照签名与
+  `auth` 授权签名，`item` 中的 `new_key`（32 字节）验证 `new` 的快照签名——新钥只有经
+  旧钥授权后才被信任；并要求 `old` 与 `new` 除 `signature` 外五个字段全等（同一快照）。
+  任一签名不符、`new_key` 与授权不匹配或两个检查点描述的不是同一快照，返回 `False`，匹配
+  返回 `True`。`item` 不是四元组、`old` / `new` 不是 `SignedRoot`、`new_key` /
+  `auth` 不是 `bytes` 抛 `TypeError`；`new_key` 非 32 字节、`auth` 非 64 字节、公钥
+  长度非 32 字节或嵌套 `SignedRoot` 结构非法抛 `ValueError`（沿用
+  `verify_signed_root` 的既有异常）；调用只读
 - `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
   Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
   无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）

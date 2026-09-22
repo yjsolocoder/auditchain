@@ -1083,6 +1083,58 @@ verify_signed_auth_audit_bundle(restored, public_key)  # True：单 bool 结论
   匹配仍可正常解码，`verify_signed_auth_audit_bundle` 返回 `False`。两个入口
   均只读且确定，旧接口不变
 
+#### 跨快照认证审计续接（Ed25519）
+
+`SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
+`SignedConsistency` 证明"新快照由旧快照只追加形成"，但两者仍要分别交付、
+分别核对。冻结的
+`SignedAuthAuditContinuation(bundle, consistency)` 把二者组合成**一个**
+不可变续接凭据：离线方只凭预置信任的 32 字节 Ed25519 公钥，即可在同一凭据上
+既逐项核验前向安全标签、确认选中条目属于新快照，又确认该新快照由一个更早日签名
+快照只追加续接而来，全程不持有日志、也**不新增任何签名域**——一致性凭据的 `new`
+检查点就是审计包检查点本身（全字段相等）：
+
+```python
+from auditchain import verify_signed_auth_audit_continuation
+
+# old_size=3 的前缀续接到 size=5 的新快照；size 默认 len(log)
+cont = log.signed_auth_audit_continuation(3, [4, 1], seed, size=5)
+cont.consistency.old == log.sign_root(seed, 3)          # True：旧快照检查点
+cont.consistency.new == cont.bundle.audit.checkpoint    # True：新检查点即审计检查点
+cont.consistency.proof == log.consistency_proof(3, 5)   # True：逐字节相同
+verify_signed_auth_audit_continuation(cont, public_key) # True：无需持有日志
+verify_signed_auth_audit_continuation(cont, other_key)  # False：未信任的公钥
+```
+
+- 续接凭据为冻结的
+  `SignedAuthAuditContinuation(bundle:SignedAuthAuditBundle,
+  consistency:SignedConsistency)`，支持位置构造、按两个字段相等；`bundle`
+  必须是 `SignedAuthAuditBundle`、`consistency` 必须是
+  `SignedConsistency`，容器字段类型错抛 `TypeError`；两包内部的结构契约沿用
+  各自的既有校验，构造器不重复校验
+- `AuditLog.signed_auth_audit_continuation(old_size, indices, private_key,
+  size=None)` 在一次调用内原子组合两半：`size` 默认当前日志长度；尺寸须为非
+  `bool` 整数且满足 `0 <= old_size <= size <= len(log)`，两快照均可重建
+  （已剪枝的前缀抛 `ValueError`）；`indices` 为互异非 `bool` 整数，范围
+  `retain_from <= i < size`，**空选择允许**。审计半与
+  `signed_auth_audit_bundle` 一致——非空快照自动并入末条（索引 `size - 1`），
+  认证半只对调用方选中索引签标签；一致性半只读，其 `new` 检查点即审计检查点。
+  所有校验（尺寸链、两快照可重建、索引、密钥、stage 容量与一次性导出资格）在
+  认证半签名与提交前完成，**失败原子**：不消耗导出资格、不演进密钥、不改标签与
+  条目等任何日志状态；成功时认证半消耗一次性导出资格、stage 恰推进所选条数
+- 尺寸、容器、索引或密钥类型错（非整数、为 `bool`、不可迭代、密钥非 `bytes`）
+  抛 `TypeError`；索引重复、密钥非 32 字节、尺寸越界/快照不可重建、stage 容量
+  不足或导出资格不满足抛 `ValueError`；索引越出保留快照范围抛 `IndexError`
+- `verify_signed_auth_audit_continuation(receipt, public_key) -> bool` 完全
+  离线：先用 `verify_signed_auth_audit_bundle` 完整核验认证审计包（签名验证
+  材料、逐项标签、批量包含证明、审计检查点签名与同索引 `Entry` 一致），再用
+  `verify_signed_consistency` 完整核验一致性包（两个检查点签名与 Merkle 一致性
+  证明），最后要求两包算法一致且一致性凭据的 `new` 检查点与审计检查点**全字段
+  相等**（含签名本身）。任一不成立返回 `False`（绝不抛异常）；入参不是
+  `SignedAuthAuditContinuation`（含绕过冻结构造器写入的容器字段类型错）抛
+  `TypeError`，嵌套结构非法与公钥长度错沿用既有 `TypeError` / `ValueError`；
+  调用只读，旧接口不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带

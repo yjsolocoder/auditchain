@@ -55,6 +55,7 @@ __all__ = [
     "PruneReceipt",
     "SignedAuditBatch",
     "SignedAuthAuditBundle",
+    "SignedAuthAuditContinuation",
     "SignedAuthBundle",
     "SignedConsistency",
     "SignedPrune",
@@ -111,6 +112,7 @@ __all__ = [
     "verify_inclusion",
     "verify_signed_audit_batch",
     "verify_signed_auth_audit_bundle",
+    "verify_signed_auth_audit_continuation",
     "verify_signed_auth_bundle",
     "verify_signed_consistency",
     "verify_signed_prune",
@@ -1094,6 +1096,53 @@ class SignedAuthAuditBundle:
             raise TypeError("auth must be a SignedAuthBundle")
         if not isinstance(self.audit, SignedAuditBatch):
             raise TypeError("audit must be a SignedAuditBatch")
+
+
+@dataclass(frozen=True)
+class SignedAuthAuditContinuation:
+    """Cross-snapshot continuation of a signed auth audit, with no new domain.
+
+    Merges the :class:`SignedAuthAuditBundle` of
+    :meth:`AuditLog.signed_auth_audit_bundle` — selected entries'
+    forward-secure tags and signed audit against one snapshot — with the
+    :class:`SignedConsistency` of :meth:`AuditLog.signed_consistency` linking
+    an earlier prefix to that very snapshot, so an offline receiver holding
+    only a pre-trusted 32-byte Ed25519 public key can authenticate the
+    selected entries, confirm the snapshot they belong to, and confirm that
+    the audit continues an earlier signed snapshot by appends only — all in
+    one artifact, without holding the :class:`AuditLog` and without any new
+    signing message:
+
+    - ``bundle``: the :class:`SignedAuthAuditBundle` carrying the signed
+      stage-0 :class:`Verifier`, the selected ``(Entry, AuthTag)`` items and
+      the selected entries' batch inclusion proof plus the new snapshot's
+      signed checkpoint,
+    - ``consistency``: the :class:`SignedConsistency` whose ``new``
+      checkpoint attests exactly that new snapshot (all fields equal to the
+      bundle's audit checkpoint) and whose ``old`` checkpoint attests the
+      earlier prefix, joined by the Merkle consistency proof between them.
+
+    Both packages must be minted under one hash algorithm, and the
+    consistency proof's ``new`` checkpoint must be byte-for-byte the audit
+    package's checkpoint. Whether all of that holds, and whether any of the
+    embedded Ed25519 signatures verify, is left to
+    :func:`verify_signed_auth_audit_continuation`.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``bundle`` must be a
+    :class:`SignedAuthAuditBundle` and ``consistency`` a
+    :class:`SignedConsistency`, so a field of the wrong type raises
+    TypeError.
+    """
+
+    bundle: SignedAuthAuditBundle
+    consistency: SignedConsistency
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bundle, SignedAuthAuditBundle):
+            raise TypeError("bundle must be a SignedAuthAuditBundle")
+        if not isinstance(self.consistency, SignedConsistency):
+            raise TypeError("consistency must be a SignedConsistency")
 
 
 # Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
@@ -2357,6 +2406,113 @@ class AuditLog:
         # last entry), in any order — it sorts them itself.
         auth = self.signed_auth_bundle(tuple(selected), private_key)
         return SignedAuthAuditBundle(auth=auth, audit=audit)
+
+    def signed_auth_audit_continuation(
+        self,
+        old_size: int,
+        indices: Iterable[int],
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedAuthAuditContinuation:
+        """Atomically issue a :class:`SignedAuthAuditContinuation`.
+
+        The one-call continuation of :meth:`signed_auth_audit_bundle` across
+        snapshots: it delivers that method's :class:`SignedAuthAuditBundle`
+        for the selected entries against the ``size`` snapshot together with
+        the :class:`SignedConsistency` linking an earlier ``old_size``
+        prefix to that very snapshot, so an offline receiver holding only a
+        pre-trusted 32-byte Ed25519 public key gets, in one artifact, the
+        forward-secure authentication of the selected entries, the signed
+        evidence that they belong to the new snapshot, and the signed
+        evidence that the new snapshot continues the old one by appends
+        only. No new signing message is introduced: the bundle's signatures
+        are byte-for-byte the ones :meth:`signed_auth_audit_bundle` mints
+        and the consistency's two checkpoints sign exactly the
+        :meth:`sign_root` message, with ``proof`` byte-for-byte the
+        :meth:`consistency_proof` output; in particular the consistency's
+        ``new`` checkpoint is the audit checkpoint itself (all six fields
+        equal), so it adds no signing domain.
+
+        ``size`` defaults to the current log length and must be a non-bool
+        integer satisfying ``0 <= size <= len(log)``; ``old_size`` must be a
+        non-bool integer satisfying ``0 <= old_size <= size`` and both
+        snapshots must still be rebuildable (a pruned-away prefix raises
+        ValueError). ``indices`` must be an iterable of distinct non-bool
+        integers each satisfying ``retain_from <= index < size``; an empty
+        selection is allowed (the audit still carries the snapshot's last
+        entry, and only the empty snapshot ``size == 0`` yields an audit
+        with no entries). ``private_key`` is a 32-byte Ed25519 seed used for
+        the signatures and never stored.
+
+        Every check — the size chain, rebuildability of both snapshots, the
+        selection, the seed, stage capacity and the one-shot verifier-export
+        eligibility — runs before the auth half's one-shot signature and
+        commit; the consistency and audit halves are read-only. A failure
+        consumes no export eligibility, never evolves the key and leaves
+        stored tags, entries and every other log object untouched. On
+        success the auth half consumes the one-shot export and advances the
+        stage exactly once per selected entry. A non-``bytes`` seed, a
+        non-iterable ``indices``, a non-integer/``bool`` index, ``size`` or
+        ``old_size`` raises TypeError; a seed that is not 32 bytes,
+        duplicate indices, sizes outside ``0 <= old_size <= size <=
+        len(log)``, an unrebuildable snapshot, stage-capacity exhaustion,
+        keyless mode, a non-zero stage or a repeat export raises
+        ValueError; an index outside the retained snapshot range raises
+        IndexError.
+        """
+        # Resolve and validate the whole size chain first, exactly as the
+        # two composed methods do: wrong types are TypeError, out-of-range
+        # sizes ValueError, before the snapshots, the seed and the selection
+        # are touched.
+        size = self._resolve_size(size)
+        if isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        if not isinstance(old_size, int) or isinstance(old_size, bool):
+            raise TypeError("old_size must be an integer")
+        if not 0 <= old_size <= size:
+            raise ValueError(f"old_size must satisfy 0 <= old_size <= {size}")
+        # Both snapshots must still be rebuildable; the empty snapshot is a
+        # content-free constant always available, even after a prune.
+        if old_size > 0:
+            self._require_retained_snapshot(old_size)
+        if size > 0:
+            self._require_retained_snapshot(size)
+        # Validate the selection against the new snapshot range up front.
+        # The audit's automatic last entry is added only to the audit
+        # selection; the auth indices stay exactly the caller's distinct
+        # set, so the auth side never tags an unselected entry.
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < size:
+                raise IndexError(
+                    f"no retained entry at index {index} in snapshot of size {size}"
+                )
+            selected.add(index)
+        # Build the read-only consistency half first: it re-checks the sizes,
+        # both snapshots' rebuildability and the seed, and signs nothing the
+        # composed methods do not sign; its new checkpoint is the very
+        # checkpoint the audit half mints. It mutates nothing, so a failure
+        # leaves the one-shot export and key state untouched.
+        consistency = self.signed_consistency(old_size, private_key, new_size=size)
+        # signed_auth_audit_bundle re-validates the selection, seed, snapshot,
+        # stage capacity and one-shot eligibility, builds the read-only audit
+        # half and only then commits the auth half atomically (feeding it
+        # exactly the caller's indices, without the audit's appended last
+        # entry); it sorts them itself.
+        bundle = self.signed_auth_audit_bundle(
+            tuple(sorted(selected)), private_key, size
+        )
+        return SignedAuthAuditContinuation(
+            bundle=bundle, consistency=consistency
+        )
 
     def signed_consistency(
         self,
@@ -4714,6 +4870,62 @@ def verify_signed_auth_audit_bundle(bundle: Any, public_key: Any) -> bool:
         if audit_by_index.get(entry.index) != entry:
             return False
     return True
+
+
+def verify_signed_auth_audit_continuation(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedAuthAuditContinuation` against a pre-trusted key.
+
+    Confirms the whole cross-snapshot continuation entirely offline, without
+    holding the log, in three steps:
+
+    1. :func:`verify_signed_auth_audit_bundle` verifies the nested
+       :class:`SignedAuthAuditBundle` — the signed stage-0 verifier, the
+       per-item forward-secure tags, the batch inclusion proof, the audit
+       checkpoint signature and the entry correspondence at shared indices;
+    2. :func:`verify_signed_consistency` verifies the nested
+       :class:`SignedConsistency` — both checkpoint signatures and the
+       Merkle proof linking the old prefix to the new snapshot;
+    3. the two packages must describe one chain: they must name one hash
+       algorithm, and the consistency's ``new`` checkpoint must be
+       byte-for-byte (all six fields, including the signature) the audit
+       package's checkpoint, so the consistency proves exactly the snapshot
+       the authenticated entries were audited against — it introduces no
+       signing domain of its own.
+
+    A genuine continuation from the trusted key returns True; a
+    structurally valid continuation signed by another key, whose two
+    packages disagree on the algorithm or snapshot, whose ``new``
+    checkpoint differs from the audit checkpoint in any field, or whose
+    signatures, tags, proof or entries have been altered returns False.
+    Input that is not a :class:`SignedAuthAuditContinuation` (or whose
+    container fields have been bypassed to wrong types) raises TypeError;
+    nested structural violations raise exactly the exceptions of
+    :func:`verify_signed_auth_audit_bundle` and
+    :func:`verify_signed_consistency` (TypeError or ValueError), and a
+    public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the receipt.
+    """
+    if not isinstance(receipt, SignedAuthAuditContinuation):
+        raise TypeError("receipt must be a SignedAuthAuditContinuation")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuthAuditContinuation(receipt.bundle, receipt.consistency)
+    if not verify_signed_auth_audit_bundle(checked.bundle, public_key):
+        return False
+    if not verify_signed_consistency(checked.consistency, public_key):
+        return False
+    bundle = checked.bundle
+    consistency = checked.consistency
+    # The decisive linkage, covering algorithm consistency as well: the
+    # bundle verifier already pinned its auth/verifier/audit algorithms and
+    # the consistency verifier pinned old to new; requiring the
+    # consistency's new checkpoint to equal the audit checkpoint on every
+    # field — hash_name, size, root, head and the signature itself — then
+    # pins the two packages to one algorithm and proves the consistency
+    # extends exactly the snapshot the entries were audited against, with
+    # no signing domain of its own.
+    return consistency.new == bundle.audit.checkpoint
 
 
 def encode_signed_auth_audit_bundle(x: Any) -> bytes:

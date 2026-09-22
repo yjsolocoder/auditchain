@@ -4,9 +4,10 @@ Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
+ContinuationChainReport /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
-verify_audit_batch / verify_signed_verifier / verify_signed_root /
+verify_audit_batch / inspect_continuation_chain / verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
@@ -51,6 +52,7 @@ __all__ = [
     "AuditLog",
     "AuditReceipt",
     "AuthTag",
+    "ContinuationChainReport",
     "Entry",
     "IntegrityIssue",
     "IntegrityReport",
@@ -101,6 +103,7 @@ __all__ = [
     "encode_signed_root",
     "encode_signed_verifier",
     "entry_digest",
+    "inspect_continuation_chain",
     "load_auth",
     "load_hybrid",
     "load_log",
@@ -1169,6 +1172,82 @@ class SignedAuthAuditContinuation:
             raise TypeError("bundle must be a SignedAuthAuditBundle")
         if not isinstance(self.consistency, SignedConsistency):
             raise TypeError("consistency must be a SignedConsistency")
+
+
+# Diagnostic codes of inspect_continuation_chain, each pinpointing the first
+# segment or boundary at which the receipts fail to describe one chain:
+# "verify" — a segment itself fails verify_signed_auth_audit_continuation;
+# "growth" — a segment's old checkpoint is not strictly smaller than its new;
+# "duplicate" — a segment repeats an earlier receipt;
+# "link" — adjacent segments do not join at equal checkpoints. "link" names
+# only the boundary between segments, it does not blame either one.
+_CHAIN_CODE_VERIFY = "verify"
+_CHAIN_CODE_GROWTH = "growth"
+_CHAIN_CODE_DUPLICATE = "duplicate"
+_CHAIN_CODE_LINK = "link"
+_CHAIN_CODES = frozenset(
+    {
+        _CHAIN_CODE_VERIFY,
+        _CHAIN_CODE_GROWTH,
+        _CHAIN_CODE_DUPLICATE,
+        _CHAIN_CODE_LINK,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ContinuationChainReport:
+    """Result of :func:`inspect_continuation_chain`.
+
+    A read-only diagnosis of a non-empty tuple of chained
+    :class:`SignedAuthAuditContinuation` receipts, locating the **first**
+    failed segment or broken boundary — only the earliest problem is ever
+    reported:
+
+    - ``ok``: the single source of truth, ``True`` exactly for a chain whose
+      every segment verifies against the pre-trusted key, whose segments all
+      grow strictly, which repeats no receipt and whose adjacent segments join
+      on equal checkpoints;
+    - ``index``: the tuple position of the failing segment for ``"verify"``,
+      ``"growth"`` and ``"duplicate"``, or the position of the segment whose
+      ``old`` boundary does not join its predecessor's ``new`` for
+      ``"link"``; ``None`` exactly when ``ok`` is ``True``;
+    - ``code``: one of ``"verify"``, ``"growth"``, ``"duplicate"`` or
+      ``"link"`` describing that first failure; ``None`` exactly when ``ok``
+      is ``True``. A ``"link"`` code identifies the boundary only and blames
+      neither segment.
+
+    Reports are immutable, may be built positionally and compare by all three
+    fields. The success report is ``ContinuationChainReport(True, None, None)``.
+    A non-bool ``ok`` or a non-integer, negative or bool ``index`` raises
+    TypeError/ValueError like the other frozen reports; an unknown code string
+    raises ValueError, and a failed report must carry both a code and an index.
+    """
+
+    ok: bool
+    index: int | None
+    code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if self.ok:
+            if self.index is not None or self.code is not None:
+                raise ValueError(
+                    "a successful report must carry index None and code None"
+                )
+            return
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _CHAIN_CODES:
+            raise ValueError(
+                f"unknown chain code {self.code!r}; expected one of "
+                f"'verify', 'growth', 'duplicate', 'link'"
+            )
+        if not isinstance(self.index, int) or isinstance(self.index, bool):
+            raise TypeError("index must be an integer or None")
+        if self.index < 0:
+            raise ValueError("index must be non-negative")
 
 
 # Issue codes reported by AuditLog.verify_report(). The first three pinpoint a
@@ -5231,6 +5310,96 @@ def verify_continuation_chain(receipts: Any, public_key: Any) -> bool:
             return False
         previous_new = consistency.new
     return True
+
+
+def inspect_continuation_chain(
+    receipts: Any, public_key: Any
+) -> ContinuationChainReport:
+    """Diagnose a non-empty tuple of chained continuation receipts offline.
+
+    The read-only diagnostic counterpart of :func:`verify_continuation_chain`:
+    it holds neither the log nor any checkpoint history, introduces no new
+    Ed25519 or HMAC signing domain and never mutates the receipts or the key,
+    but instead of a bare bool it returns a frozen
+    :class:`ContinuationChainReport` locating the **first** failed segment or
+    broken boundary — a valid chain reports
+    ``ContinuationChainReport(True, None, None)`` and only the earliest
+    problem is ever reported.
+
+    Segments are examined in the caller's tuple order, in two phases:
+
+    1. each segment is verified on its own with
+       :func:`verify_signed_auth_audit_continuation` against the pre-trusted
+       32-byte Ed25519 ``public_key`` — failure reports ``"verify"`` at that
+       segment's position — and must extend a strictly smaller prefix, i.e.
+       ``consistency.old.size < consistency.new.size`` (a zero-length segment
+       never describes an append) — ``old.size >= new.size`` reports
+       ``"growth"``;
+    2. only after every segment is individually sound and strictly growing
+       are the segments compared with one another: a receipt equal to an
+       earlier one reports ``"duplicate"`` at the repeated segment's
+       position, and the previous segment's ``consistency.new`` checkpoint
+       must equal the following segment's ``consistency.old`` checkpoint on
+       every field (hash name, size, root, head and the Ed25519 signature
+       itself) — a mismatch reports ``"link"`` at the following segment's
+       position. The ``"link"`` code identifies the boundary between the two
+       segments and blames neither one.
+
+    ``receipts`` must be a non-empty ``tuple`` of
+    :class:`SignedAuthAuditContinuation` objects: a non-tuple (including a
+    list, a generator or ``None``) or an element of another type raises
+    TypeError, and an empty tuple raises ValueError. ``public_key`` must be a
+    32-byte ``bytes`` Ed25519 key: a non-``bytes`` value (including
+    ``bytearray``) raises TypeError and a ``bytes`` value of another length
+    raises ValueError. Nested structural violations raised by
+    :func:`verify_signed_auth_audit_continuation` on a structurally illegal
+    receipt propagate unchanged (TypeError or ValueError) rather than
+    becoming a ``"verify"`` report; signature, tag or proof mismatches on a
+    structurally valid receipt are reported, not raised.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    for receipt in receipts:
+        if not isinstance(receipt, SignedAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedAuthAuditContinuation"
+            )
+    if not isinstance(public_key, bytes):
+        raise TypeError("public_key must be a 32-byte Ed25519 public key")
+    if len(public_key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"public_key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+    # Phase 1: every segment must independently verify and strictly grow.
+    # Exceptions from nested verification propagate: a structurally illegal
+    # receipt is a caller error, not a failed "verify" diagnosis.
+    for index, receipt in enumerate(receipts):
+        if not verify_signed_auth_audit_continuation(receipt, public_key):
+            return ContinuationChainReport(False, index, _CHAIN_CODE_VERIFY)
+        consistency = receipt.consistency
+        if consistency.old.size >= consistency.new.size:
+            return ContinuationChainReport(False, index, _CHAIN_CODE_GROWTH)
+
+    # Phase 2: relationships between individually sound segments. Repeated
+    # receipts and broken joins are located from the current segment's
+    # position; "link" marks the boundary itself rather than either segment.
+    seen: set[SignedAuthAuditContinuation] = set()
+    previous_new: SignedRoot | None = None
+    for index, receipt in enumerate(receipts):
+        if receipt in seen:
+            return ContinuationChainReport(
+                False, index, _CHAIN_CODE_DUPLICATE
+            )
+        seen.add(receipt)
+        consistency = receipt.consistency
+        if previous_new is not None and consistency.old != previous_new:
+            return ContinuationChainReport(False, index, _CHAIN_CODE_LINK)
+        previous_new = consistency.new
+    return ContinuationChainReport(True, None, None)
 
 
 def encode_continuations(receipts: Any) -> bytes:

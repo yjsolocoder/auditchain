@@ -915,6 +915,73 @@ verify_signed_verifier(restored, public_key)   # True：无需持有日志
   但签名与字段不匹配仍可解码，`verify_signed_verifier` 返回 `False`。两个入口
   均为只读
 
+#### 可信认证批次交付包（Ed25519）
+
+把 `export_signed_verifier` 给出的已签名 stage-0 验证材料与一次 `auth_batch`
+前向安全认证批次**合并进同一个交付包**，离线方仅凭**预置信任**的 32 字节
+Ed25519 公钥即可确认验证材料来源、并逐项核验标签，全程无需持有日志、也**不新增
+签名原文**（包内唯一签名就是 `SignedVerifier` 对 stage-0 材料的既有签名；批次
+不带签名，逐标签自证）。包为冻结的
+`SignedAuthBundle(verifier:SignedVerifier, hash_name:str, items:tuple)`，按全部
+字段相等、支持位置构造；`items` 即 `auth_batch` 的
+`tuple[tuple[Entry, AuthTag], ...]` 结果（空批次为 `()`），`hash_name` 必须与
+嵌套验证材料的算法一致：
+
+```python
+from auditchain import (
+    SignedAuthBundle, verify_signed_auth_bundle,
+    encode_signed_auth_bundle, decode_signed_auth_bundle,
+)
+
+log = AuditLog(key=b"shared-secret")
+log.append("agent started"); log.append("position claim")
+receipt = log.export_signed_verifier(seed)        # 首次演进前、仅可导出一次
+items = log.auth_batch([0, 1])                    # 随后批量签发，密钥照常演进
+bundle = SignedAuthBundle(receipt, "sha256", items)
+verify_signed_auth_bundle(bundle, public_key)     # (True, True)：来源可信且逐项通过
+verify_signed_auth_bundle(bundle, other_key)      # (False, False)：验签失败逐项 False
+```
+
+- `verify_signed_auth_bundle(bundle, public_key) -> tuple[bool, ...]` 只凭交付包
+  与预信任公钥离线核验：先用 `verify_signed_verifier` 验证材料签名，**验签失败
+  （未信任公钥、字段或签名被改）在每个位置返回 `False`**（空包为 `()`）；验签
+  通过且算法一致时复用 `verify_auth_batch(items, receipt.verifier)`，返回同序
+  `tuple[bool, ...]`，结构合法但某条标签 / 条目不匹配仅令该位置为 `False`。
+  入参不是 `SignedAuthBundle`（含绕过冻结构造器写入的字段类型错）或公钥不是
+  `bytes` 抛 `TypeError`；嵌套结构或公钥长度（非 32 字节）非法沿用
+  `verify_signed_verifier` / `verify_auth_batch` 的既有 `ValueError`；入口只读
+- 签名**只认证来源、不加密**：`Verifier.key` 在包内以明文携带，交付包须像裸
+  `Verifier` 一样被保护；`verifier` 必须是 `SignedVerifier`（其嵌套字段同样被
+  复验），`hash_name` 必须是字符串、已知固定输出算法且与验证材料的算法一致，
+  `items` 必须是 `tuple`——容器字段类型错抛 `TypeError`，算法未知或两端不一致
+  抛 `ValueError`；批次项内部的结构契约由 `verify_auth_batch` / 编码侧校验
+- `encode_signed_auth_bundle(bundle) -> bytes` 与
+  `decode_signed_auth_bundle(data) -> SignedAuthBundle` 把交付包序列化为规范
+  二进制并原样还原，使其可落盘、跨进程传输后继续凭预信任公钥离线核验：
+
+```python
+data = encode_signed_auth_bundle(bundle)          # bytes，可写文件/发网络
+restored = decode_signed_auth_bundle(data)        # 冻结 SignedAuthBundle
+restored == bundle                                # True
+encode_signed_auth_bundle(restored) == data       # True：重编码逐字节相同
+verify_signed_auth_bundle(restored, public_key)   # (True, True)：无需持有日志
+```
+
+  字节流为 `D || U(1) || B(S) || B(A)`，其中
+  `D = b"auditchain/signed-auth-bundle/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 README 公开的 u64 大端与 blob 规则）；`S` 与
+  `A` 依次是既有 `encode_signed_verifier(receipt)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的**完整规范字节**，验证材料
+  在前、认证批次在后，解码精确消费两个 blob 且禁止尾随字节，分别交给既有
+  `decode_signed_verifier` 与 `decode_auth_batch`（批次的算法名即包的
+  `hash_name`，须与验证材料一致）。前者只接受 `SignedAuthBundle`（其余类型抛
+  `TypeError`，嵌套错误沿用既有编码器的 `TypeError` / `ValueError`），后者只
+  接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、UTF-8、未知
+  算法、截断、尾随、blob 长度、嵌套格式或两端算法不一致抛 `ValueError`；编解码
+  均不校验签名与标签——结构合法但签名或标签不匹配仍可解码，
+  `verify_signed_auth_bundle` 逐项返回 `False`；两个入口均为只读且确定，旧接口
+  不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -1258,6 +1325,14 @@ python3 -m auditchain
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
   抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
+- `SignedAuthBundle(verifier, hash_name, items)` — 不可变的可信认证批次交付包，
+  合并已签名的 stage-0 验证材料与前向安全认证批次，按全部字段相等、支持位置构造；
+  `verifier` 必须是 `SignedVerifier`（其嵌套字段同样被复验），`hash_name` 必须是
+  已知固定输出算法且与 `verifier.verifier.hash_name` 一致，`items` 即
+  `auth_batch` 的 `(Entry, AuthTag)` 项元组（必须是 `tuple`）；容器字段类型错抛
+  `TypeError`，未知算法或两端算法不一致抛 `ValueError`，批次项内部的结构契约由
+  `verify_auth_batch` / 编码侧校验。唯一签名是 `SignedVerifier` 的既有签名，不
+  新增签名原文，且验证密钥明文携带、只认证来源
 - `SignedPrune(receipt, checkpoint)` — 不可变的可信签名裁剪授权，按两个字段
   相等、支持位置构造；`receipt` 为 `seal` 的前缀裁剪回执（必须是
   `PruneReceipt`），`checkpoint` 为同一前缀的 `SignedRoot`（必须是
@@ -1476,6 +1551,16 @@ python3 -m auditchain
   `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
   `verify_signed_root` 的既有异常（`TypeError` / `ValueError`），公钥长度非
   32 字节抛 `ValueError`；调用只读
+- `verify_signed_auth_bundle(bundle, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥完全离线核验 `SignedAuthBundle`（已签名 stage-0 验证材料 +
+  `auth_batch` 批次）：先用 `verify_signed_verifier` 验证材料签名，验签失败
+  （未信任公钥、验证材料字段或签名被改）在每个项位置返回 `False`（空包为
+  `()`）；验签通过且两端算法一致时复用 `verify_auth_batch(items, verifier)`
+  返回同序 `tuple[bool, ...]`，某条标签 / 条目不匹配仅令该位置为 `False`。
+  入参不是 `SignedAuthBundle`（含绕过构造器的容器字段类型错）或公钥不是
+  `bytes` 抛 `TypeError`；嵌套结构非法沿用 `verify_signed_verifier` /
+  `verify_auth_batch` 的既有异常（`TypeError` / `ValueError`），公钥长度非
+  32 字节抛 `ValueError`；调用只读
 - `verify_signed_prune(item, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_prune` 签发的 `SignedPrune` 裁剪授权，无需持有日志：
   先用 `verify_signed_root` 校验检查点签名，再要求回执与检查点描述同一前缀——
@@ -1518,6 +1603,23 @@ python3 -m auditchain
   版本、截断、尾随、blob 长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、
   冻结且重编码逐字节相同，结构合法但验真不匹配仍可解码（验包返回 `False`）；
   两个入口均为只读且确定
+- `encode_signed_auth_bundle(bundle)` / `decode_signed_auth_bundle(data)` —
+  可信认证批次交付包的规范二进制编码与解码，使 `SignedAuthBundle` 可落盘、跨
+  进程传输后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：字节流为
+  `D || U(1) || B(S) || B(A)`，其中
+  `D = b"auditchain/signed-auth-bundle/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则）；`S` 与 `A` 依次是
+  既有 `encode_signed_verifier(verifier)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的完整规范字节，验证材料在前、
+  认证批次在后，解码精确消费两个 blob 并禁止尾随字节，分别交给既有
+  `decode_signed_verifier` 与 `decode_auth_batch`（批次算法名即包的
+  `hash_name`，须与验证材料一致）。前者只接受 `SignedAuthBundle`（其余类型抛
+  `TypeError`，嵌套错误沿用既有编码器的 `TypeError` / `ValueError`），后者只
+  接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、UTF-8、未知
+  算法、截断、尾随、blob 长度、嵌套格式或两端算法不一致抛 `ValueError`；解码
+  对象字段相等、冻结且重编码逐字节相同；编解码不校验签名与标签，结构合法但签名
+  或标签不匹配仍可解码（`verify_signed_auth_bundle` 逐项返回 `False`）；两个
+  入口均为只读且确定，验证密钥明文，旧接口不变
 - `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —
   可信跨快照一致性凭据的规范二进制编码与解码，使 `SignedConsistency` 可落盘、
   跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数

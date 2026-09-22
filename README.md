@@ -1269,11 +1269,12 @@ inspect_continuation_chain(chain, other_public_key)
 #### 续接链端点锚定诊断：确认链恰从期望旧快照延伸到期望新快照（Ed25519）
 
 `inspect_continuation_chain` 只回答“链内部是否连续”。顶层
-`inspect_anchors(receipts, public_key, start, end) -> ContinuationChainReport`
+`inspect_anchors(receipts, key, start, end) -> ContinuationChainReport`
 是其**端点锚定扩展**：离线方仅凭预置信任公钥与两个期望 `SignedRoot`
 检查点，即可确认这条链不仅内部连续，而且**恰好**从期望旧快照延伸到期望新
 快照——被截去前缀、截去后缀或整体替换的**有效子链**都会被定位而非被接受。
-四个参数均无默认值；调用同样全程离线、只读、不新增任何签名域：
+四个参数均无默认值（第二参数名为 `key`，即预置信任的 32 字节 Ed25519
+公钥）；调用同样全程离线、只读、不新增任何签名域：
 
 ```python
 from auditchain import ContinuationChainReport, inspect_anchors
@@ -1288,7 +1289,7 @@ inspect_anchors(chain[:-1], public_key, start, end)
 # ContinuationChainReport(ok=False, index=len(chain)-2, code='end')  # 截去后缀
 ```
 
-- 先委托 `inspect_continuation_chain(receipts, public_key)` 做内部诊断，
+- 先委托 `inspect_continuation_chain(receipts, key)` 做内部诊断，
   失败报告**原样返回**——`"verify"`、`"growth"`、`"duplicate"`、`"link"`
   四类首错顺序不变，内部不成立的链绝不会被改报为锚点不符
 - 仅当内部报告成功才比较锚点，且**起点优先于终点**：首段
@@ -1304,6 +1305,68 @@ inspect_anchors(chain[:-1], public_key, start, end)
   `bytes` 公钥或非 `SignedRoot` 锚点抛 `TypeError`；空链或公钥非 32 字节
   抛 `ValueError`；结构非法凭据的嵌套异常沿用既有规则原样传播。既有核验
   与编解码接口、签名域均不变
+
+#### 锚定续接链的持久化与整体诊断（Ed25519）
+
+`inspect_anchors` 的四个参数把链与两个锚点分开传递，落盘与跨进程交付时
+仍要调用方自行保持三者对应。冻结的
+`AnchoredContinuationChain(receipts, start, end)` 把非空续接凭据 tuple 与
+两个期望 `SignedRoot` 锚点合并成**一个**不可变容器，配合规范编解码即可
+整体落盘、整体恢复、整体诊断，全程不持有日志、也**不新增任何签名域**：
+
+```python
+from auditchain import (
+    AnchoredContinuationChain,
+    decode_anchored_continuations,
+    encode_anchored_continuations,
+    inspect_anchored_continuations,
+)
+
+start, end = chain[0].consistency.old, chain[-1].consistency.new
+bundle = AnchoredContinuationChain(chain, start, end)
+
+data = encode_anchored_continuations(bundle)        # bytes，可写文件/发网络
+restored = decode_anchored_continuations(data)      # 冻结 AnchoredContinuationChain
+restored == bundle                                  # True：字段相等
+encode_anchored_continuations(restored) == data     # True：重编码逐字节相同
+
+inspect_anchored_continuations(restored, public_key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+inspect_anchored_continuations(restored, other_public_key)
+# ContinuationChainReport(ok=False, index=0, code='verify')
+```
+
+- 容器为冻结的 `AnchoredContinuationChain(receipts:tuple,
+  start:SignedRoot, end:SignedRoot)`，字段类型依次为 `tuple`、
+  `SignedRoot`、`SignedRoot`，支持位置构造、按全部三个字段相等；
+  `receipts` 必须是非空 `SignedAuthAuditContinuation` tuple（非 tuple 或
+  元素类型错抛 `TypeError`，空 tuple 抛 `ValueError`），`start` / `end`
+  必须是 `SignedRoot`（否则抛 `TypeError`）；链是否真从 `start` 延伸到
+  `end` 由 `inspect_anchored_continuations` 判定，构造器不重复核验
+- 字节流严格为 `D || U(1) || B(C) || B(S) || B(E)`，其中
+  `D = b"auditchain/anchor/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则）；`C` 须逐字节
+  等于既有 `encode_continuations(receipts)` 的完整输出，`S` / `E` 分别为
+  既有 `encode_signed_root(start)` / `encode_signed_root(end)` 的完整输出，
+  顺序固定为链在前、起点锚点居中、终点锚点在后，解码精确消费三个 blob 且
+  **禁止尾随字节**，分别原样交给 `decode_continuations` 与
+  `decode_signed_root`，嵌套异常沿用对应既有解码器
+- `encode_anchored_continuations` 只接受 `AnchoredContinuationChain`
+  （其余类型抛 `TypeError`，含绕过冻结构造器写入的字段类型错，嵌套错误
+  沿用既有编码器的 `TypeError` / `ValueError`），
+  `decode_anchored_continuations` 只接受 `bytes`（含拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、截断、blob 长度、嵌套格式或尾随非法均抛
+  `ValueError`；编解码不校验签名、证明、相邻段关联及锚点关系，结构合法但
+  验真不匹配仍可解码，由 `inspect_anchored_continuations` 报告；两个入口
+  均为只读且确定
+- `inspect_anchored_continuations(bundle, key) -> ContinuationChainReport`
+  把持久化后的包作为**一个**入参诊断，完全等价于
+  `inspect_anchors(bundle.receipts, key, bundle.start, bundle.end)`：
+  首错顺序（内部四类先于锚点两类、`"start"` 先于 `"end"`）、冻结三字段
+  报告与只读语义全部复用锚点诊断，不新增任何签名域。`bundle` 不是
+  `AnchoredContinuationChain`（含绕过冻结构造器写入的容器字段类型错）抛
+  `TypeError`；`key` 非 `bytes` 抛 `TypeError`、非 32 字节抛
+  `ValueError`；结构非法凭据的嵌套异常沿用既有规则原样传播；旧接口不变
 
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
@@ -2009,8 +2072,9 @@ python3 -m auditchain
   tuple 与 32 字节 `bytes` 公钥的类型/长度校验及嵌套异常传播规则与
   `verify_continuation_chain` 一致；不持有日志、不改凭据、不新增签名域，旧
   接口不变
-- `inspect_anchors(receipts, public_key, start, end)` —
-  `inspect_continuation_chain` 的端点锚定扩展（四参均无默认值）：先委托内部
+- `inspect_anchors(receipts, key, start, end)` —
+  `inspect_continuation_chain` 的端点锚定扩展（四参均无默认值，第二参数
+  `key` 为预置信任的 32 字节 Ed25519 公钥）：先委托内部
   诊断，失败报告原样返回（四类首错顺序不变）；仅当链内部成立才比较锚点，
   首段 `consistency.old` 不等于期望 `start` 报 `"start"`（`index` 取 `0`），
   末段 `consistency.new` 不等于期望 `end` 报 `"end"`（`index` 取末段位置），
@@ -2035,6 +2099,33 @@ python3 -m auditchain
   编解码不校验签名、证明及相邻段关联，结构合法但验真不匹配仍可解码
   （`verify_continuation_chain` 返回 `False`）；两个入口均为只读且确定，旧
   接口和签名域不变
+- `AnchoredContinuationChain(receipts, start, end)` — 冻结的锚定续接链
+  容器，把非空 `SignedAuthAuditContinuation` tuple 与两个期望 `SignedRoot`
+  锚点合并为一个不可变工件；字段类型依次为 `tuple`、`SignedRoot`、
+  `SignedRoot`，支持位置构造、按三个字段相等；非 tuple、元素类型错或非
+  `SignedRoot` 锚点抛 `TypeError`，空链抛 `ValueError`
+- `encode_anchored_continuations(bundle)` /
+  `decode_anchored_continuations(data)` — 锚定续接链的规范二进制编码与
+  解码，使 `AnchoredContinuationChain` 可整体落盘、跨进程恢复后继续凭预置
+  信任的 Ed25519 公钥由 `inspect_anchored_continuations` 整体诊断，且不
+  新增签名域：字节流严格为 `D || U(1) || B(C) || B(S) || B(E)`，其中
+  `D = b"auditchain/anchor/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`C` 为既有 `encode_continuations` 的完整规范
+  输出，`S` / `E` 为既有 `encode_signed_root` 对起点 / 终点锚点的完整规范
+  输出；解码精确消费三个 blob、禁止尾随字节，分别交给 `decode_continuations`
+  与 `decode_signed_root`，嵌套异常沿用既有解码器。前者只接受
+  `AnchoredContinuationChain`（其余类型抛 `TypeError`），后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、blob 长度、嵌套
+  格式或尾随非法抛 `ValueError`；解码结果字段相等且重编码逐字节相同；编解码
+  不校验签名、证明、相邻段关联及锚点关系，结构合法但验真不匹配仍可解码；
+  两个入口均为只读且确定，旧接口和签名域不变
+- `inspect_anchored_continuations(bundle, key)` — 把持久化的锚定续接链
+  作为**一个**入参诊断，完全等价于
+  `inspect_anchors(bundle.receipts, key, bundle.start, bundle.end)`：首错
+  顺序、冻结三字段 `ContinuationChainReport` 与只读语义全部复用锚点诊断，
+  不新增签名域；`bundle` 非 `AnchoredContinuationChain` 抛 `TypeError`，
+  `key` 非 `bytes` 抛 `TypeError`、非 32 字节抛 `ValueError`，嵌套异常
+  沿用既有规则传播；旧接口不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

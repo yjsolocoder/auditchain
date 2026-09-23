@@ -5,7 +5,7 @@ Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
-RotatedChain /
+RotatedChain / RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
 verify_audit_batch / inspect_continuation_chain / inspect_anchors /
@@ -31,6 +31,7 @@ encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
 encode_rotated_anchor / decode_rotated_anchor /
+encode_rotated_anchor_set / decode_rotated_anchor_set /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
@@ -71,6 +72,7 @@ __all__ = [
     "IntegrityIssue",
     "IntegrityReport",
     "PruneReceipt",
+    "RotatedAnchorSet",
     "RotatedChain",
     "SignedAuditBatch",
     "SignedAuthAuditBundle",
@@ -90,6 +92,7 @@ __all__ = [
     "decode_prune_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
+    "decode_rotated_anchor_set",
     "decode_rotations",
     "decode_signed_audit_batch",
     "decode_signed_auth_audit_bundle",
@@ -116,6 +119,7 @@ __all__ = [
     "encode_prune_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
+    "encode_rotated_anchor_set",
     "encode_rotations",
     "encode_signed_audit_batch",
     "encode_signed_auth_audit_bundle",
@@ -324,6 +328,16 @@ _ANCHORED_CONTINUATION_VERSION = 1
 # start and end anchors, in that order and with nothing else.
 _ROTATED_ANCHOR_MAGIC = b"auditchain/ra/v1\0"
 _ROTATED_ANCHOR_VERSION = 1
+
+# Binary framing of encode_rotated_anchor_set / decode_rotated_anchor_set: a
+# fixed magic, then the envelope version as a u64, the package count n as a
+# u64, n u64-length-prefixed blobs each holding the complete canonical
+# encode_rotated_anchor bytes of one package in input order, the bridge count
+# m (= n - 1) as a u64 and m u64-length-prefixed blobs each holding the
+# complete canonical encode_rotation bytes of one cross-package bridge in
+# input order, with nothing else.
+_ROTATED_ANCHOR_SET_MAGIC = b"auditchain/rotated-anchor-set/v1\0"
+_ROTATED_ANCHOR_SET_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -1382,6 +1396,56 @@ class RotatedChain:
             raise TypeError("start must be a SignedRoot")
         if not isinstance(self.end, SignedRoot):
             raise TypeError("end must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class RotatedAnchorSet:
+    """Several cross-key packages and their bridges persisted as one artifact.
+
+    Bundles the non-empty tuple of separately landed :class:`RotatedChain`
+    packages together with the cross-package rotation bridges that splice
+    them into one continuous cross-signer chain, so the whole collection —
+    packages, intra-package rotations, package anchors and the inter-package
+    hops — can be saved, transferred and restored across processes as a
+    single artifact for :func:`inspect_rotated_anchor_set` diagnosis or
+    :func:`merge_rotated_anchor_set` merging:
+
+    - ``items``: the tuple of :class:`RotatedChain` packages, in traversal
+      order, at least one;
+    - ``bridges``: the tuple of ``(old, new_key, new, auth)`` rotation
+      four-tuples, exactly one fewer than the packages — ``bridges[i]``
+      connects package ``i`` to package ``i + 1``.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``items`` and
+    ``bridges`` must be tuples, ``items`` must be non-empty, every item must
+    be a :class:`RotatedChain`, and the bridge count must be exactly
+    ``len(items) - 1`` — a non-tuple field or a wrongly typed item raises
+    TypeError, while an empty ``items`` tuple or a bridge count other than
+    one per package boundary raises ValueError. Whether the bridges are
+    genuine and join the packages on both anchors is left to
+    :func:`inspect_rotated_anchor_set`.
+    """
+
+    items: tuple
+    bridges: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple")
+        if not isinstance(self.bridges, tuple):
+            raise TypeError("bridges must be a tuple of rotation records")
+        if len(self.items) == 0:
+            raise ValueError("items must be a non-empty tuple")
+        for item in self.items:
+            if not isinstance(item, RotatedChain):
+                raise TypeError("each item must be a RotatedChain")
+        if len(self.bridges) != len(self.items) - 1:
+            raise ValueError(
+                "bridges must contain exactly one record per package "
+                "boundary "
+                f"({len(self.bridges)} given for {len(self.items)} packages)"
+            )
 
 
 # Diagnostic codes of inspect_continuation_chain and inspect_anchors, each
@@ -7163,6 +7227,120 @@ def decode_rotated_anchor(data: Any) -> RotatedChain:
     if offset != len(data):
         raise ValueError("trailing bytes after the rotated anchor")
     return RotatedChain(receipts, rotations, start, end)
+
+
+def encode_rotated_anchor_set(bundle: Any) -> bytes:
+    """Encode a :class:`RotatedAnchorSet` into canonical bytes.
+
+    The byte stream is ``D || U(1) || U(n) || B(P)*n || U(m) || B(R)*m``
+    with ``D = b"auditchain/rotated-anchor-set/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x`` (an empty blob
+    still writes its all-zero u64 length): the envelope ``version`` (always
+    1), the package count ``n``, one blob ``P_i`` per package holding
+    byte-for-byte the complete canonical output of
+    :func:`encode_rotated_anchor` over ``bundle.items[i]`` in input order,
+    then the bridge count ``m = n - 1`` and one blob ``R_i`` per bridge
+    holding byte-for-byte the complete canonical output of
+    :func:`encode_rotation` over ``bundle.bridges[i]`` in input order —
+    nothing may be omitted, reordered or appended. The framing re-uses the
+    existing encodings only, introduces no new signing domain and is
+    read-only: it never mutates the bundle.
+
+    ``bundle`` must be a :class:`RotatedAnchorSet` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_rotated_anchor` and :func:`encode_rotation` (TypeError or
+    ValueError), propagated unchanged. Encoding is deterministic:
+    re-encoding a decoded bundle reproduces the original bytes exactly.
+    """
+    if not isinstance(bundle, RotatedAnchorSet):
+        raise TypeError("bundle must be a RotatedAnchorSet")
+    parts = [
+        _ROTATED_ANCHOR_SET_MAGIC,
+        _encode_u64(_ROTATED_ANCHOR_SET_VERSION, "version"),
+        _encode_u64(len(bundle.items), "package count"),
+    ]
+    for item in bundle.items:
+        parts.append(_encode_blob(encode_rotated_anchor(item)))
+    parts.append(_encode_u64(len(bundle.bridges), "bridge count"))
+    for bridge in bundle.bridges:
+        parts.append(_encode_blob(encode_rotation(bridge)))
+    return b"".join(parts)
+
+
+def decode_rotated_anchor_set(data: Any) -> RotatedAnchorSet:
+    """Decode bytes produced by :func:`encode_rotated_anchor_set`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/rotated-anchor-set/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the u64
+    package count ``n`` followed by exactly ``n`` length-prefixed package
+    blobs, then the u64 bridge count ``m`` followed by exactly ``m``
+    length-prefixed bridge blobs, with the whole stream consumed and no
+    trailing bytes. Each package blob is handed whole to
+    :func:`decode_rotated_anchor` and each bridge blob whole to
+    :func:`decode_rotation`, so their framing and structural rules apply
+    verbatim and their exceptions propagate unchanged. A bad magic or
+    version, truncation, an oversized blob length, trailing bytes, a zero
+    package count, a bridge count other than exactly ``n - 1`` or an
+    illegal nested encoding raises ValueError.
+
+    Signatures and authorizations are not checked here — only
+    :func:`inspect_rotated_anchor_set` confirms the restored packages verify
+    across their bridges; a structurally legal set whose bridges do not
+    verify still decodes. The returned bundle is a frozen
+    :class:`RotatedAnchorSet` whose tuples preserve the encoded order and
+    equal the originally encoded fields, and re-encoding reproduces the
+    original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ROTATED_ANCHOR_SET_MAGIC):
+        raise ValueError("not an auditchain rotated-anchor-set encoding")
+    offset = len(_ROTATED_ANCHOR_SET_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ROTATED_ANCHOR_SET_VERSION:
+        raise ValueError(f"unsupported rotated-anchor-set version {version}")
+    package_count = read_u64("package count")
+    if package_count == 0:
+        raise ValueError("rotated anchor set must contain at least one package")
+    items = tuple(
+        decode_rotated_anchor(read_blob(f"package {index}"))
+        for index in range(package_count)
+    )
+    bridge_count = read_u64("bridge count")
+    if bridge_count != package_count - 1:
+        raise ValueError(
+            "bridge count must be exactly one fewer than the package count "
+            f"({bridge_count} bridges for {package_count} packages)"
+        )
+    bridges = tuple(
+        decode_rotation(read_blob(f"bridge {index}"))
+        for index in range(bridge_count)
+    )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the rotated anchor set")
+    return RotatedAnchorSet(items, bridges)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

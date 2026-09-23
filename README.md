@@ -1733,6 +1733,58 @@ inspect_rotated_anchor_set(packages, (forged_bridge,), key_a)
 - 单包（`bridges` 为空 tuple）时该调用等价于
   `inspect_rotated_anchors(items[0], key)`；旧接口与既有各码均不变
 
+#### 多包轮换锚定链集合：包与包间桥绑成单一制品跨进程恢复
+
+分批落盘的若干 `RotatedChain` 包及衔接它们的包间轮换桥可以再绑成
+**一件**可持久化、可跨进程恢复的冻结制品：
+`RotatedAnchorSet(items:tuple, bridges:tuple)`。两字段分别为
+`RotatedChain` 包的**非空 tuple**（按遍历顺序）与跨包轮换四元组 tuple
+（`rotate_signer` 的 `(old, new_key, new, auth)`，桥数恰为包数减一，
+`bridges[i]` 衔接包 `i` 与包 `i + 1`）；支持位置/关键字构造、按两个
+字段相等（可哈希）。制品本身只校验容器形状：两字段均为 tuple、`items`
+非空且元素均为 `RotatedChain`、桥元素均为 tuple、桥数恰为
+`len(items) - 1`——非 tuple 或元素类型错抛 `TypeError`，空集或桥数
+不符抛 `ValueError`；桥四元组自身的元数、字段与真伪不在此处校验，桥
+是否真实、是否与各包锚点接缝成立，继续留给编码或
+`inspect_rotated_anchor_set` / `merge_rotated_anchor_set`，恢复后可在
+另一进程中继续诊断或合并。
+
+```python
+from auditchain import (
+    RotatedAnchorSet,
+    encode_rotated_anchor_set,
+    decode_rotated_anchor_set,
+    inspect_rotated_anchor_set,
+)
+
+bundle = RotatedAnchorSet(packages, bridges)
+data = encode_rotated_anchor_set(bundle)     # bytes，可写文件/发网络
+restored = decode_rotated_anchor_set(data)   # 另一进程中恢复
+restored == bundle                            # True：两字段逐字段相等
+encode_rotated_anchor_set(restored) == data   # True：重编码逐字节相同
+inspect_rotated_anchor_set(restored.items, restored.bridges, key_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- 字节流严格为 `D || U(1) || U(n) || B(P0)…B(Pn-1) || U(m) ||
+  B(R0)…B(Rm-1)`，其中 `D = b"auditchain/rotated-anchor-set/v1\0"`，
+  `U` 为 8 字节无符号大端整数，`B(x) = U(len(x)) || x`，零长 blob 也
+  写全零 u64；`n` 为包数、`m = n - 1` 为桥数；`Pi` 逐字节等于既有
+  `encode_rotated_anchor(items[i])` 的完整输出，`Ri` 逐字节等于既有
+  `encode_rotation(bridges[i])` 的完整输出，均保持输入顺序、**禁止尾随
+  字节**；全部 blob 复用既有编码，外层帧不引入新签名域
+- `encode_rotated_anchor_set(bundle)` 只接受 `RotatedAnchorSet`（否则
+  抛 `TypeError`）；嵌套结构问题的 `TypeError` / `ValueError` 原样传播；
+  编码只读、确定
+- `decode_rotated_anchor_set(data) -> RotatedAnchorSet` 只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`，抛 `TypeError`）；魔数 / 版本错、
+  截断、blob 长度越界、尾随字节、空集（包数为零）或桥数不为包数减一
+  抛 `ValueError`；各包 blob 与桥 blob 分别交给 `decode_rotated_anchor`
+  / `decode_rotation`，嵌套异常原样传播。解码保序并返回冻结对象，但不
+  校验签名、授权、证明与锚定关系，结构合法而验真失败仍可解码，由
+  `inspect_rotated_anchor_set` 报告而非抛出
+- 全程离线只读，不新增签名域；旧接口与既有各码均不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -2600,6 +2652,30 @@ python3 -m auditchain
   非 `bytes` 抛 `TypeError`，空集、桥数不符或 `key` 长度不符抛
   `ValueError`，嵌套异常原样传播；全程离线只读、不新增签名域或线格式，
   旧接口不变
+- `RotatedAnchorSet(items, bridges)` — 冻结的多包轮换锚定链集合，把
+  分批落盘的非空 `RotatedChain` 包 tuple 与包间轮换桥 tuple 绑为一件
+  可持久化、可跨进程恢复的制品；支持位置/关键字构造、按两字段相等
+  （可哈希）；`items` / `bridges` 非 tuple、`items` 元素非
+  `RotatedChain` 或桥元素非 tuple 抛 `TypeError`，`items` 为空或桥数
+  不为包数减一抛 `ValueError`；制品本身不校验桥四元组的元数、真伪与
+  接缝关系
+- `encode_rotated_anchor_set(bundle)` /
+  `decode_rotated_anchor_set(data)` — 多包轮换锚定链集合的规范二进制
+  编码与解码，使若干包与包间桥作为单一制品落盘、跨进程恢复后继续诊断
+  或合并（`inspect_rotated_anchor_set` /
+  `merge_rotated_anchor_set`），全程只读、不新增签名域：字节流严格为
+  `D || U(1) || U(n) || B(P0)…B(Pn-1) || U(m) || B(R0)…B(Rm-1)`，
+  其中 `D = b"auditchain/rotated-anchor-set/v1\0"`，`U` 为 8 字节无
+  符号大端整数，`B(x) = U(len(x)) || x`（零长 blob 也写全零 u64），
+  `n` 为包数、`m = n - 1`，`Pi` 逐字节为既有
+  `encode_rotated_anchor(items[i])` 输出，`Ri` 逐字节为既有
+  `encode_rotation(bridges[i])` 输出，均按输入顺序排列且禁止尾随字节；
+  前者只接受 `RotatedAnchorSet`（否则抛 `TypeError`），嵌套编码异常
+  原样传播；后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`），
+  魔数、版本、零包数、截断、blob 长度、桥数不符、嵌套格式或尾随非法
+  抛 `ValueError`；解码保持两 tuple 顺序、字段相等且重编码逐字节
+  相同，不校验签名、授权、跨钥验真与锚定关系，结构合法而验真失败仍
+  可解码；两个入口均为只读且确定，旧接口不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

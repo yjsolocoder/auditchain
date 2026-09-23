@@ -1678,6 +1678,61 @@ inspect_rotated_anchors(restored, key_a)
   `inspect_rotated_anchors` 报告而非抛出
 - 旧接口与既有各码均不变
 
+#### 多包轮换锚定链的按序核验：跨密钥链分批落盘后的逐跳拼接诊断
+
+同一条跨签名者续接链若分多批落盘、每批各自保存为一个
+`RotatedChain`（包内携带自己的逐跳轮换与首尾锚点），而批次之间的跨钥
+交接同样由 `rotate_signer` 轮换授权，离线方可仅凭首包签名者的预置公钥，
+在**不持有日志、不持有检查点历史、不新增任何签名域或线格式**的前提下，
+按 tuple 顺序把这些包与包间轮换核验为一条真实的跨签名者链。顶层
+
+`inspect_rotated_anchor_set(items, bridges, key) -> ContinuationChainReport`
+
+三参均无默认值，负责按序诊断，只报最早问题，全部成立返回
+`(True, None, None)`：
+
+- `items` 为 `RotatedChain` 的**非空 tuple**；`bridges` 为
+  `rotate_signer` `(old, new_key, new, auth)` **轮换四元组 tuple**，长度
+  恰为 `len(items) - 1`，`bridges[i]` 衔接包 `i` 与包 `i + 1`；`key` 为
+  首包签名者的恰好 32 字节 `bytes` Ed25519 公钥
+- **逐包诊断、信任逐跳转移**：首包以 `key` 调用
+  `inspect_rotated_anchors`；每包通过后当前钥取该包**末轮换**的已验真
+  `new_key`；对后包先验其前 `bridge`（以当前钥），通过后才以桥的新钥
+  对后包调用 `inspect_rotated_anchors`
+- **包内失败码保留、索引重基**：包级失败报告码不变
+  （`"verify"`、`"growth"`、`"duplicate"`、`"rotation_duplicate"`、
+  `"rotation"`、`"rotation_link"`、`"start"`、`"end"`），其包内
+  `index` 加此前各包凭据总数，定位到拼接待建链中的全局凭据位置；故
+  `"duplicate"` 索引为后次出现的全局位置
+- **包间桥先于后包诊断**，顺序与既有边界规则一致：`bridge` 与**更早的
+  包间桥**全等时报 `"rotation_duplicate"`（仅跨包桥之间去重，不与包内
+  轮换比较）；否则以当前信任钥调用 `verify_rotation`，验真失败报
+  `"rotation"`；验真通过后还要求桥的 `old` 与前包 `end`、`new` 与后包
+  `start` 按 `SignedRoot` 全六字段（`version`、`hash_name`、`size`、
+  `root`、`head` 及 Ed25519 `signature`）全等，不符报
+  `"rotation_link"`。三种桥码的 `index` 均为**后包首凭据的全局位置**
+- 内部断裂绝不改判为接缝不符：仅当此前每个包都通过后才检查其桥；
+  调用全程离线只读，不修改任何包、桥或公钥，也不新增签名域或线格式
+
+```python
+from auditchain import inspect_rotated_anchor_set
+
+inspect_rotated_anchor_set(packages, bridges, key_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+inspect_rotated_anchor_set(packages, (forged_bridge,), key_a)
+# ContinuationChainReport(ok=False, index=2, code='rotation')
+```
+
+- 调用前校验：非 tuple 的 `items` / `bridges`（含 list、生成器、
+  `None`）、`items` 元素非 `RotatedChain`、桥元素非 tuple，或 `key` 非
+  `bytes` 抛 `TypeError`；空集、桥数不为 `len(items) - 1` 或 `key` 非
+  恰好 32 字节抛 `ValueError`；桥四元组的其余结构校验仍交给
+  `verify_rotation`，包内结构异常由 `inspect_rotated_anchors` 传播，
+  嵌套 `TypeError` / `ValueError` 原样传播而非变成失败报告
+- 单包（`bridges` 为空 tuple）时该调用等价于
+  `inspect_rotated_anchors(items[0], key)`；旧接口与既有各码均不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -2531,6 +2586,20 @@ python3 -m auditchain
   `encode_anchored_continuations`、不设新格式；诊断失败抛 `ValueError`，
   类型/长度校验与嵌套异常规则同 `inspect_anchor_set`；调用只读，不修改
   任何输入包
+- `inspect_rotated_anchor_set(items, bridges, key)` — 分批落盘的多个
+  `RotatedChain` 与包间轮换的按序只读核验（三参均无默认值）：`items` 为
+  非空 `RotatedChain` tuple，`bridges` 为轮换四元组 tuple 且长度恰为
+  `len(items) - 1`，`key` 为首包签名者 32 字节 `bytes` 公钥。首包以
+  `key` 调用 `inspect_rotated_anchors`，每包通过后当前钥取其末轮换的
+  已验真 `new_key`；对后包先诊桥——与更早的包间桥全等报
+  `"rotation_duplicate"`，否则以当前钥 `verify_rotation`，失败报
+  `"rotation"`，通过后还要求桥 `old` 与前包 `end`、`new` 与后包
+  `start` 全六字段相等，不符报 `"rotation_link"`——以桥的新钥验后包；
+  包内失败码不变且 `index` 加此前凭据总数，`"duplicate"` 与三种桥码的
+  `index` 均为后次/后包首凭据的全局位置。非 tuple、元素类型错或 `key`
+  非 `bytes` 抛 `TypeError`，空集、桥数不符或 `key` 长度不符抛
+  `ValueError`，嵌套异常原样传播；全程离线只读、不新增签名域或线格式，
+  旧接口不变
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

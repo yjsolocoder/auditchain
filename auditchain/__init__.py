@@ -12,6 +12,7 @@ verify_audit_batch / inspect_continuation_chain / inspect_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
+inspect_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 verify_rotation /
@@ -131,6 +132,7 @@ __all__ = [
     "inspect_continuation_chain",
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
+    "inspect_rotated_anchor_set",
     "load_auth",
     "load_hybrid",
     "load_log",
@@ -1397,9 +1399,11 @@ class RotatedChain:
 # packages cannot be spliced into one chain; its index is the global
 # position, across every package, of the later package's first receipt.
 # "rotation_duplicate", "rotation" and "rotation_link" are reported by
-# inspect_rotated_chain only: a rotation equal to an earlier one, a rotation
-# that fails verify_rotation, and a rotation whose checkpoints do not join
-# the two segments on every field; each is indexed at the later segment.
+# inspect_rotated_chain and inspect_rotated_anchor_set: a rotation equal to
+# an earlier one, a rotation that fails verify_rotation, and a rotation whose
+# checkpoints do not join the two segments on every field; within a single
+# chain each is indexed at the later segment, and across separately landed
+# packages at the global position of the later package's first segment.
 _CHAIN_CODE_VERIFY = "verify"
 _CHAIN_CODE_GROWTH = "growth"
 _CHAIN_CODE_DUPLICATE = "duplicate"
@@ -1459,9 +1463,12 @@ class ContinuationChainReport:
       :func:`inspect_anchor_set` only. ``"rotation_duplicate"``,
       ``"rotation"`` and ``"rotation_link"`` — a repeated rotation, a
       rotation that fails :func:`verify_rotation`, and a rotation whose two
-      checkpoints fail to join the surrounding segments, each indexed at
-      the later segment's position — are reported by
-      :func:`inspect_rotated_chain` only.
+      checkpoints fail to join the surrounding segments — are reported by
+      :func:`inspect_rotated_chain`, indexed at the later segment's
+      position, and by :func:`inspect_rotated_anchor_set`, where a repeated
+      rotation means a bridge equal to an earlier cross-package bridge and
+      every such code is indexed at the global position of the later
+      package's first segment.
 
     Reports are immutable, may be built positionally and compare by all three
     fields. The success report is ``ContinuationChainReport(True, None, None)``.
@@ -6521,6 +6528,153 @@ def inspect_rotated_anchors(
             False, len(bundle.receipts) - 1, _CHAIN_CODE_END
         )
     return report
+
+
+def inspect_rotated_anchor_set(
+    items: Any, bridges: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose persisted cross-key packages and the bridges that hop between.
+
+    When a cross-signer continuation chain — one whose segments may be
+    signed by different keys, each boundary authorized by an
+    :meth:`AuditLog.rotate_signer` rotation — has been landed in several
+    separate batches, each batch persisted on its own as a
+    :class:`RotatedChain` with its own intra-package rotations and its own
+    two anchors, this is the offline, read-only diagnosis that the packages
+    and the cross-package rotations, taken in the caller's tuple order,
+    verify as one genuine cross-signer chain. It holds neither the log nor
+    any checkpoint history, introduces no new signing domain or wire
+    format and never mutates the packages, the bridges or the key.
+
+    ``items`` is a non-empty ``tuple`` of :class:`RotatedChain` packages and
+    ``bridges`` a ``tuple`` whose length is exactly ``len(items) - 1``, with
+    ``bridges[i]`` the ``(old, new_key, new, auth)`` four-tuple connecting
+    package ``i`` to package ``i + 1``. Trust hops at most once per
+    boundary and packages and bridges are examined strictly in traversal
+    order, reporting only the first failure:
+
+    - package 0 is diagnosed with :func:`inspect_rotated_anchors` against
+      the pre-trusted 32-byte Ed25519 ``key``; once it passes, the key
+      trusted onwards is its last intra-package rotation's verified
+      ``new_key``;
+    - at every later package ``i`` the bridge is diagnosed before the
+      package it leads into, in this order: ``bridges[i - 1]`` equal to an
+      earlier cross-package bridge reports ``"rotation_duplicate"``;
+      failure of :func:`verify_rotation` against the currently trusted key
+      reports ``"rotation"``; and a bridge whose ``old`` checkpoint does
+      not equal the previous package's ``end`` or whose ``new`` checkpoint
+      does not equal this package's ``start`` on all six
+      :class:`SignedRoot` fields (``version``, ``hash_name``, ``size``,
+      ``root``, ``head`` and the Ed25519 ``signature``) reports
+      ``"rotation_link"``. Only a bridge that passes all three checks hops
+      trust: its verified ``new_key`` is then the only key trusted while
+      package ``i`` is diagnosed, again with
+      :func:`inspect_rotated_anchors`;
+    - every package-level failure keeps its code unchanged — ``"verify"``,
+      ``"growth"``, ``"duplicate"`` (a receipt repeating an earlier
+      credential within that package), ``"rotation_duplicate"``,
+      ``"rotation"``, ``"rotation_link"``, ``"start"`` or ``"end"`` — and
+      its package-local ``index`` is shifted onto the global credential
+      position by adding the receipt count of every earlier package. A
+      ``"duplicate"`` report is therefore indexed at the repeated
+      credential's later global position, and the three bridge codes at
+      the global position of the following package's first receipt. An
+      internally broken package is never re-diagnosed across its
+      boundary: the bridge is examined only after every earlier package
+      has passed.
+
+    A set whose packages are sound one by one under the hopped keys and
+    whose bridges are genuine and join at every boundary reports
+    ``ContinuationChainReport(True, None, None)``.
+
+    A non-tuple ``items`` or ``bridges`` (including a list, a generator or
+    ``None``), an element of ``items`` that is not a :class:`RotatedChain`,
+    a bridge element that is not a tuple, or a ``key`` that is not
+    ``bytes`` raises TypeError; an empty ``items`` tuple, a ``bridges``
+    tuple whose length is not exactly ``len(items) - 1`` or a key that is
+    not 32 bytes raises ValueError. Every other nested structural
+    violation — a bridge four-tuple of the wrong length, a wrongly typed
+    or sized bridge field, or any structural exception raised while a
+    package is diagnosed — propagates unchanged (TypeError or ValueError)
+    from :func:`verify_rotation` / :func:`inspect_rotated_anchors`. Types
+    and shapes being legal, any signature, authorization, proof, growth,
+    repetition or boundary-link mismatch is reported, not raised.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple")
+    for item in items:
+        if not isinstance(item, RotatedChain):
+            raise TypeError("each item must be a RotatedChain")
+    if not isinstance(bridges, tuple):
+        raise TypeError("bridges must be a tuple of rotation records")
+    if len(bridges) != len(items) - 1:
+        raise ValueError(
+            "bridges must contain exactly one record per package boundary "
+            f"({len(bridges)} given for {len(items)} packages)"
+        )
+    # The raw four-tuples returned by rotate_signer have no dedicated class;
+    # check only their container type here, leaving length and element
+    # validation to verify_rotation, exactly as inspect_rotated_chain does.
+    for bridge in bridges:
+        if not isinstance(bridge, tuple):
+            raise TypeError(
+                "each bridge must be a (old, new_key, new, auth) tuple"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be a 32-byte Ed25519 public key")
+    if len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+    # Traversal order: diagnose package 0 with the pre-trusted key, then at
+    # each boundary diagnose the bridge (repetition, verify_rotation against
+    # the key currently trusted, all-field join of the two anchors) before
+    # hopping to its verified new_key and diagnosing the following package.
+    # Package-local report indices are re-based onto the global credential
+    # position by adding the receipt count of all earlier packages; the
+    # bridge codes are indexed at the following package's first receipt.
+    seen_bridges: set[tuple] = set()
+    current_key = key
+    offset = 0
+    for index, item in enumerate(items):
+        if index > 0:
+            bridge = bridges[index - 1]
+            if bridge in seen_bridges:
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION_DUPLICATE
+                )
+            seen_bridges.add(bridge)
+            if not verify_rotation(bridge, current_key):
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION
+                )
+            # verify_rotation succeeded and pinned new_key to 32 bytes; only
+            # then are the two sides of the seam compared on all six
+            # SignedRoot fields.
+            if bridge[0] != items[index - 1].end or bridge[2] != item.start:
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION_LINK
+                )
+            current_key = bridge[1]
+        # Exceptions from the nested diagnosis propagate: a structurally
+        # illegal package or bridge is a caller error, not a failed report.
+        report = inspect_rotated_anchors(item, current_key)
+        if not report.ok:
+            return ContinuationChainReport(
+                False, offset + report.index, report.code
+            )
+        offset += len(item.receipts)
+        # The package passed, so every one of its rotations passed
+        # verify_rotation under the hopped keys; trust now rests on its
+        # last rotation's verified new_key, against which the next bridge
+        # must be authorized. A RotatedChain always carries at least one
+        # rotation (it requires at least two receipts).
+        current_key = item.rotations[-1][1]
+    return ContinuationChainReport(True, None, None)
 
 
 def _anchor_set_packages(items: Any, key: Any) -> None:

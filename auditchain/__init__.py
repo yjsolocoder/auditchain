@@ -5,10 +5,12 @@ Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
+RotatedChain /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
 verify_audit_batch / inspect_continuation_chain / inspect_anchors /
 inspect_rotated_chain /
+inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
@@ -27,6 +29,7 @@ encode_continuations / decode_continuations /
 encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
+encode_rotated_anchor / decode_rotated_anchor /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
@@ -67,6 +70,7 @@ __all__ = [
     "IntegrityIssue",
     "IntegrityReport",
     "PruneReceipt",
+    "RotatedChain",
     "SignedAuditBatch",
     "SignedAuthAuditBundle",
     "SignedAuthAuditContinuation",
@@ -84,6 +88,7 @@ __all__ = [
     "decode_continuations",
     "decode_prune_receipt",
     "decode_rotation",
+    "decode_rotated_anchor",
     "decode_rotations",
     "decode_signed_audit_batch",
     "decode_signed_auth_audit_bundle",
@@ -109,6 +114,7 @@ __all__ = [
     "encode_continuations",
     "encode_prune_receipt",
     "encode_rotation",
+    "encode_rotated_anchor",
     "encode_rotations",
     "encode_signed_audit_batch",
     "encode_signed_auth_audit_bundle",
@@ -123,6 +129,7 @@ __all__ = [
     "inspect_anchored_continuations",
     "inspect_anchors",
     "inspect_continuation_chain",
+    "inspect_rotated_anchors",
     "inspect_rotated_chain",
     "load_auth",
     "load_hybrid",
@@ -306,6 +313,16 @@ _CONTINUATION_CHAIN_VERSION = 1
 # start and end anchors, in that order and with nothing else.
 _ANCHORED_CONTINUATION_MAGIC = b"auditchain/anchor/v1\0"
 _ANCHORED_CONTINUATION_VERSION = 1
+
+# Binary framing of encode_rotated_anchor / decode_rotated_anchor: a fixed
+# magic, then the envelope version as a u64 and four u64-length-prefixed
+# blobs holding the complete canonical encode_continuations bytes of the
+# at-least-two continuation receipts, the encode_rotations bytes of the
+# per-boundary signer-rotation four-tuples (one fewer than the receipts),
+# and the encode_signed_root bytes of the start and end anchors, in that
+# order and with nothing else.
+_ROTATED_ANCHOR_MAGIC = b"auditchain/ra/v1\0"
+_ROTATED_ANCHOR_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -1285,6 +1302,92 @@ class AnchoredContinuationChain:
             if not isinstance(receipt, SignedAuthAuditContinuation):
                 raise TypeError(
                     "each receipt must be a SignedAuthAuditContinuation"
+                )
+        if not isinstance(self.start, SignedRoot):
+            raise TypeError("start must be a SignedRoot")
+        if not isinstance(self.end, SignedRoot):
+            raise TypeError("end must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class RotatedChain:
+    """A signer-rotated continuation chain persisted with both anchors.
+
+    Bundles the tuple of chained
+    :class:`SignedAuthAuditContinuation` receipts, the per-boundary
+    :meth:`AuditLog.rotate_signer` ``(old, new_key, new, auth)``
+    four-tuples that hand trust from one segment's signer to the next's,
+    and the two :class:`SignedRoot` checkpoints the chain is expected to
+    span — the ``start`` checkpoint the first segment's ``consistency.old``
+    must equal and the ``end`` checkpoint the last segment's
+    ``consistency.new`` must equal — so the cross-key continuation
+    credentials, every hop-by-hop signer rotation and both endpoint
+    checkpoints can be saved, transferred and restored across processes as
+    one artifact:
+
+    - ``receipts``: the tuple of :class:`SignedAuthAuditContinuation`
+      receipts, in chain order — at least two, since a rotated chain
+      always crosses at least one signer boundary;
+    - ``rotations``: the tuple of raw rotation four-tuples, one per
+      boundary, in chain order — exactly one fewer than ``receipts``,
+      with ``rotations[i]`` joining segment ``i`` to segment ``i + 1``;
+    - ``start``: the :class:`SignedRoot` checkpoint the chain must start
+      at;
+    - ``end``: the :class:`SignedRoot` checkpoint the chain must end at.
+
+    Instances are immutable, may be built positionally and compare by all
+    four fields. Only the container shape is validated here: ``receipts``
+    must be a ``tuple`` of :class:`SignedAuthAuditContinuation` objects
+    with at least two elements, ``rotations`` must be a ``tuple`` of
+    raw rotation four-tuples exactly one shorter than ``receipts``, and
+    ``start``/``end`` must be :class:`SignedRoot` — a non-tuple or a
+    wrongly typed field raises TypeError, while a too-short receipt
+    tuple, a rotation count other than ``len(receipts) - 1`` or a
+    rotation element that is not a tuple raises ValueError. Rotation
+    element arity and field types are left to :func:`verify_rotation`
+    (exactly as :func:`inspect_rotated_chain` does), and whether the
+    rotations genuinely authorize the key hops, the chain is internally
+    continuous and actually spans the two anchors is left to
+    :func:`inspect_rotated_anchors`.
+    """
+
+    receipts: tuple
+    rotations: tuple
+    start: SignedRoot
+    end: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipts, tuple):
+            raise TypeError("receipts must be a tuple of continuation receipts")
+        # A rotated chain crosses at least one signer boundary, so it must
+        # hold at least two segments — unlike the non-empty anchored chain.
+        if len(self.receipts) < 2:
+            raise ValueError(
+                "receipts must contain at least two segments "
+                "(one rotation per boundary)"
+            )
+        for receipt in self.receipts:
+            if not isinstance(receipt, SignedAuthAuditContinuation):
+                raise TypeError(
+                    "each receipt must be a SignedAuthAuditContinuation"
+                )
+        if not isinstance(self.rotations, tuple):
+            raise TypeError("rotations must be a tuple of rotation records")
+        if len(self.rotations) != len(self.receipts) - 1:
+            raise ValueError(
+                "rotations must contain exactly one record per segment "
+                "boundary "
+                f"({len(self.rotations)} given for {len(self.receipts)} "
+                "segments)"
+            )
+        # The raw four-tuples returned by rotate_signer have no dedicated
+        # class; check only their container type here, leaving length and
+        # element validation to verify_rotation, exactly as
+        # inspect_rotated_chain does.
+        for rotation in self.rotations:
+            if not isinstance(rotation, tuple):
+                raise TypeError(
+                    "each rotation must be a (old, new_key, new, auth) tuple"
                 )
         if not isinstance(self.start, SignedRoot):
             raise TypeError("start must be a SignedRoot")
@@ -6373,6 +6476,74 @@ def inspect_anchored_continuations(
     )
 
 
+def inspect_rotated_anchors(
+    bundle: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose a persisted rotated anchor chain offline.
+
+    The bundle-level, anchor-aware counterpart of
+    :func:`inspect_rotated_chain`: an offline party holding only the
+    pre-trusted first signer's key and a :class:`RotatedChain` restored
+    from storage — by :func:`decode_rotated_anchor` or built directly —
+    confirms in one call that the persisted receipts not only form one
+    internally continuous, hop-by-hop authorized cross-key chain but
+    span **exactly** from the persisted ``start`` anchor to the
+    persisted ``end`` anchor. It is equally read-only: it holds neither
+    the log nor any checkpoint history, introduces no new Ed25519 or
+    HMAC signing domain or wire format and never mutates the bundle or
+    the key.
+
+    The chain itself is diagnosed first by delegating to
+    :func:`inspect_rotated_chain` over the bundle's own fields —
+    ``inspect_rotated_chain(bundle.receipts, bundle.rotations, key)`` —
+    so a failing report (``"verify"``, ``"growth"``, ``"duplicate"``,
+    ``"rotation_duplicate"``, ``"rotation"`` or ``"rotation_link"``) is
+    returned unchanged with its first-failure order, and an internally
+    broken chain is never re-diagnosed as an anchor mismatch. Only when
+    the internal report succeeds are the anchors compared, start before
+    end:
+
+    - the first segment's ``consistency.old`` checkpoint must equal
+      ``bundle.start`` — a mismatch reports ``"start"`` at index ``0``;
+    - the last segment's ``consistency.new`` checkpoint must equal
+      ``bundle.end`` — a mismatch reports ``"end"`` at the last
+      segment's position.
+
+    Anchor equality is full :class:`SignedRoot` equality over all six
+    fields (``version``, ``hash_name``, ``size``, ``root``, ``head`` and
+    the Ed25519 ``signature``), so a checkpoint attesting the right size
+    over the wrong history — or signed by the wrong key — does not
+    match. A chain that is internally continuous, authorized at every
+    hop and anchored at both ends reports
+    ``ContinuationChainReport(True, None, None)``.
+
+    ``bundle`` must be a :class:`RotatedChain` — anything else raises
+    TypeError; the bundle's own constructor guarantees at least two
+    receipts with exactly one fewer rotation. ``key`` and the bundle's
+    fields are validated by :func:`inspect_rotated_chain` itself, whose
+    TypeError/ValueError rules and nested structural exceptions apply
+    and propagate unchanged.
+    """
+    if not isinstance(bundle, RotatedChain):
+        raise TypeError("bundle must be a RotatedChain")
+    # The internal cross-key diagnosis keeps its own first-failure order;
+    # only an internally sound chain is ever compared against the anchors,
+    # start before end, exactly as inspect_anchors does for the
+    # single-signer chain.
+    report = inspect_rotated_chain(
+        bundle.receipts, bundle.rotations, key
+    )
+    if not report.ok:
+        return report
+    if bundle.receipts[0].consistency.old != bundle.start:
+        return ContinuationChainReport(False, 0, _CHAIN_CODE_START)
+    if bundle.receipts[-1].consistency.new != bundle.end:
+        return ContinuationChainReport(
+            False, len(bundle.receipts) - 1, _CHAIN_CODE_END
+        )
+    return report
+
+
 def _anchor_set_packages(items: Any, key: Any) -> None:
     """Validate the arguments of the anchor-set entry points."""
     if not isinstance(items, tuple):
@@ -6697,6 +6868,106 @@ def decode_anchored_continuations(data: Any) -> AnchoredContinuationChain:
     if offset != len(data):
         raise ValueError("trailing bytes after the anchored continuations")
     return AnchoredContinuationChain(receipts, start, end)
+
+
+def encode_rotated_anchor(x: Any) -> bytes:
+    """Encode a :class:`RotatedChain` into its canonical binary form.
+
+    The byte stream is ``D || U(1) || B(C) || B(R) || B(S) || B(E)``
+    with ``D = b"auditchain/ra/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then ``C`` holding byte-for-byte the
+    complete canonical output of :func:`encode_continuations` over
+    ``x.receipts``, ``R`` holding byte-for-byte the complete canonical
+    output of :func:`encode_rotations` over ``x.rotations``, and ``S``
+    and ``E`` holding byte-for-byte the complete canonical outputs of
+    :func:`encode_signed_root` over ``x.start`` and ``x.end`` — nothing
+    may be omitted, reordered or appended. The framing introduces no new
+    signing message and is read-only: it never mutates the chain.
+
+    ``x`` must be a :class:`RotatedChain` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_continuations`, :func:`encode_rotations` and
+    :func:`encode_signed_root` (TypeError or ValueError), propagated
+    unchanged. Encoding is deterministic: re-encoding a decoded chain
+    reproduces the original bytes exactly, and a structurally valid
+    chain whose signatures do not verify encodes just as well.
+    """
+    if not isinstance(x, RotatedChain):
+        raise TypeError("x must be a RotatedChain")
+    return b"".join((
+        _ROTATED_ANCHOR_MAGIC,
+        _encode_u64(_ROTATED_ANCHOR_VERSION, "version"),
+        _encode_blob(encode_continuations(x.receipts)),
+        _encode_blob(encode_rotations(x.rotations)),
+        _encode_blob(encode_signed_root(x.start)),
+        _encode_blob(encode_signed_root(x.end)),
+    ))
+
+
+def decode_rotated_anchor(data: Any) -> RotatedChain:
+    """Decode bytes produced by :func:`encode_rotated_anchor`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray``
+    and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/ra/v1\\0"`` it must contain, strictly in order, the
+    u64 envelope version (only ``1`` is supported) and exactly four
+    length-prefixed blobs, each consumed whole with no trailing bytes:
+    the continuation-chain blob is handed to
+    :func:`decode_continuations`, the rotation-chain blob to
+    :func:`decode_rotations`, and the start and end anchor blobs to
+    :func:`decode_signed_root`, so their framing and structural rules
+    apply verbatim and their exceptions propagate unchanged. A bad magic
+    or version, truncation, an oversized blob length, trailing bytes, or
+    any nested structural violation raises ValueError.
+
+    The decoded tuples are re-assembled, in encoded order, into the
+    frozen :class:`RotatedChain` returned to the caller, so that
+    class's own shape rules apply as a final check: at least two
+    receipts and exactly one fewer rotation raise ValueError on a
+    hand-crafted framing whose nested blobs decode but do not fit the
+    rotated-chain relationship. Signatures, tags, proofs, the hop-by-hop
+    key handoffs, the adjacency between receipts and the anchoring
+    itself are not checked here — only
+    :func:`inspect_rotated_anchors` confirms the decoded chain spans its
+    anchors. The returned chain's fields equal the originally encoded
+    ones, and re-encoding reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ROTATED_ANCHOR_MAGIC):
+        raise ValueError("not an auditchain rotated-anchor encoding")
+    offset = len(_ROTATED_ANCHOR_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ROTATED_ANCHOR_VERSION:
+        raise ValueError(f"unsupported rotated-anchor version {version}")
+    receipts = decode_continuations(read_blob("continuation chain"))
+    rotations = decode_rotations(read_blob("rotation chain"))
+    start = decode_signed_root(read_blob("start anchor"))
+    end = decode_signed_root(read_blob("end anchor"))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the rotated anchor chain")
+    return RotatedChain(receipts, rotations, start, end)
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

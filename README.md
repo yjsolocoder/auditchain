@@ -1614,6 +1614,68 @@ merged.receipts == tuple(                  # 按包序、包内序拼接全部�
   `bytearray`）抛 `TypeError`，长度不符抛 `ValueError`；诊断中的嵌套
   结构异常按既有规则原样传播（`TypeError` / `ValueError`）
 
+#### 轮换感知锚定链持久化：跨密钥续接、逐跳轮换与首尾检查点一并恢复
+
+跨密钥续接链要跨进程保存时，仅有 `AnchoredContinuationChain` 不足以还原
+信任逐跳转移的全部依据：还必须一并保存每处边界的签名者轮换四元组。冻结包
+`RotatedChain(receipts:tuple, rotations:tuple, start:SignedRoot,
+end:SignedRoot)` 把**至少两段**跨密钥续接凭据 tuple、**数量恰为段数减一**
+的逐跳轮换四元组 tuple 与首尾两个 `SignedRoot` 锚点（首段
+`consistency.old` 应对的 `start`、末段 `consistency.new` 应对的 `end`）
+绑为一件可持久化制品，支持位置/关键字构造、按全部四个字段相等（可哈希）。
+容器或字段类型错抛 `TypeError`，段数少于二或轮换数不等于段数减一抛
+`ValueError`；轮换四元组的元素类型与长度沿用 `verify_rotation` 的校验，
+包本身不核验轮换授权、链连续性与端点锚定。顶层
+`inspect_rotated_anchors(bundle, key) -> ContinuationChainReport`
+是它的只读诊断入口，全程离线、不持有日志、不新增签名域或线格式：
+
+```python
+from auditchain import (
+    RotatedChain,
+    encode_rotated_anchor,
+    decode_rotated_anchor,
+    inspect_rotated_anchors,
+)
+
+bundle = RotatedChain(receipts, rotations, start, end)
+data = encode_rotated_anchor(bundle)    # bytes，可写文件/发网络
+restored = decode_rotated_anchor(data)  # 另一进程中恢复
+restored == bundle                       # True：四字段逐字段相等
+encode_rotated_anchor(restored) == data  # True：重编码逐字节相同
+inspect_rotated_anchors(restored, key_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- 诊断先委托既有
+  `inspect_rotated_chain(bundle.receipts, bundle.rotations, key)`：
+  `"verify"`、`"growth"`、`"duplicate"` 与 `"rotation_duplicate"`、
+  `"rotation"`、`"rotation_link"` 六类失败报告**原样返回**，首错顺序
+  不变，内部不成立的链绝不会被改报为锚点不符
+- 仅当内部诊断成功才比较锚点，且**起点优先于终点**：首段
+  `consistency.old` 与 `bundle.start` 按 `SignedRoot` 全六字段
+  （`version`、`hash_name`、`size`、`root`、`head` 及 Ed25519
+  `signature`）不符报 `"start"`（`index` 取 `0`）；末段
+  `consistency.new` 与 `bundle.end` 全字段不符报 `"end"`（`index` 取
+  末段位置）。两端均锚定、每跳授权均成立的链返回 `(True, None, None)`
+- `bundle` 非 `RotatedChain` 抛 `TypeError`；`key` 及各字段校验、嵌套
+  结构异常全部由 `inspect_rotated_chain` 按既有规则处理并原样传播
+- 字节流严格为 `D || U(1) || B(C) || B(R) || B(S) || B(E)`，其中
+  `D = b"auditchain/ra/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；四个 blob 依次逐字节等于既有
+  `encode_continuations(receipts)`、`encode_rotations(rotations)`、
+  `encode_signed_root(start)`、`encode_signed_root(end)` 的完整输出，
+  按 tuple 顺序排列、**禁止尾随字节**，外层帧不引入任何新签名域
+- `encode_rotated_anchor(x)` 只接受 `RotatedChain`（否则抛
+  `TypeError`）；四个 blob 均由既有编码器原样产出，嵌套结构问题的
+  `TypeError` / `ValueError` 原样传播，编码只读、确定
+- `decode_rotated_anchor(data) -> RotatedChain` 只接受 `bytes`（拒绝
+  `bytearray` / `memoryview`，抛 `TypeError`）；魔数、版本错、截断、
+  blob 长度越界或尾随字节抛 `ValueError`，四个 blob 分别交给
+  `decode_continuations` / `decode_rotations` / `decode_signed_root`，
+  嵌套异常原样传播；解码保序并返回冻结对象，不校验签名、证明、逐跳授权、
+  段间相邻与锚定关系，结构合法但验真不匹配仍可解码，由
+  `inspect_rotated_anchors` 报告而非抛出。旧接口与既有格式均不变
+
 ### 认证日志的加密导出与恢复（AES-256-GCM）
 
 `dump_auth(log, key, nonce=None)` 与 `load_auth(data, key)` 为**构造时带
@@ -2467,6 +2529,35 @@ python3 -m auditchain
   `encode_anchored_continuations`、不设新格式；诊断失败抛 `ValueError`，
   类型/长度校验与嵌套异常规则同 `inspect_anchor_set`；调用只读，不修改
   任何输入包
+- `RotatedChain(receipts, rotations, start, end)` — 冻结的轮换感知锚定
+  链包，把至少两段 `SignedAuthAuditContinuation` tuple、数量恰为段数
+  减一的逐跳轮换四元组 tuple 与首尾两个 `SignedRoot` 锚点绑为一件可
+  持久化制品；支持位置/关键字构造、按全部四字段相等（可哈希）；非 tuple
+  容器、非续接凭据元素、非 tuple 轮换元素或非 `SignedRoot` 锚点抛
+  `TypeError`，段数少于二或轮换数量不等于段数减一抛 `ValueError`；轮换
+  四元组的元素类型与长度沿用 `verify_rotation` 校验，包本身不核验轮换
+  授权、链连续性与锚定关系
+- `encode_rotated_anchor(x)` / `decode_rotated_anchor(data)` —
+  轮换感知锚定链的规范二进制编码与解码，使跨密钥续接凭据、逐跳轮换与
+  首尾锚点可一并落盘、跨进程恢复：字节流严格为
+  `D || U(1) || B(C) || B(R) || B(S) || B(E)`，其中
+  `D = b"auditchain/ra/v1\0"`，`U`/`B` 沿用 u64 大端与长度前缀规则，
+  `C`/`R` 分别逐字节为既有 `encode_continuations` /
+  `encode_rotations` 输出，`S`/`E` 为既有 `encode_signed_root` 输出，
+  禁止尾随字节；前者只接受 `RotatedChain`（否则抛 `TypeError`），后者
+  只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、
+  blob 长度、嵌套格式或尾随非法抛 `ValueError`，嵌套编码器异常原样
+  传播；解码保序、返回冻结 `RotatedChain` 且重编码逐字节相同，不校验
+  签名、证明、逐跳授权、段间相邻与锚定关系；两个入口均为只读且确定，
+  旧接口和签名域不变
+- `inspect_rotated_anchors(bundle, key)` — `RotatedChain` 的只读诊断
+  入口：先委托 `inspect_rotated_chain(bundle.receipts, bundle.rotations,
+  key)`，失败报告（含三个轮换码）原样返回；仅当内部成立才按 `SignedRoot`
+  全六字段比较锚点，首段 `consistency.old` 不符报 `"start"`（`index`
+  取 `0`），末段 `consistency.new` 不符报 `"end"`（`index` 取末段位置），
+  起点优先；全部成立返回 `(True, None, None)`。`bundle` 非 `RotatedChain`
+  抛 `TypeError`，`key` 及各字段校验与嵌套异常由 `inspect_rotated_chain`
+  按既有规则原样传播；离线、只读、不持有日志、不新增签名域或线格式
 - `encode_prune_receipt(receipt)` / `decode_prune_receipt(data)` — 前缀裁剪回执的
   规范二进制编码与解码，使 `PruneReceipt` 可落盘、跨进程恢复后继续用于
   `AuditLog.prune`（编解码只读，旧裁剪行为不变）：字节流为

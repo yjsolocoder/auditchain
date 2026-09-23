@@ -12,7 +12,7 @@ verify_audit_batch / inspect_continuation_chain / inspect_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
-inspect_rotated_anchor_set /
+inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
 verify_rotation /
@@ -142,6 +142,7 @@ __all__ = [
     "load_secure_log",
     "load_secure_pruned",
     "merge_anchor_set",
+    "merge_rotated_anchor_set",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -6675,6 +6676,69 @@ def inspect_rotated_anchor_set(
         # rotation (it requires at least two receipts).
         current_key = item.rotations[-1][1]
     return ContinuationChainReport(True, None, None)
+
+
+def merge_rotated_anchor_set(
+    items: Any, bridges: Any, key: Any
+) -> RotatedChain:
+    """Merge in-order persisted cross-key packages into one frozen chain.
+
+    The productive counterpart of :func:`inspect_rotated_anchor_set`: it
+    diagnoses the packages and bridges exactly as that function does and,
+    only when the diagnosis succeeds — every package sound on its own under
+    the hopped keys and every bridge genuine and joining at both anchors —
+    returns a **new** frozen :class:`RotatedChain` spanning the whole set:
+
+    - ``receipts`` are the packages' receipts concatenated in package order
+      and in within-package order;
+    - ``rotations`` interleave the intra-package rotations with the
+      cross-package bridges: after each package's own rotations (i.e. after
+      its last intra-package rotation), the boundary ``bridges[i]`` is
+      inserted, followed by the next package's own rotations, so every
+      adjacent-credential boundary in the merged chain is covered exactly
+      once;
+    - ``start`` is the first package's ``start`` and ``end`` the last
+      package's ``end``.
+
+    The merged artifact verifies as one cross-signer chain with
+    :func:`verify_rotated_chain` and encodes through the existing
+    :func:`encode_rotated_anchor` with no new signing domain, framing or
+    wire format. The call is strictly offline and read-only: none of the
+    input packages, bridges or the key is mutated or rebuilt; receipts and
+    rotations are reused rather than recopied (tuples are immutable), so
+    the inputs still encode exactly as before.
+
+    ``items``, ``bridges`` and ``key`` follow
+    :func:`inspect_rotated_anchor_set` exactly and have no defaults: a
+    non-tuple ``items`` or ``bridges`` (including a list, a generator or
+    ``None``), an element of ``items`` that is not a :class:`RotatedChain`,
+    a bridge element that is not a tuple, or a non-``bytes`` ``key`` raises
+    TypeError, while an empty ``items`` tuple, a ``bridges`` tuple whose
+    length is not exactly ``len(items) - 1`` or a key that is not 32 bytes
+    raises ValueError. A set that fails the diagnosis — a package that does
+    not verify internally, or a bridge that repeats an earlier one, fails
+    :func:`verify_rotation` or fails to join the two anchors — raises
+    ValueError, never a silently partial merge. Nested structural violations
+    raised during the diagnosis propagate unchanged (TypeError or
+    ValueError).
+    """
+    report = inspect_rotated_anchor_set(items, bridges, key)
+    if not report.ok:
+        raise ValueError(
+            "rotated anchor set cannot be merged: "
+            f"{report.code!r} at receipt index {report.index}"
+        )
+    receipts = tuple(
+        receipt for item in items for receipt in item.receipts
+    )
+    rotations: list[tuple] = []
+    for index, item in enumerate(items):
+        rotations.extend(item.rotations)
+        if index < len(items) - 1:
+            rotations.append(bridges[index])
+    return RotatedChain(
+        receipts, tuple(rotations), items[0].start, items[-1].end
+    )
 
 
 def _anchor_set_packages(items: Any, key: Any) -> None:

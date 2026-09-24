@@ -1148,6 +1148,120 @@ for i, old in enumerate(old_tags):
 - stage-0 一次性导出、批量签发与签名交付的既有行为全部不变；这一层不新增签名
   原文、不新增线格式，`python3 -m auditchain` 演示入口不变
 
+#### 可信阶段认证批次交付包（Ed25519）
+
+`SignedStageVerifier` 解决"演进后的阶段验证材料从哪来"，`auth_batch` 解决
+"批量签发"，但两者仍要分别交付、分别核对。冻结的
+`SignedStageAuthBundle(verifier, hash_name, items)` 是
+`SignedAuthBundle` 的**阶段对应物**：它把已签名的交付点
+`SignedStageVerifier` 与 `auth_batch` 的 `(Entry, AuthTag)` 元组合并成
+**一个**不可变交付包，离线方只凭预置信任的 32 字节 Ed25519 公钥先确认来源、
+再逐项核验标签，全程不持有日志、也不新增任何签名原文（签名仍是
+`SignedStageVerifier` 里那一份）：
+
+```python
+from auditchain import (
+    SignedStageAuthBundle,
+    decode_signed_stage_auth_bundle,
+    encode_signed_stage_auth_bundle,
+    verify_signed_stage_auth_bundle,
+)
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    log.append(record)
+log.rotate_key()                          # 交付点 stage 1
+receipt = log.export_signed_stage_verifier(seed)  # 已签名的阶段验证材料
+items = log.auth_batch([0, 2, 4])                 # 前向安全认证批次
+bundle = SignedStageAuthBundle(receipt, log.hash_name, items)
+
+data = encode_signed_stage_auth_bundle(bundle)     # bytes，可写文件/发网络
+restored = decode_signed_stage_auth_bundle(data)   # 冻结交付包，字段相等
+restored == bundle                                 # True
+encode_signed_stage_auth_bundle(restored) == data  # True：重编码逐字节相同
+verify_signed_stage_auth_bundle(restored, public_key)   # (True, True, True)
+verify_signed_stage_auth_bundle(restored, other_key)    # (False, False, False)
+```
+
+- 交付包为冻结的 `SignedStageAuthBundle(verifier, hash_name, items)`，支持
+  位置构造、按全部三个字段相等；`verifier` 必须是 `SignedStageVerifier`，
+  `hash_name` 必须是已知固定输出算法名，`items` 即 `auth_batch` 的结果元组
+  （必须是 `tuple`）。容器字段类型错抛 `TypeError`，未知算法名抛
+  `ValueError`；项内部的结构契约沿用 `verify_signed_stage_auth_bundle`，
+  构造器不重复校验
+- `verify_signed_stage_auth_bundle(bundle, public_key) -> tuple[bool, ...]`
+  完全离线：先用 `verify_signed_stage_verifier` 以预信任公钥核验嵌套阶段
+  材料的签名，**验签失败逐项返回 `False`**（结果长度与 `items` 相同，空批次
+  为 `()`）；验签成功且 `bundle.hash_name` 与签名阶段材料的算法一致时，对每个
+  `(Entry, AuthTag)` 复用 `verify_auth_stage` 以交付的 `StageVerifier` 逐项
+  核验并返回同序布尔元组。算法不一致同样逐项 `False`，绝不抛异常冒充结构
+  错误。入参不是 `SignedStageAuthBundle`（含绕过构造器的容器字段类型错）或
+  公钥不是 `bytes` 抛 `TypeError`；公钥不是 32 字节或嵌套结构非法（索引非
+  升序、stage 不连续、摘要宽度不符等）沿用 `verify_signed_stage_verifier` /
+  `verify_auth_stage` 的既有异常（`TypeError` / `ValueError`）；调用只读
+- `encode_signed_stage_auth_bundle(x)` /
+  `decode_signed_stage_auth_bundle(data)` 把交付包序列化为规范字节并原样
+  还原，使它可落盘、跨进程恢复后继续离线核验，**不新增签名原文**：字节流为
+  `D || U(1) || B(S) || B(A)`，其中
+  `D = b"auditchain/signed-stage-auth-bundle/v1\0"`，`U` 为 8 字节无符号
+  大端整数，`B(x) = U(len(x)) || x`（沿用 u64/blob 公开规则）；`S`、`A`
+  依次为既有 `encode_signed_stage_verifier(verifier)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的完整规范字节，签名阶段
+  材料在前、认证批次在后，解码精确消费两个 blob 并禁止尾随字节，分别交给
+  既有解码器
+- 类型错抛 `TypeError`（`encode` 只接受 `SignedStageAuthBundle`，`decode`
+  只接受精确的 `bytes`，含拒绝 `bytearray` / `memoryview`）；魔数、版本、
+  截断、尾随、blob 长度越界、嵌套格式非法或**两段算法不一致**（批次算法与
+  签名阶段材料算法不符）在编码与解码两端都抛 `ValueError`，不留半个结果；
+  空批次照常往返（两个 blob 都在，不因零项省略任何结构），恢复后核验返回
+  `()`；签名或标签不匹配仍可正常解码，核验逐项 `False`。阶段密钥在字节流中
+  明文携带（只认证来源、不加密），字节流须像材料本体一样保护；两个入口均
+  只读且确定，同一交付包重复编码、以及解码后重编码的字节逐字节相同
+
+`SignedStageAuthBundle` 也可由日志**原子签发**：
+`AuditLog.signed_stage_auth_bundle(indices, private_key)` 在一次调用内同时
+交付已签名的当前阶段材料与按绝对索引升序的前向安全标签（首个标签落在交付
+stage），避免先 `export_signed_stage_verifier` 再 `auth_batch` 分步执行：
+
+```python
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    log.append(record)
+log.rotate_key()
+bundle = log.signed_stage_auth_bundle([4, 0, 2], seed)   # 一次调用完成签发
+
+# 等价于在同型日志上分步执行 export_signed_stage_verifier + auth_batch
+twin = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    twin.append(record)
+twin.rotate_key()
+stepwise = SignedStageAuthBundle(
+    twin.export_signed_stage_verifier(seed),
+    twin.hash_name,
+    twin.auth_batch([4, 0, 2]),
+)
+bundle == stepwise                               # True：签名与标签逐字节相同
+verify_signed_stage_auth_bundle(bundle, public_key)   # (True, True, True)
+```
+
+- `AuditLog.signed_stage_auth_bundle(indices, private_key)` 与
+  `export_signed_stage_verifier` 的资格相同：仅限带 `key` 且**至少演进过
+  一次**（`stage > 0`）的日志；只读、可重复调用，**不消耗** stage-0 的一次性
+  导出资格。`indices` 为互异非 `bool` 整数的可迭代项（含生成器），允许空
+  选择；返回的冻结包 `verifier` 即当前阶段的签名材料，`hash_name` 为日志
+  算法，`items` 按绝对索引升序，第 j 个标签的 stage 为交付 stage 加 j
+- **不新增签名原文**：嵌套 `SignedStageVerifier` 的 Ed25519 签名逐字节复用
+  `export_signed_stage_verifier` 的签名原文；各项 HMAC、u64 大端 stage 与
+  密钥演进顺序逐字节沿用 `auth_batch`。空选择仍交付签名材料但 stage 不
+  推进；非空选择恰推进所选条数
+- 所有校验（密钥模式、私钥、索引、重复、保留范围、stage 容量与交付 stage）
+  均在签名与任何状态变更之前完成：任何失败都**不演进密钥，且不改标签、条目
+  等日志状态**。`private_key` 或 `indices` 类型错、索引非整数或为 `bool`
+  抛 `TypeError`；种子非 32 字节、索引重复、stage 容量不足、无密钥模式或
+  仍在初始 stage 0 抛 `ValueError`；非保留索引沿用 `auth_batch` 的
+  `IndexError`。成功不改哈希链、Merkle 根或搜索索引；既有各线格式与一次性
+  导出行为不变
+
 #### 可信认证批次交付包（Ed25519）
 
 `SignedVerifier` 解决"验证材料从哪来"，`auth_batch` 解决"批量签发"，但两者仍要
@@ -2370,6 +2484,17 @@ python3 -m auditchain
     `ValueError`，仍在初始 stage 0 或无密钥模式抛 `ValueError`；离线用
     `verify_signed_stage_verifier` 凭预信任公钥验真，恢复出的 `verifier` 可直接
     交给 `verify_auth_stage`，签名只认证来源、不加密其中密钥
+  - `signed_stage_auth_bundle(indices, private_key)` — 只读、原子地一次性
+    签发可信阶段认证批次交付包 `SignedStageAuthBundle`：等价于在当前状态上
+    先 `export_signed_stage_verifier(private_key)` 再 `auth_batch(indices)`，
+    嵌套签名与各标签逐字节复用两者的既有原文、**不新增签名原文**，首个标签落在
+    当前交付 stage，非空选择恰推进所选条数、空选择交付材料但 stage 不变。资格与
+    `export_signed_stage_verifier` 相同（带 `key`、`stage > 0`），可重复调用且
+    不消耗 stage-0 的一次性导出资格；`indices` 接受生成器并按绝对索引升序。
+    `private_key` / `indices` / 索引类型错抛 `TypeError`，种子非 32 字节、
+    重复、stage 容量不足、无密钥模式或仍在 stage 0 抛 `ValueError`，非保留索引
+    抛 `IndexError`；任何失败都不演进密钥、不改日志状态；离线用
+    `verify_signed_stage_auth_bundle` 凭预信任公钥逐项验真
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
@@ -2510,6 +2635,20 @@ python3 -m auditchain
   不是 `bytes` 抛 `TypeError`；版本非 1、stage 越界、空 `key`、正阶段宽度不符、
   未知算法、签名长度或公钥长度（非 32 字节）非法抛 `ValueError`；调用只读，
   恢复出的嵌套 `StageVerifier` 可直接交给 `verify_auth_stage`
+- `verify_signed_stage_auth_bundle(bundle, public_key)` — 凭预先信任的 32
+  字节 Ed25519 公钥离线核验 `SignedStageAuthBundle` 可信阶段认证批次交付包
+  （可由 `AuditLog.signed_stage_auth_bundle(indices, private_key)` 原子签发，
+  或用 `export_signed_stage_verifier` 与 `auth_batch` 的结果手工构造），无需
+  持有日志、不新增签名原文：先用 `verify_signed_stage_verifier` 核验嵌套的
+  已签名交付点阶段材料，验签失败逐项返回 `False`（长度与 `items` 相同，空
+  批次为 `()`）；验签成功且 `bundle.hash_name` 与签名阶段材料的算法一致时，
+  对每个 `(Entry, AuthTag)` 以交付的 `StageVerifier` 复用
+  `verify_auth_stage` 逐项核验并返回同序 `tuple[bool, ...]`；算法不一致同样
+  逐项 `False`。批次先做结构校验（索引严格升序、标签 stage 连续）。入参不是
+  `SignedStageAuthBundle`（含绕过构造器的容器字段类型错）或公钥不是 `bytes`
+  抛 `TypeError`；公钥长度非 32 字节抛 `ValueError`，嵌套结构非法沿用
+  `verify_signed_stage_verifier` / `verify_auth_stage` 的既有异常
+  （`TypeError` / `ValueError`）；签名只认证来源、不加密其中密钥，调用只读
 - `verify_signed_root(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_root` 签发的 `SignedRoot`：重建同一签名原文
   `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`
@@ -2648,6 +2787,24 @@ python3 -m auditchain
   blob 长度、stage 为负或达到 `2**64`、空 `key`、正阶段 `key` 宽度不符或签名
   不是 64 字节抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，验签返回
   `False` 而绝不抛异常；编码只认证来源、不加密其中密钥；两个入口均为只读且确定
+- `encode_signed_stage_auth_bundle(bundle)` /
+  `decode_signed_stage_auth_bundle(data)` — 可信阶段认证批次交付包的规范
+  二进制编码与解码，使 `SignedStageAuthBundle` 可落盘、跨进程恢复后继续凭
+  预置信任的 Ed25519 公钥离线逐项验真，且不新增签名原文：魔数
+  `b"auditchain/signed-stage-auth-bundle/v1\0"` 开头，严格依次写
+  version=1（u64）、签名阶段材料 blob、认证批次 blob（不允许省略、换序或附加
+  字段）；每个 blob 为 u64 字节长度前缀加原始字节，内容分别是既有
+  `encode_signed_stage_verifier(verifier)` 与
+  `encode_auth_batch(items, hash_name=hash_name)` 的完整规范字节，解码精确
+  消费两个 blob、禁止尾随字节并分别交给既有解码器。解码结果为冻结交付包，
+  全部字段与原件相等（空批次为 `()`，两个 blob 均不省略），重编码逐字节相同，
+  可直接交回 `verify_signed_stage_auth_bundle` 且恢复前后同一公钥的逐项结论
+  一致。前者只接受 `SignedStageAuthBundle`（含绕过构造器的容器字段类型错抛
+  `TypeError`），后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；魔数、版本不符、截断、尾随、blob 长度越界或嵌套格式非法抛
+  `ValueError`，两段所载算法不一致在编码与解码两端都抛 `ValueError`、不留
+  半个结果；结构合法但签名或标签与内容不匹配仍可编解码，核验逐项返回 `False`；
+  编码不加密其中的阶段密钥，字节流须像材料本体一样保护；两个入口均为只读且确定
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head

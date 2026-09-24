@@ -2,6 +2,7 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
+SignedAuditReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
@@ -15,7 +16,8 @@ inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
-verify_signed_audit_batch / verify_signed_consistency / verify_signed_prune /
+verify_signed_audit_batch / verify_signed_audit_receipt /
+verify_signed_consistency / verify_signed_prune /
 verify_rotation /
 verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
@@ -25,6 +27,7 @@ encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_verifier / decode_signed_verifier /
 encode_signed_audit_batch / decode_signed_audit_batch /
+encode_signed_audit_receipt / decode_signed_audit_receipt /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
@@ -76,6 +79,7 @@ __all__ = [
     "RotatedAnchorSet",
     "RotatedChain",
     "SignedAuditBatch",
+    "SignedAuditReceipt",
     "SignedAuthAuditBundle",
     "SignedAuthAuditContinuation",
     "SignedAuthBundle",
@@ -96,6 +100,7 @@ __all__ = [
     "decode_rotated_anchor_set",
     "decode_rotations",
     "decode_signed_audit_batch",
+    "decode_signed_audit_receipt",
     "decode_signed_auth_audit_bundle",
     "decode_signed_auth_audit_continuation",
     "decode_signed_auth_bundle",
@@ -123,6 +128,7 @@ __all__ = [
     "encode_rotated_anchor_set",
     "encode_rotations",
     "encode_signed_audit_batch",
+    "encode_signed_audit_receipt",
     "encode_signed_auth_audit_bundle",
     "encode_signed_auth_audit_continuation",
     "encode_signed_auth_bundle",
@@ -160,6 +166,7 @@ __all__ = [
     "verify_rotation",
     "verify_rotation_chain",
     "verify_signed_audit_batch",
+    "verify_signed_audit_receipt",
     "verify_signed_auth_audit_bundle",
     "verify_signed_auth_audit_continuation",
     "verify_signed_auth_bundle",
@@ -261,6 +268,13 @@ _SIGNED_VERIFIER_VERSION = 1
 # encode_signed_root bytes, in that order and with nothing else.
 _SIGNED_AUDIT_BATCH_MAGIC = b"auditchain/signed-audit-batch/v1\0"
 _SIGNED_AUDIT_BATCH_VERSION = 1
+
+# Binary framing of encode_signed_audit_receipt / decode_signed_audit_receipt:
+# a fixed magic, then the envelope version as a u64 and two u64-length-prefixed
+# blobs holding the complete canonical encode_audit_receipt and
+# encode_signed_root bytes, in that order and with nothing else.
+_SIGNED_AUDIT_RECEIPT_MAGIC = b"auditchain/signed-audit-receipt/v1\0"
+_SIGNED_AUDIT_RECEIPT_VERSION = 1
 
 # Binary framing of encode_signed_consistency / decode_signed_consistency:
 # a fixed magic, then the envelope version as a u64, two u64-length-prefixed
@@ -986,6 +1000,40 @@ class SignedAuditBatch:
     def __post_init__(self) -> None:
         if not isinstance(self.batch, tuple):
             raise TypeError("batch must be the audit_batch five-tuple")
+        if not isinstance(self.checkpoint, SignedRoot):
+            raise TypeError("checkpoint must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class SignedAuditReceipt:
+    """Offline audit receipt sealed by a pre-trusted Ed25519 key.
+
+    Bundles the :class:`AuditReceipt` of :meth:`AuditLog.audit_receipt` with
+    the :class:`SignedRoot` checkpoint of :meth:`AuditLog.sign_root`, so an
+    offline receiver holding only a pre-trusted 32-byte Ed25519 public key
+    can confirm in one artifact that the selected entries, the snapshot
+    Merkle root and the chain head were all issued by the log holder —
+    without holding the :class:`AuditLog`:
+
+    - ``receipt``: the :class:`AuditReceipt` produced by
+      :meth:`AuditLog.audit_receipt`,
+    - ``checkpoint``: the :class:`SignedRoot` produced by
+      :meth:`AuditLog.sign_root` for the same snapshot.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``receipt`` must be
+    an :class:`AuditReceipt` and ``checkpoint`` a :class:`SignedRoot`; the
+    receipt's own structural contract is left to :class:`AuditReceipt` and
+    :func:`verify_audit_receipt`, so a field of the wrong type raises
+    TypeError.
+    """
+
+    receipt: AuditReceipt
+    checkpoint: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, AuditReceipt):
+            raise TypeError("receipt must be an AuditReceipt")
         if not isinstance(self.checkpoint, SignedRoot):
             raise TypeError("checkpoint must be a SignedRoot")
 
@@ -2831,6 +2879,36 @@ class AuditLog:
         checkpoint = self.sign_root(private_key, size)
         return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
 
+    def signed_audit_receipt(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedAuditReceipt:
+        """Issue a :class:`SignedAuditReceipt`: an audit receipt sealed by a
+        pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``receipt =
+        audit_receipt(indices, size)`` followed by ``checkpoint =
+        sign_root(private_key, size)`` (``size`` defaulting to the current
+        log length), bundled as one :class:`SignedAuditReceipt`. The receipt
+        lets an offline receiver verify the selected entries and their
+        inclusion proofs against the snapshot Merkle root, and the checkpoint
+        lets the same receiver confirm — using only a pre-trusted 32-byte
+        Ed25519 public key — that the root and chain head were issued by the
+        log holder; no new signing message is introduced, the checkpoint
+        signs exactly the :meth:`sign_root` message. The call is read-only:
+        it never changes entries, head, authentication state, Merkle roots or
+        proofs, and a failure (an invalid selection, seed or size) raises
+        before the bundle is constructed, leaving all state unchanged.
+        """
+        # Validate and build the receipt first, exactly as the public method
+        # does; sign_root() is read-only as well, so either failure leaves the
+        # log untouched and nothing new is ever signed.
+        receipt = self.audit_receipt(indices, size)
+        checkpoint = self.sign_root(private_key, size)
+        return SignedAuditReceipt(receipt=receipt, checkpoint=checkpoint)
+
     def signed_auth_audit_bundle(
         self,
         indices: Iterable[int],
@@ -4634,6 +4712,55 @@ def verify_signed_audit_batch(receipt: Any, public_key: Any) -> bool:
     return hmac.compare_digest(checkpoint.head, expected_head)
 
 
+def verify_signed_audit_receipt(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedAuditReceipt` against a pre-trusted Ed25519 key.
+
+    Confirms both parts of the sealed bundle without holding the log:
+    :func:`verify_audit_receipt` re-verifies the selected entries and their
+    inclusion proofs against the receipt's snapshot root, and
+    :func:`verify_signed_root` verifies the checkpoint signature with the
+    32-byte ``public_key``. The two parts are then required to describe the
+    same snapshot — equal ``hash_name``, ``size`` and ``root``. A genuine
+    sealed bundle from the trusted key returns True; a structurally valid
+    bundle signed by another key, whose parts disagree, or whose entries,
+    proofs, root or signature have been altered returns False. Input that is
+    not a :class:`SignedAuditReceipt` (or whose container fields have been
+    bypassed to wrong types) raises TypeError; nested structural violations
+    raise exactly the exceptions of :class:`AuditReceipt` and
+    :func:`verify_signed_root` (TypeError or ValueError), and a public key
+    that is not 32 ``bytes`` raises ValueError (a non-``bytes`` key
+    TypeError). The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedAuditReceipt):
+        raise TypeError("bundle must be a SignedAuditReceipt")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuditReceipt(bundle.receipt, bundle.checkpoint)
+    # Re-validate the receipt's fields as well (verify_signed_root below does
+    # the same for the checkpoint), so bypassed nested corruption raises
+    # exactly as the AuditReceipt constructor would and only a genuine
+    # mismatch returns False.
+    receipt = AuditReceipt(
+        checked.receipt.version,
+        checked.receipt.hash_name,
+        checked.receipt.size,
+        checked.receipt.root,
+        checked.receipt.items,
+    )
+    if not verify_audit_receipt(receipt):
+        return False
+    if not verify_signed_root(checked.checkpoint, public_key):
+        return False
+    checkpoint = checked.checkpoint
+    # The signed checkpoint must attest exactly the receipt's snapshot.
+    return (
+        checkpoint.hash_name == receipt.hash_name
+        and checkpoint.size == receipt.size
+        and hmac.compare_digest(checkpoint.root, receipt.root)
+    )
+
+
 def verify_signed_consistency(receipt: Any, public_key: Any) -> bool:
     """Verify a :class:`SignedConsistency` against a pre-trusted Ed25519 key.
 
@@ -5337,6 +5464,105 @@ def decode_signed_audit_batch(data: Any) -> SignedAuditBatch:
     batch = decode_audit_batch(batch_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedAuditBatch(batch=batch, checkpoint=checkpoint)
+
+
+def encode_signed_audit_receipt(bundle: Any) -> bytes:
+    """Encode a :class:`SignedAuditReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-audit-receipt/v1\\0"``; it then writes, strictly in
+    order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the receipt blob and the checkpoint blob — nothing
+    may be omitted, reordered or appended. Each blob is a u64 byte length
+    followed by the raw bytes: the receipt blob is the complete canonical
+    output of :func:`encode_audit_receipt` over ``bundle.receipt`` and the
+    checkpoint blob is the complete canonical output of
+    :func:`encode_signed_root` over ``bundle.checkpoint``. No new signing
+    message is introduced: encoding is read-only and only re-uses the
+    existing canonical encodings.
+
+    ``bundle`` must be a :class:`SignedAuditReceipt` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_audit_receipt` and :func:`encode_signed_root` (TypeError or
+    ValueError). Encoding is deterministic: re-encoding a decoded bundle
+    reproduces the original bytes exactly, and a structurally valid bundle
+    whose signature does not match encodes just as well.
+    """
+    if not isinstance(bundle, SignedAuditReceipt):
+        raise TypeError("bundle must be a SignedAuditReceipt")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedAuditReceipt(bundle.receipt, bundle.checkpoint)
+    receipt_blob = encode_audit_receipt(checked.receipt)
+    checkpoint_blob = encode_signed_root(checked.checkpoint)
+    return b"".join((
+        _SIGNED_AUDIT_RECEIPT_MAGIC,
+        _encode_u64(_SIGNED_AUDIT_RECEIPT_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        _encode_blob(checkpoint_blob),
+    ))
+
+
+def decode_signed_audit_receipt(data: Any) -> SignedAuditReceipt:
+    """Decode bytes produced by :func:`encode_signed_audit_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-audit-receipt/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed receipt blob and one length-prefixed checkpoint blob,
+    with no trailing bytes. Each blob is handed whole to the existing decoder
+    — :func:`decode_audit_receipt` and :func:`decode_signed_root`
+    respectively — so every nested framing and structural rule is theirs. A
+    bad magic or version, truncation, an oversized blob length, trailing
+    bytes or an illegal nested encoding raises ValueError.
+
+    The returned object is a frozen :class:`SignedAuditReceipt` whose fields
+    equal the originally encoded ones, and re-encoding reproduces the
+    original bytes exactly. A structurally sound encoding whose receipt and
+    checkpoint disagree or whose checkpoint signature simply does not verify
+    still decodes; :func:`verify_signed_audit_receipt` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_AUDIT_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain signed-audit-receipt encoding")
+    offset = len(_SIGNED_AUDIT_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_AUDIT_RECEIPT_VERSION:
+        raise ValueError(
+            f"unsupported signed-audit-receipt version {version}"
+        )
+    receipt_blob = read_blob("receipt")
+    checkpoint_blob = read_blob("checkpoint")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed audit receipt")
+    # Decode both nested blobs with their existing decoders; their own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    receipt = decode_audit_receipt(receipt_blob)
+    checkpoint = decode_signed_root(checkpoint_blob)
+    return SignedAuditReceipt(receipt=receipt, checkpoint=checkpoint)
 
 
 def encode_signed_consistency(receipt: Any) -> bytes:

@@ -2245,6 +2245,13 @@ python3 -m auditchain
   `signature` 只接受恰好 64 字节的精确 `bytes`（拒绝 `bytearray` /
   `memoryview`）；签名只认证来源、不加密其中密钥。类型非法抛 `TypeError`，版本非
   1、空 `key`、未知算法或 `signature` 不是 64 字节抛 `ValueError`
+- `SignedStageVerifier(version, verifier, signature)` — 不可变的 Ed25519 可信
+  交付阶段验证材料（`StageVerifier` 的签名封装），按全部字段相等、支持位置构造；
+  `version` 恒为 `1`，`verifier` 必须是 `StageVerifier`（其 stage 范围、非空
+  `bytes` 类型 `key`、正阶段与摘要等宽及算法名同样被复验），`signature` 只接受
+  恰好 64 字节的精确 `bytes`（拒绝 `bytearray` / `memoryview`）；签名只认证
+  来源、不加密其中密钥。类型非法抛 `TypeError`，版本非 1、嵌套字段非法或
+  `signature` 不是 64 字节抛 `ValueError`
 - `SignedAuthBundle(verifier, hash_name, items)` — 不可变的可信认证批次交付包，
   按全部三个字段相等、支持位置构造；`verifier` 为已签名的 stage-0 验证材料
   （必须是 `SignedVerifier`），`hash_name` 为认证批次签发所用算法（必须是已知
@@ -2352,6 +2359,17 @@ python3 -m auditchain
     日志或认证状态。带认证密钥的日志须至少演进过一次，仍在初始 stage 0 时调用抛
     `ValueError`，无密钥模式抛 `ValueError`；离线用 `verify_auth_stage` 核验，
     只能通过交付点及其之后签发的标签
+  - `export_signed_stage_verifier(private_key)` — 只读、可重复调用的演进后可信
+    交付入口，用按次传入的 32 字节 Ed25519 私钥种子对当前
+    `export_stage_verifier()` 结果确定性签名，返回不可变
+    `SignedStageVerifier(version=1, verifier, signature)`；签名原文为
+    `D || 0x01 || U(stage) || B(hash_name 的 UTF-8) || B(key)`
+    （`D = b"auditchain/signed-stage/v1\0"`，`U` 为 8 字节无符号大端，
+    `B(x) = U(len(x)) || x`）。不消耗 stage-0 的一次性导出资格、不演进密钥、不
+    签发标签、不改变日志或认证状态；种子类型错抛 `TypeError`、长度非 32 抛
+    `ValueError`，仍在初始 stage 0 或无密钥模式抛 `ValueError`；离线用
+    `verify_signed_stage_verifier` 凭预信任公钥验真，恢复出的 `verifier` 可直接
+    交给 `verify_auth_stage`，签名只认证来源、不加密其中密钥
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
@@ -2480,6 +2498,18 @@ python3 -m auditchain
   `SignedVerifier`（含绕过构造器写入错误字段类型）或公钥不是 `bytes` 抛
   `TypeError`；版本非 1、空 `key`、未知算法、签名长度或公钥长度（非 32 字节）
   非法抛 `ValueError`；调用只读
+- `verify_signed_stage_verifier(receipt, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥离线验证 `AuditLog.export_signed_stage_verifier` 签发的
+  `SignedStageVerifier`：从嵌套 `StageVerifier` 重建同一签名原文
+  `D || 0x01 || U(stage) || B(hash_name 的 UTF-8) || B(key)`
+  （`D = b"auditchain/signed-stage/v1\0"`，`U` 为 8 字节无符号大端，
+  `B(x) = U(len(x)) || x`）并校验其 64 字节签名，无需持有日志；公钥不是对应
+  签发方，或结构合法但 `verifier` 的 `stage` / `key` / `hash_name` 或
+  `signature` 被改返回 `False`，匹配返回 `True`。签名只认证来源、不加密其中
+  密钥。入参不是 `SignedStageVerifier`（含绕过构造器写入错误字段类型）或公钥
+  不是 `bytes` 抛 `TypeError`；版本非 1、stage 越界、空 `key`、正阶段宽度不符、
+  未知算法、签名长度或公钥长度（非 32 字节）非法抛 `ValueError`；调用只读，
+  恢复出的嵌套 `StageVerifier` 可直接交给 `verify_auth_stage`
 - `verify_signed_root(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_root` 签发的 `SignedRoot`：重建同一签名原文
   `D || 0x01 || B(hash_name 的 UTF-8) || U(size) || B(root) || B(head)`
@@ -2591,6 +2621,33 @@ python3 -m auditchain
   的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、blob 长度、
   空 `key` 或签名宽度非法抛 `ValueError`；结构合法但签名不匹配仍可解码，验签
   返回 `False`；两个入口均为只读
+- `encode_stage_verifier(material)` / `decode_stage_verifier(data)` — 裸交付
+  点阶段验证材料的规范二进制编码与解码，使 `StageVerifier` 可落盘、跨进程恢复后
+  继续由 `verify_auth_stage` 离线核验：魔数
+  `b"auditchain/stage-verifier/v1\0"` 开头，后接 version=1（u64）、stage（u64）、
+  hash_name 的 UTF-8 blob、key blob；整数为 8 字节无符号大端，blob 为 u64 长度
+  前缀加原始字节（零长度也写全零 u64）。解码结果冻结、按全部字段与原材料相等，
+  重编码逐字节相同，对同一标签的核验结论与原件一致。前者只接受
+  `StageVerifier`，后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；非
+  对应类型或字段类型错（含绕过冻结构造器的材料）抛 `TypeError`，魔数、版本、
+  UTF-8、未知算法、截断、尾随、blob 长度、stage 为负或达到 `2**64`、空 `key`
+  或正阶段 `key` 不与摘要等宽抛 `ValueError`；编码携带明文阶段密钥，须像内存中的
+  材料一样保护；两个入口均为只读且确定
+- `encode_signed_stage_verifier(receipt)` /
+  `decode_signed_stage_verifier(data)` — 可信交付阶段验证材料的规范二进制
+  编码与解码，使 `SignedStageVerifier` 可落盘、跨进程恢复后继续凭预置信任的
+  Ed25519 公钥离线验真，且不新增签名原文：魔数
+  `b"auditchain/signed-stage/v1\0"` 开头，后接 version=1（u64）、嵌套
+  verifier 的 stage（u64）、hash_name 的 UTF-8 blob、key blob、signature blob；
+  整数为 8 字节无符号大端，blob 为 u64 长度前缀加原始字节（零长度也写全零
+  u64）。解码结果字段与原回执相等、重编码逐字节相同，并可继续由
+  `verify_signed_stage_verifier` 离线验真，恢复出的嵌套 `StageVerifier` 可直接
+  交给 `verify_auth_stage`。前者只接受 `SignedStageVerifier`，后者只接受
+  `bytes`（拒绝 `bytearray` / `memoryview`）；非对应类型或字段类型错（含绕过
+  冻结构造器的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、
+  blob 长度、stage 为负或达到 `2**64`、空 `key`、正阶段 `key` 宽度不符或签名
+  不是 64 字节抛 `ValueError`；结构合法但签名与字段不匹配仍可解码，验签返回
+  `False` 而绝不抛异常；编码只认证来源、不加密其中密钥；两个入口均为只读且确定
 - `encode_signed_root(receipt)` / `decode_signed_root(data)` — 可信签名检查点的
   规范二进制编码与解码：魔数 `b"auditchain/signed-root/v1\0"` 开头，后接
   version=1（u64）、hash_name 的 UTF-8 blob、size（u64）、root blob、head

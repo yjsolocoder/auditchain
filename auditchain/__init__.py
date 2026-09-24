@@ -2,6 +2,7 @@
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
+SignedStageAuthBundle /
 SignedAuditBatch /
 SignedAuditReceipt /
 SignedAuthAuditBundle /
@@ -18,7 +19,7 @@ inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
-verify_signed_stage_verifier /
+verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
 verify_signed_audit_batch / verify_signed_audit_receipt /
 verify_signed_consistency / verify_signed_prune /
 verify_rotation /
@@ -89,6 +90,7 @@ __all__ = [
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
+    "SignedStageAuthBundle",
     "SignedStageVerifier",
     "SignedVerifier",
     "StageVerifier",
@@ -183,6 +185,7 @@ __all__ = [
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
+    "verify_signed_stage_auth_bundle",
     "verify_signed_stage_verifier",
     "verify_signed_verifier",
 ]
@@ -1390,6 +1393,52 @@ class SignedAuthBundle:
 
 
 @dataclass(frozen=True)
+class SignedStageAuthBundle:
+    """Trusted delivery bundle of signed stage material and an auth batch.
+
+    The stage-scoped counterpart of :class:`SignedAuthBundle`: it merges the
+    :class:`SignedStageVerifier` of
+    :meth:`AuditLog.export_signed_stage_verifier` with the ``(Entry,
+    AuthTag)`` item tuple of :meth:`AuditLog.auth_batch`, so an offline
+    receiver holding only a pre-trusted 32-byte Ed25519 public key can
+    confirm where the post-evolution stage verification material came from
+    and then check every tag against it — one artifact, no new signing
+    message:
+
+    - ``verifier``: the :class:`SignedStageVerifier` carrying the signed
+      :class:`StageVerifier` (delivery stage, that stage's key and the hash
+      algorithm),
+    - ``hash_name``: the hash algorithm the auth batch was minted under
+      (must agree with the nested verifier's algorithm for verification to
+      succeed),
+    - ``items``: the ``((Entry, AuthTag), ...)`` tuple produced by
+      :meth:`AuditLog.auth_batch`, whose first tag sits at the delivery
+      stage.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. Only the container shape is validated here: ``verifier``
+    must be a :class:`SignedStageVerifier`, ``hash_name`` a known hash
+    algorithm name and ``items`` a tuple; the items' own structural contract
+    is left to :func:`verify_signed_stage_auth_bundle`, so a field of the
+    wrong type raises TypeError. The signature authenticates provenance
+    only; the verifier key travels in the clear.
+    """
+
+    verifier: SignedStageVerifier
+    hash_name: str
+    items: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verifier, SignedStageVerifier):
+            raise TypeError("verifier must be a SignedStageVerifier")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        _digest_size(self.hash_name)
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of (Entry, AuthTag) pairs")
+
+
+@dataclass(frozen=True)
 class SignedAuthAuditBundle:
     """Trusted delivery bundle of an auth bundle and a signed batch audit.
 
@@ -2361,6 +2410,95 @@ class AuditLog:
         )
         # Commit the export and the whole batch atomically.
         self._verifier_exported = True
+        self._tags.update(new_tags)
+        self._key = current_key
+        self._stage += count
+        return bundle
+
+    def signed_stage_auth_bundle(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+    ) -> SignedStageAuthBundle:
+        """Atomically issue a :class:`SignedStageAuthBundle`.
+
+        The one-call fusion of :meth:`export_signed_stage_verifier` and
+        :meth:`auth_batch`: it delivers the signed current-stage
+        :class:`SignedStageVerifier` together with the forward-secure tags
+        of the selected entries in ascending absolute-index order, so a
+        caller never observes the half-committed states a separate
+        export-then-batch sequence can leave. No new signing message is
+        introduced: the embedded signature is byte-for-byte the Ed25519
+        signature :meth:`export_signed_stage_verifier` makes over
+        ``D || 0x01 || U(stage) || B(UTF-8(hash_name)) || B(key)`` with
+        ``D = b"auditchain/signed-stage/v1\\0"``, and the j-th tag reuses
+        exactly :meth:`auth_batch`'s HMAC, 8-byte big-endian stage encoding
+        and key evolution — the items are byte-for-byte what j consecutive
+        ascending :meth:`auth` calls from the current state produce, with
+        the j-th tag at the delivery stage plus j.
+
+        The same eligibility as :meth:`export_signed_stage_verifier`
+        applies: a keyed log that has evolved at least once
+        (``stage > 0``); the call is repeatable and consumes no one-shot
+        eligibility. ``private_key`` is a 32-byte Ed25519 seed used for this
+        one signature and never stored. Every check — key mode, seed,
+        indices, duplicates, retained range, stage capacity and the
+        post-evolution stage — runs before the signature is made or any
+        state changes: a failure never evolves the key and leaves stored
+        tags, entries and every other log object untouched. An empty
+        selection still delivers the signed stage material while the stage
+        does not advance; a non-empty selection advances the stage exactly
+        once per selected entry, exactly like :meth:`auth_batch`. A
+        non-``bytes`` seed, a non-iterable ``indices`` or a
+        non-integer/``bool`` index raises TypeError; a seed that is not 32
+        bytes, duplicate indices, stage-capacity exhaustion, keyless mode or
+        the initial stage raises ValueError; a non-retained index raises
+        IndexError, exactly as :meth:`auth_batch`.
+        """
+        key = self._require_key()
+        signing_key = _load_ed25519_seed(private_key)
+        ordered = self._resolve_auth_indices(indices)
+        count = len(ordered)
+        if self._stage + count >= _MAX_STAGE:
+            raise ValueError("stage limit reached; cannot evolve the key that far")
+        if self._stage == 0:
+            raise ValueError(
+                "stage verifier can only be exported after at least one key evolution"
+            )
+        # All validation passed. Build the signature and every tag against
+        # local variables first, so nothing below mutates the log until the
+        # single commit at the end: a failure here cannot leave a
+        # half-evolved key.
+        receipt = SignedStageVerifier(
+            version=_SIGNED_STAGE_VERSION,
+            verifier=StageVerifier(
+                stage=self._stage,
+                key=key,
+                hash_name=self._hash_name,
+            ),
+            signature=signing_key.sign(
+                _signed_stage_verifier_message(self._stage, self._hash_name, key)
+            ),
+        )
+        current_key = key
+        items: list[tuple[Entry, AuthTag]] = []
+        new_tags: dict[int, AuthTag] = {}
+        for position, index in enumerate(ordered):
+            stage = self._stage + position
+            entry = self._entries[index - self._retain_from]
+            tag = AuthTag(
+                stage=stage,
+                tag=_auth_tag(stage, entry.entry_hash, current_key, self._hash_name),
+            )
+            items.append((entry, tag))
+            new_tags[index] = tag
+            current_key = _evolve_key(current_key, self._hash_name)
+        bundle = SignedStageAuthBundle(
+            verifier=receipt,
+            hash_name=self._hash_name,
+            items=tuple(items),
+        )
+        # Commit the whole batch atomically.
         self._tags.update(new_tags)
         self._key = current_key
         self._stage += count
@@ -5266,6 +5404,100 @@ def verify_signed_auth_bundle(bundle: Any, public_key: Any) -> tuple[bool, ...]:
     if checked.hash_name != verifier.hash_name:
         return tuple(False for _ in checked.items)
     return verify_auth_batch(checked.items, verifier)
+
+
+def verify_signed_stage_auth_bundle(bundle: Any, public_key: Any) -> tuple[bool, ...]:
+    """Verify a :class:`SignedStageAuthBundle` against a pre-trusted Ed25519 key.
+
+    Confirms the trusted-delivery stage auth bundle entirely offline,
+    without holding the log: :func:`verify_signed_stage_verifier` first
+    checks the nested :class:`SignedStageVerifier` against the pre-trusted
+    32-byte ``public_key``, so the receiver learns the stage verification
+    material genuinely came from the log holder. Only when that signature
+    verifies *and* the bundle's ``hash_name`` agrees with the signed
+    verifier's algorithm are the items checked — each ``(Entry, AuthTag)``
+    pair with exactly :func:`verify_auth_stage` against the delivered
+    :class:`StageVerifier` — and the per-item results come back as a tuple
+    of booleans in item order, ``()`` for an empty bundle. A signature that
+    does not verify, or a bundle whose ``hash_name`` disagrees with the
+    signed verifier's algorithm, yields ``False`` at every item position —
+    provenance failure is never silently upgraded to per-item detail.
+
+    As in :func:`verify_auth_batch`, the batch is validated structurally
+    before any per-item verification: the entry indices must be strictly
+    ascending and the tag stages consecutive (the first tag sits at the
+    delivery stage). A wrong container or element type raises TypeError;
+    duplicate, out-of-range or out-of-order entry indices, non-consecutive
+    stages, a stage/index at or beyond ``2**64`` or a wrong digest width
+    raise ValueError; nested structural violations raise exactly the
+    exceptions of :func:`verify_signed_stage_verifier` and
+    :func:`verify_auth_stage`, and a public key that is not 32 ``bytes``
+    raises ValueError (a non-``bytes`` key TypeError). A structurally valid
+    pair whose content does not authenticate contributes only ``False`` at
+    its position, never an exception. The signature authenticates provenance
+    only, not confidentiality: the stage key travels in the clear and must
+    be protected by the caller. The call is read-only and never mutates the
+    bundle.
+    """
+    if not isinstance(bundle, SignedStageAuthBundle):
+        raise TypeError("bundle must be a SignedStageAuthBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedStageAuthBundle(bundle.verifier, bundle.hash_name, bundle.items)
+    if not verify_signed_stage_verifier(checked.verifier, public_key):
+        return tuple(False for _ in checked.items)
+    verifier = checked.verifier.verifier
+    if checked.hash_name != verifier.hash_name:
+        return tuple(False for _ in checked.items)
+    digest_size = _digest_size(checked.hash_name)
+
+    # One structural pass over the whole batch first, exactly as
+    # verify_auth_batch does: any malformed pair (or a broken
+    # ordering/continuity relationship) must raise before per-item
+    # verification.
+    previous_index: int | None = None
+    for position, item in enumerate(checked.items):
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("each item must be an (Entry, AuthTag) tuple")
+        entry, tag = item
+        if not isinstance(entry, Entry):
+            raise TypeError("item entry must be an Entry")
+        if not isinstance(tag, AuthTag):
+            raise TypeError("item tag must be an AuthTag")
+        if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+            raise TypeError("entry.index must be an integer")
+        if not 0 <= entry.index < _MAX_STAGE:
+            raise ValueError("entry.index must satisfy 0 <= index < 2**64")
+        if previous_index is not None and entry.index <= previous_index:
+            raise ValueError(
+                "item entries must be in strictly ascending index order with no duplicates"
+            )
+        previous_index = entry.index
+        for name in ("payload", "previous_hash", "entry_hash"):
+            if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                raise TypeError(f"entry.{name} must be bytes")
+        if len(entry.previous_hash) != digest_size:
+            raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+        if len(entry.entry_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        # Re-validate even against a tag built with object.__setattr__, the
+        # same defensive ordering verify_auth_stage uses.
+        if not isinstance(tag.stage, int) or isinstance(tag.stage, bool):
+            raise TypeError("tag.stage must be an integer")
+        if not 0 <= tag.stage < _MAX_STAGE:
+            raise ValueError("tag.stage must satisfy 0 <= stage < 2**64")
+        if not isinstance(tag.tag, bytes):
+            raise TypeError("tag.tag must be bytes")
+        if len(tag.tag) != digest_size:
+            raise ValueError(f"tag.tag must be {digest_size} bytes")
+        if position > 0 and tag.stage != checked.items[position - 1][1].stage + 1:
+            raise ValueError("item tag stages must be consecutive")
+
+    return tuple(
+        verify_auth_stage(entry, tag, verifier)
+        for entry, tag in checked.items  # type: ignore[misc]
+    )
 
 
 def encode_signed_root(receipt: Any) -> bytes:

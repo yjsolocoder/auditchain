@@ -511,6 +511,73 @@ verify_signed_audit_batch(restored, public_key)    # True：无需持有日志
   或任一嵌套格式非法抛 `ValueError`；结构合法但验真不匹配仍可解码，
   `verify_signed_audit_batch` 返回 `False`。两个入口均为只读且确定
 
+### 可信逐条审计回执（Ed25519）
+
+`signed_audit_receipt` 在一个不可变 `SignedAuditReceipt` 中同时打包
+`audit_receipt` 的逐条 `AuditReceipt` 与 `sign_root` 对同一快照签发的
+`SignedRoot` 检查点；离线接收方仅凭**预置信任**的 32 字节 Ed25519 公钥，
+即可一次确认所选条目及其逐条包含证明、快照 Merkle 根与链头均由日志持有者
+签发，无需持有 `AuditLog`，也不引入任何新的签名原文：
+
+```python
+from auditchain import verify_signed_audit_receipt
+
+bundle = log.signed_audit_receipt([0, 2], seed)        # size 默认 len(log)
+bundle.receipt == log.audit_receipt([0, 2])            # True：逐条审计回执
+bundle.checkpoint == log.sign_root(seed)              # True：同一签名检查点
+verify_signed_audit_receipt(bundle, public_key)       # True：无需持有日志
+verify_signed_audit_receipt(bundle, other_key)        # False：未信任的公钥
+AuditLog().signed_audit_receipt((), seed)             # 空快照：规范空树根 + 零链头
+```
+
+- 包为冻结的 `SignedAuditReceipt(receipt:AuditReceipt, checkpoint:SignedRoot)`，
+  字段顺序即签名顺序，支持位置构造、按两个字段相等；`receipt` 必须是
+  `AuditReceipt`、`checkpoint` 必须是 `SignedRoot`，字段类型错抛
+  `TypeError`；两部分必须描述**同一可重建快照**（`hash_name`、`size`、
+  `root` 相等），否则抛 `ValueError`；回执自身的结构契约由
+  `AuditReceipt` 校验，签名真伪留给验包
+- `AuditLog.signed_audit_receipt(indices, private_key, size=None)` 是原子、
+  只读签发入口，`size` 默认当前长度：先调用 `audit_receipt(indices, size)`，
+  再调用 `sign_root(private_key, size)`，据其结果构造 `SignedAuditReceipt`；
+  任何失败都在构造前抛出，不留半成品、不改变日志状态，也不新增签名原文
+  （检查点签的仍是 `sign_root` 的原文）
+- `verify_signed_audit_receipt(bundle, public_key)` 完全离线核验：要求
+  `verify_audit_receipt` 为真、`verify_signed_root` 为真，且两部分的算法
+  （`hash_name`）、`size`、`root` 一致。公钥不受信任、两部分不一致，或
+  条目 / 证明 / 根 / 签名被改，均返回 `False`（绝不抛异常）
+- 入参不是 `SignedAuditReceipt`（含绕过冻结构造器写入的容器字段类型错）
+  抛 `TypeError`；嵌套的回执或检查点结构非法时沿用 `AuditReceipt` /
+  `verify_signed_root` 的既有异常（`TypeError` / `ValueError`）；公钥不是
+  `bytes` 抛 `TypeError`、不是 32 字节抛 `ValueError`；验包为只读
+- `encode_signed_audit_receipt(bundle)` /
+  `decode_signed_audit_receipt(data)` 把整个可信审计回执序列化为规范二进制
+  并原样还原，使其可落盘、跨进程传输后继续凭预置信任的 Ed25519 公钥离线
+  验真，且不引入任何新的签名原文：
+
+```python
+from auditchain import encode_signed_audit_receipt, decode_signed_audit_receipt
+
+data = encode_signed_audit_receipt(bundle)          # bytes，可写文件/发网络
+restored = decode_signed_audit_receipt(data)        # 冻结 SignedAuditReceipt
+restored == bundle                                  # True：字段相等
+encode_signed_audit_receipt(restored) == data       # True：重编码逐字节相同
+verify_signed_audit_receipt(restored, public_key)   # True：无需持有日志
+```
+
+  字节流以魔数 `b"auditchain/signed-audit-receipt/v1\0"` 开头，随后**严格
+  依次**写 `version`（恒为 `1`，8 字节无符号大端，即 `U(1)`）、receipt
+  blob（`B(R)`）、checkpoint blob（`B(C)`），不允许省略、换序或附加字段；
+  两个 blob 均为 u64 字节长度前缀加原始字节，内容依次就是既有
+  `encode_audit_receipt` 与 `encode_signed_root` 输出的完整规范字节，
+  `U` / `B` 规则与既有框架完全一致。解码精确消费两个 blob 且禁止尾随，
+  分别原样交给 `decode_audit_receipt` 与 `decode_signed_root`。
+  `encode_signed_audit_receipt` 只接受 `SignedAuditReceipt`（其余类型抛
+  `TypeError`，两部分快照不一致或嵌套错误抛 `ValueError`），
+  `decode_signed_audit_receipt` 只接受 `bytes`（含拒绝 `bytearray` /
+  `memoryview`）；魔数、版本、截断、尾随、blob 长度、两部分快照不一致或
+  任一嵌套格式非法抛 `ValueError`；结构合法但验真不匹配仍可解码，
+  `verify_signed_audit_receipt` 返回 `False`。两个入口均为只读且确定
+
 ### 可信跨快照一致性凭据（Ed25519）
 
 `signed_consistency` 在一个不可变 `SignedConsistency` 中打包同一日志两个

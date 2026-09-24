@@ -49,6 +49,7 @@ dump_secure_log / load_secure_log /
 dump_pruned_log / load_pruned_log /
 dump_secure_pruned / load_secure_pruned /
 dump_auth / load_auth /
+dump_signed_auth / load_signed_auth /
 dump_pruned_auth / load_pruned_auth /
 dump_hybrid / load_hybrid.
 """
@@ -131,6 +132,7 @@ __all__ = [
     "dump_pruned_log",
     "dump_secure_log",
     "dump_secure_pruned",
+    "dump_signed_auth",
     "encode_anchored_continuations",
     "encode_audit_batch",
     "encode_audit_receipt",
@@ -171,6 +173,7 @@ __all__ = [
     "load_pruned_log",
     "load_secure_log",
     "load_secure_pruned",
+    "load_signed_auth",
     "merge_anchor_set",
     "merge_rotated_anchor_set",
     "verify_audit_receipt",
@@ -479,6 +482,18 @@ _PRUNED_SECURE_VERSION = 1
 # fresh process.
 _AUTH_LOG_MAGIC = b"auditchain/auth-log/v1\0"
 _AUTH_LOG_VERSION = 1
+
+# Binary framing of dump_signed_auth / load_signed_auth: the self-certifying
+# counterpart of the auth-log framing. Instead of sealing the plaintext frame
+# with AES-256-GCM, the exact same plaintext frame P that dump_auth encrypts —
+# B(hash_name) || U(n) || E1…En || B(root) || B(head) || U(stage) || B(K) ||
+# U(x) — follows the magic and the u64 envelope version (always 1) verbatim,
+# and a trailing 64-byte Ed25519 signature over every preceding byte closes
+# the stream. The signature authenticates the source only: the evolution key
+# in the frame is not encrypted, so the stream must be protected like
+# verification material.
+_SIGNED_AUTH_MAGIC = b"auditchain/signed-auth/v1\0"
+_SIGNED_AUTH_VERSION = 1
 
 # Binary framing of dump_pruned_auth / load_pruned_auth: the pruned
 # counterpart of the auth-log framing — the same symmetric AES-256-GCM wire
@@ -10188,6 +10203,249 @@ def load_auth(data: Any, key: Any) -> AuditLog:
         raise ValueError("recomputed chain head does not match the exported head")
     if not hmac.compare_digest(log.merkle_root(), root):
         raise ValueError("recomputed Merkle root does not match the exported root")
+    log._stage = stage
+    log._verifier_exported = bool(exported)
+    return log
+
+
+def dump_signed_auth(log: Any, private_key: Any) -> bytes:
+    """Export an unpruned, keyed, encrypt-free log as one self-certifying,
+    signed (not encrypted) byte string.
+
+    The Ed25519-signed counterpart of :func:`dump_auth`: only an
+    :class:`AuditLog` that holds its complete, unpruned history
+    (``retain_from == 0``), was **constructed with an authentication key** and
+    has never held encrypted entries qualifies. After the magic
+    ``b"auditchain/signed-auth/v1\\0"`` the stream writes the envelope version
+    (always ``1``) as an unsigned 8-byte big-endian integer, then **verbatim**
+    the same plaintext frame :func:`dump_auth` encrypts:
+    ``B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) || B(K) ||
+    U(x)`` — ``h`` the UTF-8 hash algorithm name, ``n`` the entry count,
+    ``root`` the Merkle root and ``head`` the chain head of the size-``n``
+    snapshot, ``stage`` the current key-evolution stage, ``K`` the current
+    evolution key and ``x`` the verifier-exported flag (``0`` or ``1``); each
+    ``Ei`` is ``U(index) || B(payload) || B(previous_hash) || B(entry_hash)``.
+    ``U`` is an unsigned 8-byte big-endian integer and
+    ``B(v) = U(len(v)) || v``. A final 64-byte Ed25519 signature covers every
+    byte preceding it — magic, version and the whole frame — and is the only
+    signing domain; nothing else is signed and nothing is appended.
+
+    The signature authenticates the source, it does **not** encrypt the frame:
+    the evolving authentication key and every payload are readable in
+    plaintext, so the output must be protected like verification material. The
+    call is read-only and deterministic: it never mutates the log, the 32-byte
+    Ed25519 seed ``private_key`` is used for the one signature and is never
+    stored, and two dumps of logs in the same state signed with the same seed
+    are byte-for-byte identical (Ed25519 signatures are deterministic).
+
+    A non-:class:`AuditLog` value or a non-``bytes`` seed raises TypeError; a
+    seed that is not 32 bytes, or a pruned/keyless log or one with encrypted
+    history raises ValueError. Nothing is changed on failure.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, mirroring dump_log; the
+    # loaded key is used only for the one signature below and is never stored
+    # on the log.
+    signing_key = _load_ed25519_seed(private_key)
+    # Eligibility is exactly dump_auth's: the frame restores a keyed,
+    # forward-secure log carrying the live evolution key, so it requires an
+    # unpruned log constructed with a key and free of encrypt history.
+    if log._retain_from != 0:
+        raise ValueError(
+            "only an unpruned log holding its complete history can be dumped"
+        )
+    if log._key is None:
+        raise ValueError(
+            "only a log constructed with an authentication key can be dumped"
+        )
+    if log._encrypted_index or log._encrypted_locators or log._used_nonces:
+        raise ValueError("a log with encrypted entries cannot be dumped")
+    hash_name = log._hash_name
+    size = len(log)
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _SIGNED_AUTH_MAGIC,
+        _encode_u64(_SIGNED_AUTH_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+    ]
+    for entry in log._entries:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    parts.append(_encode_u64(log._stage, "stage"))
+    parts.append(_encode_blob(log._key))
+    parts.append(_encode_u64(1 if log._verifier_exported else 0, "exported flag"))
+    body = b"".join(parts)
+    # Sign every byte written so far; the signature is the trailing field, so
+    # the wire format verifies without knowing any inner framing offset.
+    signature = signing_key.sign(body)
+    if len(signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    return body + signature
+
+
+def load_signed_auth(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable keyed :class:`AuditLog` from
+    :func:`dump_signed_auth`, verifying entirely offline.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) and ``public_key`` must be 32 ``bytes``.
+    After the magic ``b"auditchain/signed-auth/v1\\0"`` the stream carries the
+    u64 envelope version (only ``1`` is supported), the plaintext frame
+    ``B(h) || U(n) || E1…En || B(root) || B(head) || U(stage) || B(K) ||
+    U(x)`` shared verbatim with :func:`load_auth`, and a final 64-byte
+    Ed25519 signature over every preceding byte.
+
+    Verification happens before any frame byte is parsed: the trailing
+    signature is checked against the magic, the version and the entire frame
+    with the 32-byte ``public_key``. Only then is the frame parsed, under the
+    same framing rules as the :func:`load_auth` plaintext (strict order, no
+    truncation or trailing bytes, indices exactly ``0..n-1``, digest widths
+    matching the named hash algorithm, a non-empty ``K`` that is one digest
+    wide after any evolution, ``x`` in ``{0, 1}``); under the named
+    ``hash_name`` every :func:`entry_digest` and predecessor link is recomputed
+    from genesis and the resulting chain head and Merkle root must match
+    ``head`` / ``root``. Only then is a fresh keyed :class:`AuditLog` built by
+    replaying the payloads through the normal append path, with ``K`` installed
+    as the current key and ``stage`` and the one-shot verifier-exported flag
+    restored, so a restored log whose flag was set can no longer export
+    stage-0 material. The result has the same length, absolute indices, head,
+    root, find results and evolution stage as the original (an empty log
+    included), is fully mutable — append, encrypt and key evolution all work —
+    shares no state with the caller's buffers, and tags it mints at the same
+    state are byte-for-byte identical to the original's.
+
+    A non-``bytes`` ``data`` or ``public_key`` raises TypeError; a public key
+    that is not 32 bytes, or a bad magic/version, truncation, trailing bytes,
+    a bad UTF-8 or unknown hash name, wrong in-frame widths or values, a
+    signature that does not verify, or a recomputed chain/root mismatch raises
+    ValueError. On failure no partial log escapes and the inputs are not
+    mutated. The stream is only authenticated, not encrypted: handle it like
+    verification material.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verification_key = _load_ed25519_public(public_key)
+    if not data.startswith(_SIGNED_AUTH_MAGIC):
+        raise ValueError("not an auditchain signed-auth encoding")
+    if len(data) < _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify the signature over magic, version and the whole frame before
+    # parsing anything, so a forged or corrupted stream never reaches the
+    # chain-replay logic.
+    try:
+        verification_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError("signed-auth signature does not verify") from error
+    offset = len(_SIGNED_AUTH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = body[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_AUTH_VERSION:
+        raise ValueError(f"unsupported signed-auth version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    count = read_u64("entries count")
+    raw_entries: list[tuple[int, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        raw_entries.append((index, payload, previous_hash, entry_hash))
+    root = read_blob("root")
+    head = read_blob("head")
+    stage = read_u64("stage")
+    evolution_key = read_blob("evolution key")
+    exported = read_u64("exported flag")
+    if offset != len(body):
+        raise ValueError("trailing bytes before the signed-auth signature")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    if not evolution_key:
+        raise ValueError("evolution key must be non-empty")
+    if stage > 0 and len(evolution_key) != digest_size:
+        raise ValueError(
+            f"evolution key must be {digest_size} bytes after the first evolution"
+        )
+    if exported not in (0, 1):
+        raise ValueError("exported flag must be 0 or 1")
+
+    # Re-derive the whole chain from genesis under the named hash algorithm,
+    # and simultaneously replay the payloads into a fresh keyed log so every
+    # auxiliary structure (find index, Merkle frontier, head, length) is
+    # rebuilt exactly as the normal append path builds it. The stage and
+    # verifier-exported flag are only installed after the replay succeeds, so
+    # a failure leaves no partially restored log behind.
+    log = AuditLog(key=evolution_key, hash_name=hash_name)
+    previous = bytes(digest_size)
+    for position, (index, payload, recorded_previous, recorded_hash) in enumerate(
+        raw_entries
+    ):
+        if index != position:
+            raise ValueError("entries must occupy indices 0..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {position}")
+        recomputed = entry_digest(
+            position,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {position}")
+        replayed = log.append(payload)
+        if (
+            replayed.index != index
+            or replayed.previous_hash != recorded_previous
+            or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+        ):
+            raise ValueError(f"entry chain is inconsistent at index {position}")
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the signed frame")
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the signed frame")
     log._stage = stage
     log._verifier_exported = bool(exported)
     return log

@@ -3273,6 +3273,25 @@ python3 -m auditchain
   算法、截断、尾随、计数、宽度、u64 范围、索引顺序或 stage 连续性错误抛
   `ValueError`；返回 `(hash_name, items)`，`items` 为不可变项元组，重编码逐字节
   相同；结构合法但认证不匹配仍可解码，`verify_auth_batch` 逐项返回 `False`
+- `encode_continuation_chain_report(report)` /
+  `decode_continuation_chain_report(data)` — 续接链诊断报告的规范二进制编码与
+  解码，使 `inspect_continuation_chain` 等四个诊断入口返回的冻结
+  `ContinuationChainReport` 结论可落盘、跨进程恢复（不新增签名原文，不改既有
+  诊断与核验入口）：字节流严格为 `D || U(1) || U(v) || U(p) || B(c)`，其中
+  `D = b"auditchain/chain-report/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（零长 blob 也写全零 u64），依次写恒为 1 的版本号、
+  结论位（成功 `0`、失败 `1`）、位置整数与问题码，不得换序或尾随字节；成功时
+  位置写 `0`、问题码写零长 blob，失败时位置写报告的绝对段位置、问题码为该码
+  UTF-8 的长度前缀 blob，取值沿用既有合法码集合（`verify`、`growth`、
+  `duplicate`、`link`、`start`、`end`、`anchor_link`、`rotation_duplicate`、
+  `rotation`、`rotation_link`）。前者只收 `ContinuationChainReport`（绕过冻结
+  构造器写入的 `ok` / `index` / `code` 类型不对同样抛 `TypeError`；问题码非
+  合法取值、位置为负或达到 `2**64` 抛 `ValueError`），后者只接受精确 `bytes`
+  （拒绝 `bytearray` / `memoryview`，其他类型抛 `TypeError`）；魔数或版本
+  不符、截断、尾随、blob 长度越界、非法 UTF-8、结论位非 `0`/`1`、成功却带
+  位置或问题码、失败却缺问题码、问题码非合法取值均抛 `ValueError`。两入口
+  只读且确定：恢复对象按字段与原件相等（仍为冻结对象），同一报告重复编码与
+  解码后重编码的字节逐字节相同；解码只恢复结论，不重跑诊断
 
 Merkle 树按 `hash_name` 构建：叶为 `H("auditchain/merkle-leaf/v1" + entry_hash)`，父节点为
 `H("auditchain/merkle-node/v1" + left + right)`，奇数层末节点原样提升；空树根为

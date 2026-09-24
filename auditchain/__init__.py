@@ -102,6 +102,7 @@ __all__ = [
     "decode_audit_receipt",
     "decode_auth_batch",
     "decode_continuations",
+    "decode_continuation_chain_report",
     "decode_prune_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
@@ -134,6 +135,7 @@ __all__ = [
     "encode_audit_receipt",
     "encode_auth_batch",
     "encode_continuations",
+    "encode_continuation_chain_report",
     "encode_prune_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
@@ -380,6 +382,18 @@ _SIGNED_AUTH_AUDIT_CONTINUATION_VERSION = 1
 # encode_signed_auth_audit_continuation output, with nothing else.
 _CONTINUATION_CHAIN_MAGIC = b"auditchain/cont-chain/v1\0"
 _CONTINUATION_CHAIN_VERSION = 1
+
+# Binary framing of encode_continuation_chain_report /
+# decode_continuation_chain_report: a fixed magic, then the envelope version
+# as a u64 (always 1), the verdict as a u64 (0 for success, 1 for failure),
+# the absolute segment position as a u64 and the code as a u64-length-prefixed
+# UTF-8 blob, in that order and with nothing else. A successful report writes
+# position 0 and a zero-length blob; a failed one writes its index and the
+# bytes of its code.
+_CHAIN_REPORT_MAGIC = b"auditchain/chain-report/v1\0"
+_CHAIN_REPORT_VERSION = 1
+_CHAIN_REPORT_OK = 0
+_CHAIN_REPORT_FAILED = 1
 
 # Binary framing of encode_anchored_continuations /
 # decode_anchored_continuations: a fixed magic, then the envelope version as
@@ -8309,6 +8323,140 @@ def decode_continuations(data: Any) -> tuple:
     if offset != len(data):
         raise ValueError("trailing bytes after the continuation chain")
     return tuple(receipts)
+
+
+def encode_continuation_chain_report(report: Any) -> bytes:
+    """Encode a :class:`ContinuationChainReport` into canonical bytes.
+
+    The byte stream is ``D || U(1) || U(v) || U(p) || B(c)`` with
+    ``D = b"auditchain/chain-report/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the verdict ``v`` — ``0`` for a successful
+    report and ``1`` for a failed one — then the absolute segment position
+    ``p`` and the length-prefixed issue code ``c``, strictly in that order
+    with nothing omitted, reordered or appended. A successful report writes
+    ``p = 0`` and a zero-length code blob; a failed one writes the report's
+    ``index`` and the UTF-8 bytes of its ``code``, one of the existing
+    diagnostic codes. The framing introduces no new signing message and is
+    read-only: it never mutates the report.
+
+    ``report`` must be a :class:`ContinuationChainReport` — anything else
+    raises TypeError; a non-bool ``ok``, a non-integer or bool ``index`` or
+    a non-string ``code`` planted by bypassing the frozen constructor raises
+    TypeError just as the constructor does. An unknown code or a negative or
+    u64-range-exceeding position raises ValueError. Encoding is
+    deterministic: re-encoding a decoded report reproduces the original bytes
+    exactly.
+    """
+    if not isinstance(report, ContinuationChainReport):
+        raise TypeError("report must be a ContinuationChainReport")
+    if not isinstance(report.ok, bool):
+        raise TypeError("ok must be a bool")
+    if report.ok:
+        position = _CHAIN_REPORT_OK
+        verdict = _CHAIN_REPORT_OK
+        code = b""
+    else:
+        verdict = _CHAIN_REPORT_FAILED
+        index = report.index
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("index must be an integer or None")
+        if index < 0 or index >= _U64_LIMIT:
+            raise ValueError("index must satisfy 0 <= index < 2**64")
+        position = index
+        raw_code = report.code
+        if not isinstance(raw_code, str):
+            raise TypeError("code must be a string")
+        if raw_code not in _CHAIN_CODES:
+            raise ValueError(
+                f"unknown chain code {raw_code!r}; expected one of "
+                "'verify', 'growth', 'duplicate', 'link', 'start', 'end', "
+                "'anchor_link', 'rotation_duplicate', 'rotation', "
+                "'rotation_link'"
+            )
+        code = raw_code.encode("utf-8")
+    return b"".join((
+        _CHAIN_REPORT_MAGIC,
+        _encode_u64(_CHAIN_REPORT_VERSION, "version"),
+        _encode_u64(verdict, "verdict"),
+        _encode_u64(position, "position"),
+        _encode_blob(code),
+    ))
+
+
+def decode_continuation_chain_report(data: Any) -> ContinuationChainReport:
+    """Decode bytes produced by :func:`encode_continuation_chain_report`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/chain-report/v1\\0"`` it must contain, strictly in order,
+    the u64 envelope version (only ``1`` is supported), the u64 verdict
+    (``0`` for success, ``1`` for failure), the u64 segment position and one
+    length-prefixed code blob, consumed whole with no trailing bytes. A
+    successful verdict must carry position ``0`` and an empty code blob; a
+    failed verdict must carry a non-empty UTF-8 code blob naming one of the
+    existing diagnostic codes. A bad magic or version, a verdict other than
+    ``0``/``1``, truncation, an oversized blob length, trailing bytes,
+    illegal UTF-8, a success carrying a position or code, a failure without
+    a code, or an unknown code raises ValueError.
+
+    Nothing is verified here — the bytes describe a diagnosis, they do not
+    re-run one. The returned frozen report's fields equal the originally
+    encoded ones, and re-encoding reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_CHAIN_REPORT_MAGIC):
+        raise ValueError("not an auditchain chain-report encoding")
+    offset = len(_CHAIN_REPORT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _CHAIN_REPORT_VERSION:
+        raise ValueError(f"unsupported chain-report version {version}")
+    verdict = read_u64("verdict")
+    if verdict not in (_CHAIN_REPORT_OK, _CHAIN_REPORT_FAILED):
+        raise ValueError(f"invalid chain-report verdict {verdict}")
+    position = read_u64("position")
+    raw_code = read_blob("code")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the chain report")
+    if verdict == _CHAIN_REPORT_OK:
+        if position != 0 or raw_code != b"":
+            raise ValueError(
+                "a successful chain report must carry position 0 and an "
+                "empty code"
+            )
+        return ContinuationChainReport(True, None, None)
+    try:
+        code = raw_code.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("code is not valid UTF-8") from error
+    if code not in _CHAIN_CODES:
+        raise ValueError(
+            f"unknown chain code {code!r}; expected one of 'verify', "
+            "'growth', 'duplicate', 'link', 'start', 'end', 'anchor_link', "
+            "'rotation_duplicate', 'rotation', 'rotation_link'"
+        )
+    return ContinuationChainReport(False, position, code)
 
 
 def encode_anchored_continuations(bundle: Any) -> bytes:

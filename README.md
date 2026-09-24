@@ -1100,6 +1100,54 @@ verify_signed_verifier(restored, public_key)   # True：无需持有日志
   但签名与字段不匹配仍可解码，`verify_signed_verifier` 返回 `False`。两个入口
   均为只读
 
+#### 交付点阶段验证材料（StageVerifier）
+
+stage-0 `Verifier` 只能在首次演进**之前**一次性导出；一旦日志已经演进，基线材料
+再也没有交付入口。`export_stage_verifier()` 补齐这一层：在演进之后随时把**当前
+阶段**的验证材料冻结成不可变 `StageVerifier(stage, key, hash_name)` 交给持有方。
+与 stage-0 材料不同，它只能核验**交付点及其之后**签发的标签——持有者凭它无法
+追溯更早的标签，更早的标签一律不通过：
+
+```python
+from auditchain import StageVerifier, verify_auth_stage
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c"):
+    log.append(record)
+verifier = log.export_verifier()     # stage-0 基线仍只能在演进前导出一次
+old_tags = [log.auth(i) for i in range(3)]   # stage 0、1、2 的标签
+assert log.stage == 3
+
+material = log.export_stage_verifier()       # 交付点 stage 3
+material.stage                               # 3
+material == log.export_stage_verifier()      # True：只读、可重复调用
+log.append("d")
+tag = log.auth(3)                            # stage 3 的新标签
+verify_auth_stage(log.entry(3), tag, material)   # True：交付点当 stage
+for i, old in enumerate(old_tags):
+    verify_auth_stage(log.entry(i), old, material)  # False：一律早于交付点
+```
+
+- `StageVerifier` 为冻结类，支持位置构造、按全部字段相等；`stage` 须为非 `bool`
+  整数且 `0 <= stage < 2**64`，`key` 只接受非空 `bytes`，`hash_name` 必须是已知
+  固定输出算法名。`stage > 0` 时 `key` 还必须与该算法摘要等宽（stage 0 与构造
+  `key` 一样允许任意非空长度）。字段类型错抛 `TypeError`，阶段越界、空 `key`、
+  未知算法或正阶段宽度不符抛 `ValueError`
+- `AuditLog.export_stage_verifier()` 只读且可任意重复调用，返回当前阶段的材料；
+  它不消耗 stage-0 的一次性导出资格、不演进密钥、不签发标签、不改变日志或认证
+  状态。带认证密钥的日志须**至少演进过一次**（`auth` / `rotate_key` /
+  `auth_batch` 等），仍在初始 stage 0 时调用抛 `ValueError`；无密钥模式抛
+  `ValueError`；任何失败都不改变日志或认证状态。新材料没有编解码入口
+- `verify_auth_stage(entry, tag, stage_verifier)` 是顶层单条核验入口，无需持有
+  日志；核验顺序与 `verify_auth` 完全一致——先重算条目摘要（结构合法但摘要不
+  匹配返回 `False`），再把交付阶段的密钥向 `tag.stage` 演进并比对 HMAC——唯一
+  区别是演进起点从 stage 0 换成交付阶段。`tag.stage < stage_verifier.stage`
+  （标签早于交付点）返回 `False`，其余结构合法而不匹配也返回 `False`；匹配
+  返回 `True`。入参不是 `Entry` / `AuthTag` / `StageVerifier` 抛 `TypeError`，
+  阶段、取值或宽度非法抛 `ValueError`
+- stage-0 一次性导出、批量签发与签名交付的既有行为全部不变；这一层不新增签名
+  原文、不新增线格式，`python3 -m auditchain` 演示入口不变
+
 #### 可信认证批次交付包（Ed25519）
 
 `SignedVerifier` 解决"验证材料从哪来"，`auth_batch` 解决"批量签发"，但两者仍要
@@ -2166,6 +2214,12 @@ python3 -m auditchain
   `stage` 须为非 `bool` 整数且 `0 <= stage < 2**64`，`tag` 只接受 `bytes`
 - `Verifier(key, hash_name)` — 不可变验证材料，由 `export_verifier()` 导出；
   `key` 只接受非空 `bytes`
+- `StageVerifier(stage, key, hash_name)` — 不可变的交付点阶段验证材料，由
+  `export_stage_verifier()` 在演进后导出、冻结交付时的演进阶段、该阶段密钥与
+  摘要算法名；支持位置构造、按全部字段相等。`stage` 须为非 `bool` 整数且
+  `0 <= stage < 2**64`，`key` 只接受非空 `bytes`；`stage > 0` 时 `key` 还须与
+  该算法摘要等宽（stage 0 与构造 `key` 一样允许任意非空长度）。字段类型错抛
+  `TypeError`，阶段越界、空 `key`、未知算法或正阶段宽度不符抛 `ValueError`
 - `PruneReceipt(hash_name, size, merkle_root, chain_hash)` — 不可变的前缀封存回执
   - `merkle_root` 为该前缀的 Merkle 根，二者均为 `hash_name` 摘要宽度；`chain_hash` 为末条摘要（空前缀为该宽度的零摘要，sha256 下即 `GENESIS_HASH`）
   - `matches(entry)` — 核对某条目是否为裁剪后首条保留记录（绝对索引等于 `size` 且前驱摘要等于 `chain_hash`），
@@ -2200,6 +2254,12 @@ python3 -m auditchain
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
   抛 `TypeError`，批量五元组内部的结构契约由 `verify_audit_batch` 校验
+- `SignedAuditReceipt(receipt, checkpoint)` — 不可变的可信逐条审计回执，按两个
+  字段相等、支持位置构造；`receipt` 为 `audit_receipt` 的逐条 `AuditReceipt`
+  （必须是 `AuditReceipt`，其自身结构契约由该类校验），`checkpoint` 为同一可
+  重建快照的 `SignedRoot`（必须是 `SignedRoot`）；两部分的 `hash_name`、`size`、
+  `root` 必须相等，容器字段类型错抛 `TypeError`，两部分不描述同一快照抛
+  `ValueError`，签名真伪由 `verify_signed_audit_receipt` 判定
 - `SignedPrune(receipt, checkpoint)` — 不可变的可信签名裁剪授权，按两个字段
   相等、支持位置构造；`receipt` 为 `seal` 的前缀裁剪回执（必须是
   `PruneReceipt`），`checkpoint` 为同一前缀的 `SignedRoot`（必须是
@@ -2286,6 +2346,12 @@ python3 -m auditchain
     所有校验先于签名和资格消耗，失败不消耗资格、不演进密钥、不改日志。种子类型错
     抛 `TypeError`、长度非 32 抛 `ValueError`；无密钥模式、已演进或重复导出抛
     `ValueError`；离线用 `verify_signed_verifier` 凭预信任公钥验真
+  - `export_stage_verifier()` — 只读、可重复调用的演进后导出入口，返回冻结当前
+    演进阶段、该阶段密钥与摘要算法名的不可变 `StageVerifier(stage, key,
+    hash_name)`；不消耗 stage-0 的一次性导出资格、不演进密钥、不签发标签、不改变
+    日志或认证状态。带认证密钥的日志须至少演进过一次，仍在初始 stage 0 时调用抛
+    `ValueError`，无密钥模式抛 `ValueError`；离线用 `verify_auth_stage` 核验，
+    只能通过交付点及其之后签发的标签
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
@@ -2338,6 +2404,13 @@ python3 -m auditchain
     失败（非法选择、种子或 `size`）在构造前抛出，不改变日志状态；异常类型沿用
     `audit_batch` / `sign_root`（`TypeError` / `ValueError`）；离线用
     `verify_signed_audit_batch` 凭预信任公钥验真
+  - `signed_audit_receipt(indices, private_key, size=None)` — 只读签发可信逐条
+    审计回执，返回不可变 `SignedAuditReceipt`：先调用 `audit_receipt(indices,
+    size)`，再调用 `sign_root(private_key, size)`（`size` 默认当前长度），据此
+    构造 `SignedAuditReceipt(receipt, checkpoint)`，两部分描述同一可重建快照，
+    且不新增签名原文。失败（非法选择、种子或 `size`）在构造前抛出，不改变日志
+    状态；异常类型沿用 `audit_receipt` / `sign_root`（`TypeError` /
+    `ValueError`）；离线用 `verify_signed_audit_receipt` 凭预信任公钥验真
   - `sign_prune(private_key, size=None)` — 只读签发可信签名裁剪授权，返回不可变
     `SignedPrune`：先调用 `seal(size)`，再调用 `sign_root(private_key, size)`
     （`size` 默认当前长度），据此构造 `SignedPrune(receipt, checkpoint)`，两部分
@@ -2475,6 +2548,16 @@ python3 -m auditchain
   `TypeError`；嵌套的批量五元组或检查点结构非法时沿用 `verify_audit_batch` /
   `verify_signed_root` 的既有异常（`TypeError` / `ValueError`），公钥长度非
   32 字节抛 `ValueError`；调用只读
+- `verify_signed_audit_receipt(bundle, public_key)` — 凭预先信任的 32 字节
+  Ed25519 公钥离线验证 `AuditLog.signed_audit_receipt` 签发的
+  `SignedAuditReceipt` 可信逐条审计回执，无需持有日志：先调用
+  `verify_audit_receipt`（重验每条所选条目的摘要与逐条包含证明对快照根）与
+  `verify_signed_root`（核验检查点签名），并要求两部分的 `hash_name`、`size`、
+  `root` 一致。公钥不受信任、两部分不一致，或条目 / 证明 / 根 / 签名被改返回
+  `False`，匹配返回 `True`。入参不是 `SignedAuditReceipt`（含绕过构造器的容器
+  字段类型错）或公钥不是 `bytes` 抛 `TypeError`；嵌套的回执或检查点结构非法时
+  沿用 `AuditReceipt` / `verify_signed_root` 的既有异常（`TypeError` /
+  `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
 - `verify_signed_prune(item, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_prune` 签发的 `SignedPrune` 裁剪授权，无需持有日志：
   先用 `verify_signed_root` 校验检查点签名，再要求回执与检查点描述同一前缀——
@@ -2530,6 +2613,18 @@ python3 -m auditchain
   版本、截断、尾随、blob 长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、
   冻结且重编码逐字节相同，结构合法但验真不匹配仍可解码（验包返回 `False`）；
   两个入口均为只读且确定
+- `encode_signed_audit_receipt(bundle)` / `decode_signed_audit_receipt(data)` —
+  可信逐条审计回执的规范二进制编码与解码，使 `SignedAuditReceipt` 可落盘、跨进程
+  传输后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
+  `b"auditchain/signed-audit-receipt/v1\0"` 开头，严格依次写 version=1（u64）、
+  receipt blob、checkpoint blob（不允许省略、换序或附加字段）；每个 blob 为 u64
+  字节长度前缀加原始字节，内容分别是既有 `encode_audit_receipt` 与
+  `encode_signed_root` 的完整规范字节，解码精确消费两个 blob 并分别交给既有
+  解码器。前者只接受 `SignedAuditReceipt`（外层或两部分快照不一致抛
+  `ValueError`、容器字段类型错抛 `TypeError`，嵌套错误沿用既有编码器），后者只
+  接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob
+  长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，
+  结构合法但验真不匹配仍可解码（验包返回 `False`）；两个入口均为只读且确定
 - `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —
   可信跨快照一致性凭据的规范二进制编码与解码，使 `SignedConsistency` 可落盘、
   跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
@@ -2926,6 +3021,14 @@ python3 -m auditchain
   结构合法但内容不符（含篡改条目、错误标签、错误 stage、错误密钥）返回 `False`；
   入参类型错误抛 `TypeError`，负 stage/index、stage 达到 `2**64`、摘要长度不符、
   未知算法等抛 `ValueError`
+- `verify_auth_stage(entry, tag, stage_verifier)` — 无需持有日志的交付点单条
+  核验，核验顺序与 `verify_auth` 一致（先校验 `tag.stage`，再用 `entry_digest`
+  核对 `entry.entry_hash`，最后把交付阶段的密钥演进到 `tag.stage` 校验 HMAC），
+  唯一区别是演进起点从 stage 0 换成 `StageVerifier.stage`；`tag.stage` 早于交付
+  阶段时返回 `False`，其余结构合法而不匹配（含篡改条目、错误标签、错误密钥）也
+  返回 `False`，匹配返回 `True`。入参不是 `Entry` / `AuthTag` / `StageVerifier`
+  抛 `TypeError`，负 stage/index、stage 达到 `2**64`、摘要长度不符、交付字段
+  取值或宽度非法、未知算法等抛 `ValueError`
 - `verify_auth_batch(items, verifier)` — 逐项调用 `verify_auth` 核验
   `(Entry, AuthTag)` 对，返回同序 `tuple[bool, ...]`（空 tuple 返回 `()`）。
   `items` 只接受 `tuple`，且 `Entry.index` 严格升序、`AuthTag.stage` 连续；

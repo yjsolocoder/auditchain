@@ -1,7 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / SignedRoot / SignedVerifier / SignedAuditBatch /
+Verifier / StageVerifier / SignedRoot / SignedVerifier / SignedAuditBatch /
 SignedAuditReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
@@ -9,7 +9,8 @@ ContinuationChainReport / AnchoredContinuationChain /
 RotatedChain /
 RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
-verify_consistency / verify_auth / verify_auth_batch / verify_audit_receipt /
+verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
+verify_audit_receipt /
 verify_audit_batch / inspect_continuation_chain / inspect_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
@@ -87,6 +88,7 @@ __all__ = [
     "SignedPrune",
     "SignedRoot",
     "SignedVerifier",
+    "StageVerifier",
     "Verifier",
     "GENESIS_HASH",
     "decode_anchored_continuations",
@@ -158,6 +160,7 @@ __all__ = [
     "verify_audit_batch",
     "verify_auth",
     "verify_auth_batch",
+    "verify_auth_stage",
     "verify_batch_inclusion",
     "verify_consistency",
     "verify_continuation_chain",
@@ -1166,6 +1169,53 @@ class Verifier:
 
 
 @dataclass(frozen=True)
+class StageVerifier:
+    """Immutable verification material delivered at a post-evolution stage.
+
+    The stage-scoped counterpart of :class:`Verifier`: it freezes the
+    evolution stage at which it was delivered together with that stage's
+    current key and the hash algorithm, and :func:`verify_auth_stage`
+    evolves this key forward to a tag's stage without needing the log.
+    Unlike the stage-0 :class:`Verifier`, delivery at a positive stage can
+    only authenticate tags minted at that stage or later: a tag whose stage
+    precedes delivery never verifies, even when its entry and tag are
+    otherwise genuine.
+
+    - ``stage``: key-evolution stage the material was delivered at,
+    - ``key``: the evolving key at exactly that stage,
+    - ``hash_name``: hash algorithm of the issuing log.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. ``stage`` must be a non-bool integer satisfying
+    ``0 <= stage < 2**64`` and ``key`` must be non-empty ``bytes``; a
+    positive stage additionally requires ``key`` to be exactly one digest
+    wide under ``hash_name`` (at stage 0 the construction key may have any
+    non-empty length, exactly as the log accepts it). A wrong field type
+    raises TypeError; an out-of-range stage, an empty or wrong-width key, or
+    an unknown hash algorithm raises ValueError.
+    """
+
+    stage: int
+    key: bytes
+    hash_name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, int) or isinstance(self.stage, bool):
+            raise TypeError("stage must be an integer")
+        if not 0 <= self.stage < _MAX_STAGE:
+            raise ValueError("stage must satisfy 0 <= stage < 2**64")
+        if not isinstance(self.key, bytes):
+            raise TypeError("key must be bytes")
+        if len(self.key) == 0:
+            raise ValueError("key must be non-empty")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if self.stage > 0 and len(self.key) != digest_size:
+            raise ValueError(f"key must be {digest_size} bytes at a positive stage")
+
+
+@dataclass(frozen=True)
 class SignedVerifier:
     """Ed25519-signed stage-0 :class:`Verifier` for trusted delivery.
 
@@ -2060,6 +2110,35 @@ class AuditLog:
             version=_SIGNED_VERIFIER_VERSION,
             verifier=verifier,
             signature=signature,
+        )
+
+    def export_stage_verifier(self) -> StageVerifier:
+        """Export the current stage's verification material, repeatably.
+
+        Unlike the one-shot stage-0 :meth:`export_verifier`, this entry is
+        available only *after* the log has evolved at least once
+        (``stage > 0``); it is then read-only and may be called any number
+        of times, always returning an equal :class:`StageVerifier` for the
+        current stage (the material changes only as the log keeps
+        evolving). It neither consumes the stage-0 export eligibility nor
+        advances the stage, mints a tag or changes any log state. The
+        returned material verifies tags minted at the current stage or
+        later via :func:`verify_auth_stage`; a tag from an earlier stage —
+        including every tag before the delivery point — never verifies.
+        Calling it in keyless mode, or while still at the initial stage,
+        raises ValueError and leaves the log untouched.
+        """
+        self._require_key()
+        if self._stage == 0:
+            raise ValueError(
+                "stage verifier can only be exported after at least one key evolution"
+            )
+        key = self._key
+        assert key is not None  # a keyed log past stage 0 always holds a key
+        return StageVerifier(
+            stage=self._stage,
+            key=key,
+            hash_name=self._hash_name,
         )
 
     def signed_auth_bundle(
@@ -4406,6 +4485,85 @@ def verify_auth(entry: Any, tag: Any, verifier: Any) -> bool:
     for _ in range(tag.stage):
         key = _evolve_key(key, verifier.hash_name)
     expected = _auth_tag(tag.stage, entry.entry_hash, key, verifier.hash_name)
+    return hmac.compare_digest(expected, tag.tag)
+
+
+def verify_auth_stage(entry: Any, tag: Any, stage_verifier: Any) -> bool:
+    """Verify a forward-secure tag against material delivered at one stage.
+
+    The stage-scoped counterpart of :func:`verify_auth`: it follows exactly
+    that routine's checks and ordering — recomputing the entry digest first
+    (a structurally valid entry whose recorded hash does not match returns
+    False), then evolving the delivered stage key forward to ``tag.stage``
+    and checking the HMAC — with one difference: evolution starts at the
+    :class:`StageVerifier`'s delivery stage rather than at stage 0. A tag
+    minted before that delivery point (``tag.stage < stage_verifier.stage``)
+    therefore returns False even when the entry and tag are genuine; only
+    tags at the delivery stage or later can authenticate.
+
+    Structural/type problems raise TypeError; negative values, wrong digest
+    lengths, an out-of-range or wrong-width field, or an unknown hash
+    algorithm raise ValueError. A well-formed entry and tag whose content
+    does not authenticate, or whose stage precedes delivery, return False.
+    """
+    if not isinstance(entry, Entry):
+        raise TypeError("entry must be an Entry")
+    if not isinstance(tag, AuthTag):
+        raise TypeError("tag must be an AuthTag")
+    if not isinstance(stage_verifier, StageVerifier):
+        raise TypeError("stage_verifier must be a StageVerifier")
+
+    # Exactly as in verify_auth, the tag stage bounds the evolution loop
+    # below, so validate it before anything else.
+    if not isinstance(tag.stage, int) or isinstance(tag.stage, bool):
+        raise TypeError("tag.stage must be an integer")
+    if not 0 <= tag.stage < _MAX_STAGE:
+        raise ValueError("tag.stage must satisfy 0 <= stage < 2**64")
+
+    # Re-validate the material even for an instance whose fields were set
+    # bypassing the frozen constructor: the delivery stage bounds the loop
+    # as well, and the starting key must be a non-empty digest-width value.
+    delivered = StageVerifier(
+        stage=stage_verifier.stage,
+        key=stage_verifier.key,
+        hash_name=stage_verifier.hash_name,
+    )
+
+    digest_size = _digest_size(delivered.hash_name)
+    for name in ("previous_hash", "entry_hash", "payload"):
+        value = getattr(entry, name)
+        if not isinstance(value, (bytes, bytearray)):
+            raise TypeError(f"entry.{name} must be bytes")
+    if len(entry.previous_hash) != digest_size:
+        raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+    if len(entry.entry_hash) != digest_size:
+        raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+    if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+        raise TypeError("entry.index must be an integer")
+    if entry.index < 0:
+        raise ValueError("entry.index must be non-negative")
+
+    if len(tag.tag) != digest_size:
+        raise ValueError(f"tag.tag must be {digest_size} bytes")
+
+    recomputed = entry_digest(
+        entry.index,
+        entry.previous_hash,
+        entry.payload,
+        hash_name=delivered.hash_name,
+    )
+    if not hmac.compare_digest(recomputed, entry.entry_hash):
+        return False
+
+    # The delivery point is the earliest verifiable stage: material handed
+    # over at a positive stage cannot authenticate anything minted earlier.
+    if tag.stage < delivered.stage:
+        return False
+
+    key = delivered.key
+    for _ in range(tag.stage - delivered.stage):
+        key = _evolve_key(key, delivered.hash_name)
+    expected = _auth_tag(tag.stage, entry.entry_hash, key, delivered.hash_name)
     return hmac.compare_digest(expected, tag.tag)
 
 

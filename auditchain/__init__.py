@@ -1,7 +1,8 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-Verifier / StageVerifier / SignedRoot / SignedVerifier / SignedAuditBatch /
+Verifier / StageVerifier / SignedRoot / SignedVerifier / SignedStageVerifier /
+SignedAuditBatch /
 SignedAuditReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
@@ -16,7 +17,7 @@ inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
-verify_signed_verifier / verify_signed_root /
+verify_signed_verifier / verify_signed_stage_verifier / verify_signed_root /
 verify_signed_audit_batch / verify_signed_audit_receipt /
 verify_signed_consistency / verify_signed_prune /
 verify_rotation /
@@ -87,6 +88,7 @@ __all__ = [
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
+    "SignedStageVerifier",
     "SignedVerifier",
     "StageVerifier",
     "Verifier",
@@ -176,6 +178,7 @@ __all__ = [
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
+    "verify_signed_stage_verifier",
     "verify_signed_verifier",
 ]
 
@@ -264,6 +267,13 @@ _ROTATION_CHAIN_VERSION = 1
 # does not encrypt the key it carries.
 _SIGNED_VERIFIER_DOMAIN = b"auditchain/signed-verifier/v1\0"
 _SIGNED_VERIFIER_VERSION = 1
+
+# Signed stage verifier of AuditLog.export_signed_stage_verifier /
+# verify_signed_stage_verifier. An Ed25519 signature over the delivery stage,
+# the hash algorithm and that stage's key; the signature authenticates the
+# source only, it does not encrypt the key it carries.
+_SIGNED_STAGE_VERIFIER_DOMAIN = b"auditchain/signed-stage/v1\0"
+_SIGNED_STAGE_VERIFIER_VERSION = 1
 
 # Binary framing of encode_signed_audit_batch / decode_signed_audit_batch:
 # a fixed magic, then the envelope version as a u64 and two u64-length-prefixed
@@ -552,6 +562,22 @@ def _signed_verifier_message(hash_name: str, key: bytes) -> bytes:
     return (
         _SIGNED_VERIFIER_DOMAIN
         + bytes((0x01,))
+        + _encode_blob(hash_name.encode("utf-8"))
+        + _encode_blob(key)
+    )
+
+
+def _signed_stage_verifier_message(stage: int, hash_name: str, key: bytes) -> bytes:
+    """M of export_signed_stage_verifier / verify_signed_stage_verifier.
+
+    ``D || 0x01 || U(stage) || B(UTF-8(hash_name)) || B(key)``
+    with ``D = b"auditchain/signed-stage/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``.
+    """
+    return (
+        _SIGNED_STAGE_VERIFIER_DOMAIN
+        + bytes((0x01,))
+        + _encode_u64(stage, "stage")
         + _encode_blob(hash_name.encode("utf-8"))
         + _encode_blob(key)
     )
@@ -1202,8 +1228,10 @@ class StageVerifier:
     def __post_init__(self) -> None:
         if not isinstance(self.stage, int) or isinstance(self.stage, bool):
             raise TypeError("stage must be an integer")
-        if not 0 <= self.stage < _MAX_STAGE:
-            raise ValueError("stage must satisfy 0 <= stage < 2**64")
+        if self.stage < 0:
+            raise ValueError("stage must be non-negative")
+        if self.stage >= _MAX_STAGE:
+            raise ValueError("stage must be less than 2**64")
         if not isinstance(self.key, bytes):
             raise TypeError("key must be bytes")
         if len(self.key) == 0:
@@ -1251,6 +1279,55 @@ class SignedVerifier:
         # were set bypassing the frozen constructor, so corruption raises
         # exactly as the Verifier constructor would.
         Verifier(self.verifier.key, self.verifier.hash_name)
+        if not isinstance(self.signature, bytes):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
+
+
+@dataclass(frozen=True)
+class SignedStageVerifier:
+    """Ed25519-signed :class:`StageVerifier` for trusted delivery.
+
+    Issued by :meth:`AuditLog.export_signed_stage_verifier` and verified
+    entirely offline by :func:`verify_signed_stage_verifier` against a
+    pre-trusted 32-byte Ed25519 public key, so a receiver can confirm where
+    the stage verification material came from without holding the log:
+
+    - ``version``: format version, always ``1``,
+    - ``verifier``: the :class:`StageVerifier` (delivery stage, that stage's
+      key and the hash algorithm),
+    - ``signature``: the 64-byte Ed25519 signature over the verifier fields.
+
+    The signature authenticates provenance only; it does not encrypt the
+    verifier's key, so callers must still protect the material carried here
+    exactly as they would protect a bare :class:`StageVerifier`.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields.
+    """
+
+    version: int
+    verifier: StageVerifier
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != _SIGNED_STAGE_VERIFIER_VERSION:
+            raise ValueError("version must be 1")
+        if not isinstance(self.verifier, StageVerifier):
+            raise TypeError("verifier must be a StageVerifier")
+        # Re-validate the nested verifier even for an instance whose fields
+        # were set bypassing the frozen constructor, so corruption raises
+        # exactly as the StageVerifier constructor would.
+        StageVerifier(
+            stage=self.verifier.stage,
+            key=self.verifier.key,
+            hash_name=self.verifier.hash_name,
+        )
         if not isinstance(self.signature, bytes):
             raise TypeError("signature must be bytes")
         if len(self.signature) != _ED25519_SIGNATURE_BYTES:
@@ -2128,17 +2205,64 @@ class AuditLog:
         Calling it in keyless mode, or while still at the initial stage,
         raises ValueError and leaves the log untouched.
         """
-        self._require_key()
+        key = self._require_key()
         if self._stage == 0:
             raise ValueError(
                 "stage verifier can only be exported after at least one key evolution"
             )
-        key = self._key
-        assert key is not None  # a keyed log past stage 0 always holds a key
         return StageVerifier(
             stage=self._stage,
             key=key,
             hash_name=self._hash_name,
+        )
+
+    def export_signed_stage_verifier(self, private_key: Any) -> SignedStageVerifier:
+        """Export the current stage's verification material, Ed25519-signed.
+
+        The signed-delivery counterpart of :meth:`export_stage_verifier`: it
+        shares the exact same eligibility — a keyed log that has evolved at
+        least once (``stage > 0``) — and is likewise read-only and repeatable:
+        it may be called any number of times, never consumes the stage-0
+        export eligibility and never advances the stage, mints a tag or
+        changes any log state, so the same state signed with the same seed
+        yields byte-for-byte identical output. The returned
+        :class:`SignedStageVerifier` bundles the current stage's
+        :class:`StageVerifier` with a 64-byte Ed25519 signature a receiver
+        checks against a pre-trusted public key via
+        :func:`verify_signed_stage_verifier`.
+
+        ``private_key`` is a 32-byte Ed25519 seed; it is used for this one
+        signature and is never stored, copied into log state or returned. The
+        signed message is
+        ``D || 0x01 || U(stage) || B(UTF-8(hash_name)) || B(key)`` with
+        ``D = b"auditchain/signed-stage/v1\\0"``, ``U`` an unsigned 8-byte
+        big-endian integer and ``B(x) = U(len(x)) || x``; ``version`` is
+        always 1. The signature authenticates the source only — it does not
+        encrypt the stage key — so callers must still protect the returned
+        material exactly as they would protect a bare :class:`StageVerifier`.
+        Every check (key mode, the seed and the stage) runs before the
+        signature is made: a failure leaves the key, the stage and every
+        other log object untouched. A non-``bytes`` seed raises TypeError; a
+        seed that is not 32 bytes, keyless mode or the initial stage raises
+        ValueError.
+        """
+        key = self._require_key()
+        signing_key = _load_ed25519_seed(private_key)
+        if self._stage == 0:
+            raise ValueError(
+                "stage verifier can only be exported after at least one key evolution"
+            )
+        verifier = StageVerifier(
+            stage=self._stage,
+            key=key,
+            hash_name=self._hash_name,
+        )
+        message = _signed_stage_verifier_message(self._stage, self._hash_name, key)
+        signature = signing_key.sign(message)
+        return SignedStageVerifier(
+            version=_SIGNED_STAGE_VERIFIER_VERSION,
+            verifier=verifier,
+            signature=signature,
         )
 
     def signed_auth_bundle(
@@ -4676,6 +4800,54 @@ def verify_signed_verifier(receipt: Any, public_key: Any) -> bool:
     verification_key = _load_ed25519_public(public_key)
     message = _signed_verifier_message(
         checked.verifier.hash_name, checked.verifier.key
+    )
+    try:
+        verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def verify_signed_stage_verifier(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedStageVerifier` against a pre-trusted Ed25519 key.
+
+    Rebuilds the exact message
+    :meth:`AuditLog.export_signed_stage_verifier` signed —
+    ``D || 0x01 || U(stage) || B(UTF-8(hash_name)) || B(key)`` with
+    ``D = b"auditchain/signed-stage/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x`` — from the nested
+    :class:`StageVerifier` and checks the receipt's 64-byte Ed25519
+    signature with the 32-byte ``public_key``, entirely without holding the
+    log. A genuine receipt from that key returns True; a structurally valid
+    receipt signed by another key, or whose version, stage, hash algorithm,
+    key or signature has been altered, returns False.
+
+    Input that is not a :class:`SignedStageVerifier` (or whose fields have
+    been bypassed to wrong types) raises TypeError, as does a non-``bytes``
+    public key; a version other than 1, an out-of-range stage, an unknown
+    hash algorithm, an empty or wrong-width key, a signature that is not 64
+    bytes or a public key that is not 32 bytes raises ValueError. The
+    signature authenticates provenance only, not confidentiality: the stage
+    key travels in the clear and must be protected by the caller. The call
+    is read-only and never mutates the receipt.
+    """
+    if not isinstance(receipt, SignedStageVerifier):
+        raise TypeError("receipt must be a SignedStageVerifier")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor (the constructor
+    # also re-validates the nested StageVerifier), so structural corruption
+    # raises exactly as the constructor would and only genuine mismatches
+    # return False below.
+    checked = SignedStageVerifier(
+        receipt.version,
+        receipt.verifier,
+        receipt.signature,
+    )
+    verification_key = _load_ed25519_public(public_key)
+    message = _signed_stage_verifier_message(
+        checked.verifier.stage,
+        checked.verifier.hash_name,
+        checked.verifier.key,
     )
     try:
         verification_key.verify(checked.signature, message)

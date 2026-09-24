@@ -36,6 +36,7 @@ encode_signed_audit_receipt / decode_signed_audit_receipt /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
+encode_continuation_chain_report / decode_continuation_chain_report /
 encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
@@ -102,6 +103,7 @@ __all__ = [
     "decode_audit_receipt",
     "decode_auth_batch",
     "decode_continuations",
+    "decode_continuation_chain_report",
     "decode_prune_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
@@ -134,6 +136,7 @@ __all__ = [
     "encode_audit_receipt",
     "encode_auth_batch",
     "encode_continuations",
+    "encode_continuation_chain_report",
     "encode_prune_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
@@ -380,6 +383,16 @@ _SIGNED_AUTH_AUDIT_CONTINUATION_VERSION = 1
 # encode_signed_auth_audit_continuation output, with nothing else.
 _CONTINUATION_CHAIN_MAGIC = b"auditchain/cont-chain/v1\0"
 _CONTINUATION_CHAIN_VERSION = 1
+
+# Binary framing of encode_continuation_chain_report /
+# decode_continuation_chain_report: a fixed magic, then the envelope version
+# as a u64 (always 1), the verdict as a u64 (0 success, 1 failure), the
+# absolute segment position as a u64 (0 for success) and the issue code as a
+# u64-length-prefixed UTF-8 blob (empty for success), in that strict order and
+# with nothing else. It carries no signatures or receipts, only the frozen
+# diagnosis, and introduces no new signing message.
+_CHAIN_REPORT_MAGIC = b"auditchain/chain-report/v1\0"
+_CHAIN_REPORT_VERSION = 1
 
 # Binary framing of encode_anchored_continuations /
 # decode_anchored_continuations: a fixed magic, then the envelope version as
@@ -7764,6 +7777,133 @@ def inspect_anchors(
             False, len(receipts) - 1, _CHAIN_CODE_END
         )
     return report
+
+
+def encode_continuation_chain_report(report: Any) -> bytes:
+    """Encode a :class:`ContinuationChainReport` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/chain-report/v1\\0"``,
+    followed strictly, in this fixed order, by the u64 envelope version
+    (always 1), the verdict, the segment position and the issue code —
+    nothing may be omitted, reordered or appended, and no signature or
+    receipt is carried. Every integer is an unsigned 8-byte big-endian
+    value and the code is a u64-length-prefixed UTF-8 blob (a zero length is
+    an all-zero u64). The verdict is ``0`` for success and ``1`` for
+    failure: a success report writes position ``0`` and an empty code blob,
+    while a failure writes the report's absolute segment position and the
+    UTF-8 bytes of its code, one of the diagnostic entry's legal codes.
+
+    ``report`` must be a :class:`ContinuationChainReport` — anything else
+    raises TypeError; fields written with wrong types by bypassing the
+    frozen constructor (``object.__setattr__``) likewise raise TypeError,
+    because every field is re-validated through the constructor. A failing
+    position outside the u64 range raises ValueError. The call is
+    read-only and deterministic: it never mutates the report, and
+    re-encoding a decoded report reproduces the original bytes exactly, so
+    a diagnosis can be landed on disk and restored in another process with
+    the same verdict, position and code.
+    """
+    if not isinstance(report, ContinuationChainReport):
+        raise TypeError("report must be a ContinuationChainReport")
+    # Re-validate every field even when the frozen constructor was bypassed
+    # with object.__setattr__, so corrupted fields raise exactly as the
+    # constructor would: TypeError for wrong types, ValueError for illegal
+    # values or an ok/index/code mismatch.
+    checked = ContinuationChainReport(report.ok, report.index, report.code)
+    if checked.ok:
+        return b"".join((
+            _CHAIN_REPORT_MAGIC,
+            _encode_u64(_CHAIN_REPORT_VERSION, "version"),
+            _encode_u64(0, "verdict"),
+            _encode_u64(0, "index"),
+            _encode_blob(b""),
+        ))
+    return b"".join((
+        _CHAIN_REPORT_MAGIC,
+        _encode_u64(_CHAIN_REPORT_VERSION, "version"),
+        _encode_u64(1, "verdict"),
+        _encode_u64(checked.index, "index"),
+        _encode_blob(checked.code.encode("utf-8")),
+    ))
+
+
+def decode_continuation_chain_report(data: Any) -> ContinuationChainReport:
+    """Decode bytes produced by :func:`encode_continuation_chain_report`.
+
+    ``data`` must be exactly ``bytes`` (anything else, including
+    ``bytearray`` and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/chain-report/v1\\0"`` it must contain, strictly in
+    order, the u64 version (only ``1`` is supported), the u64 verdict
+    (``0`` success, ``1`` failure), the u64 segment position and the
+    u64-length-prefixed code blob, consumed whole with no trailing bytes.
+    A success verdict must carry position ``0`` and an empty code blob; a
+    failure verdict must carry a non-empty code whose UTF-8 text is one of
+    the legal diagnostic codes (its position may be ``0``, the first
+    segment). A bad magic or version, a verdict other than 0/1, truncation,
+    trailing bytes, an oversized blob length, invalid UTF-8, an unknown
+    code, or any success/failure field mismatch raises ValueError.
+
+    The returned object is a frozen :class:`ContinuationChainReport` whose
+    fields equal the originally encoded report's; re-encoding it
+    reproduces the original bytes exactly, and its verdict is the same
+    before and after the round trip.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_CHAIN_REPORT_MAGIC):
+        raise ValueError("not an auditchain chain-report encoding")
+    offset = len(_CHAIN_REPORT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _CHAIN_REPORT_VERSION:
+        raise ValueError(f"unsupported chain-report version {version}")
+    verdict = read_u64("verdict")
+    if verdict not in (0, 1):
+        raise ValueError(f"chain-report verdict must be 0 or 1, got {verdict}")
+    index = read_u64("index")
+    raw_code = read_blob("code")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the chain report")
+    if verdict == 0:
+        if index != 0 or raw_code != b"":
+            raise ValueError(
+                "a successful chain report must carry position 0 and an "
+                "empty code"
+            )
+        return ContinuationChainReport(True, None, None)
+    if raw_code == b"":
+        raise ValueError("a failed chain report must carry a code")
+    try:
+        code = raw_code.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("code is not valid UTF-8") from error
+    if code not in _CHAIN_CODES:
+        raise ValueError(
+            f"unknown chain code {code!r}; expected one of "
+            "'verify', 'growth', 'duplicate', 'link', 'start', 'end', "
+            "'anchor_link', 'rotation_duplicate', 'rotation', "
+            "'rotation_link'"
+        )
+    return ContinuationChainReport(False, index, code)
 
 
 def inspect_anchored_continuations(

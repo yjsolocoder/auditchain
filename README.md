@@ -2986,6 +2986,20 @@ python3 -m auditchain
   编解码不校验签名、证明及相邻段关联，结构合法但验真不匹配仍可解码
   （`verify_continuation_chain` 返回 `False`）；两个入口均为只读且确定，旧
   接口和签名域不变
+- `encode_continuation_chain_report(report)` /
+  `decode_continuation_chain_report(data)` — 续接链诊断报告
+  `ContinuationChainReport` 的规范二进制编码与解码，使诊断结论可落盘、跨进程
+  恢复且结论不变（编解码只读且确定，不新增签名原文，既有诊断与核验入口不变）：
+  字节流严格为 `D || U(1) || U(v) || U(i) || B(c)`，其中
+  `D = b"auditchain/chain-report/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（零长 blob 也写全零 u64）；`v` 为结论位（成功 0、
+  失败 1），成功时 `i = 0`、`c` 为零长 blob，失败时 `i` 为报告的绝对段位置、
+  `c` 为问题码的 UTF-8 blob（取值沿用既有诊断码集合）。前者只收
+  `ContinuationChainReport`（其他类型或绕过冻结构造器写入的字段类型错抛
+  `TypeError`，失败位置超出 u64 范围抛 `ValueError`），后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；魔数、版本、结论位非 0/1、成功却带
+  位置或问题码、失败却缺问题码、问题码非法、截断、尾随、blob 长度越界或非法
+  UTF-8 抛 `ValueError`；解码返回字段相等的冻结报告，重编码逐字节相同
 - `AnchoredContinuationChain(receipts, start, end)` — 冻结的锚定续接链包，
   把非空 `SignedAuthAuditContinuation` tuple 与首尾两个 `SignedRoot` 锚点
   绑为一件可持久化制品；支持位置/关键字构造、按全部三字段相等（可哈希）；

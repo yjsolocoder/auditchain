@@ -1249,6 +1249,69 @@ verify_signed_auth_bundle(bundle, public_key)   # (True, True)：逐项核验
   重复导出抛 `ValueError`；非保留索引沿用 `auth_batch` 的 `IndexError`。成功不
   改哈希链、Merkle 根或搜索索引；既有接口及包编解码不变
 
+#### 演进后阶段材料与认证批次合并交付包（Ed25519）
+
+`SignedStageVerifier` 解决"演进之后的验证材料从哪来"，`auth_batch` 解决
+"批量签发"，但两者仍要分别交付、分别核对。`SignedStageAuthBundle(verifier,
+hash_name, items)` 把**当前（已演进）阶段**的已签名 `StageVerifier` 与前向安全
+认证批次合并成**一个**不可变交付包：接收方一次拿到材料和整批标签，只凭预置信任
+的 32 字节 Ed25519 公钥先确认材料来源，再逐项核验标签，全程不持有日志、也不新增
+任何签名原文（签名仍是 `SignedStageVerifier` 里那一份）。与 stage-0 的
+`SignedAuthBundle` 不同，它只在日志**至少演进过一次**后可签发，标签从交付阶段
+起连续编号：
+
+```python
+from auditchain import SignedStageAuthBundle, verify_signed_stage_auth_bundle
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    log.append(record)
+log.auth(0)
+log.auth(1)                       # 已演进到 stage 2
+bundle = log.signed_stage_auth_bundle([4, 2], seed)   # 一次调用完成签发
+# 嵌套材料即当前阶段（stage 2）的 SignedStageVerifier，标签为 stage 2、3
+verify_signed_stage_auth_bundle(bundle, public_key)   # (True, True)：逐项核验
+verify_signed_stage_auth_bundle(bundle, other_key)    # (False, False)：验签失败逐项 False
+```
+
+- 交付包为冻结的 `SignedStageAuthBundle(verifier, hash_name, items)`，支持位置
+  构造、按全部三个字段相等；`verifier` 必须是 `SignedStageVerifier`，`hash_name`
+  必须是已知固定输出算法名，`items` 为 `(Entry, AuthTag)` 结果元组（必须是
+  `tuple`）。容器字段类型错抛 `TypeError`，未知算法名抛 `ValueError`；项内部的
+  结构契约（索引严格升序、标签阶段自交付阶段起连续）构造器不重复校验，留给核验
+  入口
+- `AuditLog.signed_stage_auth_bundle(indices, private_key)` 与
+  `export_signed_stage_verifier` 共用同一资格：仅限带 `key` 的日志在**至少演进过
+  一次**（`stage > 0`）后调用；仍在初始 stage 0 或无密钥模式抛 `ValueError`。
+  `indices` 为互异非 `bool` 整数的可迭代项（含生成器），按绝对索引升序签发；
+  第 j 项（j 从 0 起）标签落在**交付阶段加 j**，HMAC、u64 大端 stage 与密钥演进
+  逐字节沿用 `auth_batch`，各项等于从当前状态连续升序调用 `auth` 的结果，成功恰
+  演进所选条数次。该入口不消耗 stage-0 的一次性导出资格；同一状态可重复调用
+  （空选择只读交付材料、阶段不动），成功后材料随阶段继续推进
+- **空选择照常交付签名材料、阶段不动**；stage 容量不足（`stage + count` 触及
+  u64 上界）抛 `ValueError`。`indices` 不可迭代或索引非整数/为 `bool` 抛
+  `TypeError`，索引重复抛 `ValueError`，非保留索引沿用 `auth_batch` 的
+  `IndexError`。`private_key` 必须是 32 字节 `bytes`：非 `bytes`（含
+  `bytearray` / `memoryview`）抛 `TypeError`，长度不符抛 `ValueError`。任何失败
+  都发生在签名与提交之前——不演进密钥、不写标签，也不改条目、保留段与索引
+- **不新增签名原文**：嵌套 `SignedStageVerifier` 的 Ed25519 签名逐字节复用
+  `export_signed_stage_verifier` 的签名原文
+  （`D || 0x01 || U(stage) || B(hash_name 的 UTF-8) || B(key)`，
+  `D = b"auditchain/signed-stage/v1\0"`）；私钥种子用后即弃，不复制进日志状态。
+  成功不改哈希链、Merkle 根或搜索索引
+- `verify_signed_stage_auth_bundle(bundle, public_key) -> tuple[bool, ...]`
+  完全离线且只读：先用 `verify_signed_stage_verifier` 以预信任公钥**先验签**，
+  验签失败（含签名、算法或材料内容不符）或 `bundle.hash_name` 与签名材料算法
+  不一致时，逐位返回 `False`（结果长度与 `items` 相同，空批次为 `()`）；验签
+  通过后复用 `verify_auth_stage` 以交付的 `StageVerifier` 逐项核验。批次须索引
+  严格升序、标签阶段自签名交付阶段起逐项加 1，违反（含重复、乱序、阶段不连续、
+  首项不锚定交付阶段）抛 `ValueError`；入参不是 `SignedStageAuthBundle`（含绕过
+  构造器的容器字段类型错）、项形状或公钥类型错抛 `TypeError`；公钥非 32 字节抛
+  `ValueError`；嵌套结构非法沿用 `verify_signed_stage_verifier` /
+  `verify_auth_stage` 的既有异常
+- 本次**不提供交付包的编解码入口**；既有各线格式、初始阶段一次性导出与既有
+  批量签发行为全部不变，`python3 -m auditchain` 演示入口不变
+
 #### 认证与批量审计合并交付包（Ed25519）
 
 `SignedAuthBundle` 解决"认证标签 + stage-0 材料从哪来"，`SignedAuditBatch`

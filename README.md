@@ -3215,6 +3215,25 @@ python3 -m auditchain
   须为 12 字节 `bytes`，`data` 只收 `bytes`；类型错抛 `TypeError`，资格、
   长度、格式、校验或 AEAD 认证失败抛 `ValueError`；导出只读、失败原子，
   旧接口不变
+- `dump_signed_pruned_auth(log, private_key)` /
+  `load_signed_pruned_auth(data, public_key)` — 构造时带 `key`、已裁剪
+  （`retain_from > 0`）且无 `encrypt` 历史的前向安全认证日志的签名导出与
+  离线恢复（`dump_pruned_auth` 的 Ed25519 签名版本），恢复出独立、可变的
+  带密钥 `AuditLog`（长度、绝对索引、`retain_from`、链头、Merkle 根、包含
+  证明、`find` 索引与 `stage` 均与原日志一致，新签标签逐字节相同）：字节流
+  为 `b"auditchain/signed-pruned-auth/v1\0" || U(1) || P || S`，`P` 严格
+  沿用 `dump_pruned_auth` 的明文帧
+  `B(hash_name) || U(n) || U(r) || B(checkpoint) || F || E || B(root) ||
+  B(head) || U(stage) || B(K) || U(x)`，`S` 为覆盖此前全部字节的 64 字节
+  Ed25519 签名，不新增签名域也不加密密钥。加载先以预置公钥验签，再复核
+  `0 < r <= n`、checkpoint / frontier 结构、条目计数与索引，从检查点重算
+  链与 Merkle 根并与 `head` / `root` 比对，最后以正常 `append` 路径重放并
+  装入 `K`、`stage` 与标志。导出只读且确定（同状态同种子字节相同，私钥
+  不存储）；`log` 不是 `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`，私钥
+  长度非 32 或日志未裁剪 / 无密钥 / 含加密历史抛 `ValueError`。`data` 只
+  收 `bytes`，公钥类型错抛 `TypeError`；公钥非 32 字节，或魔数、版本、
+  UTF-8、算法、截断、尾随、保留点、frontier 结构、条目数、索引、宽度、
+  断链、重算链 / 根、签名不符均抛 `ValueError`；失败原子，旧接口不变
 - `dump_hybrid(log, key, nonce=None)` / `load_hybrid(data, key)` — 构造时带
   `key`、未裁剪且**允许 `encrypt` 历史**的前向安全认证日志的混合加密导出与
   恢复（`dump_auth` 与 `dump_secure_log` 的混合），恢复出独立、可变的带密钥

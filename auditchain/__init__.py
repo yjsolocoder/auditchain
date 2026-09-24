@@ -119,6 +119,7 @@ __all__ = [
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
     "decode_stage_verifier",
+    "decode_verifier",
     "decrypt_entry",
     "dump_auth",
     "dump_hybrid",
@@ -150,6 +151,7 @@ __all__ = [
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
     "encode_stage_verifier",
+    "encode_verifier",
     "entry_digest",
     "inspect_anchor_set",
     "inspect_anchored_continuations",
@@ -286,6 +288,13 @@ _SIGNED_VERIFIER_VERSION = 1
 # from the stage-0 signed-verifier domain above.
 _SIGNED_STAGE_DOMAIN = b"auditchain/signed-stage/v1\0"
 _SIGNED_STAGE_VERSION = 1
+
+# Binary framing of encode_verifier / decode_verifier: a fixed magic, then
+# the format version as a u64 (always 1) and u64-length-prefixed blobs
+# holding the hash_name UTF-8 bytes and the stage-0 key, strictly in
+# Verifier field order — there is no stage field and nothing else.
+_VERIFIER_MAGIC = b"auditchain/verifier/v1\0"
+_VERIFIER_VERSION = 1
 
 # Binary framing of encode_stage_verifier / decode_stage_verifier: a fixed
 # magic, then the format version as a u64 (always 1), the delivery stage as a
@@ -5980,6 +5989,92 @@ def decode_signed_verifier(data: Any) -> SignedVerifier:
         verifier=Verifier(key, hash_name),
         signature=signature,
     )
+
+
+def encode_verifier(material: Any) -> bytes:
+    """Encode a :class:`Verifier` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/verifier/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear strictly in the order ``version`` (always 1),
+    ``hash_name`` (UTF-8 blob) and ``key`` blob — there is no stage field,
+    and nothing may be omitted, reordered or appended. ``material`` must be
+    a :class:`Verifier` — anything else, or a material whose fields have
+    been bypassed to wrong types, raises TypeError; an empty key or an
+    unknown or non-fixed-output hash algorithm raises ValueError. The
+    encoding carries the stage-0 key in the clear and must be protected
+    exactly like the in-memory material. The call is read-only and
+    deterministic: it never mutates the material, and re-encoding a decoded
+    one reproduces the original bytes exactly.
+    """
+    if not isinstance(material, Verifier):
+        raise TypeError("material must be a Verifier")
+    # Re-validate every field even for a material built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = Verifier(
+        material.key,
+        material.hash_name,
+    )
+    return b"".join((
+        _VERIFIER_MAGIC,
+        _encode_u64(_VERIFIER_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_blob(checked.key),
+    ))
+
+
+def decode_verifier(data: Any) -> Verifier:
+    """Decode bytes produced by :func:`encode_verifier`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length or an
+    empty key raises ValueError. The decoded material's fields equal the
+    originally encoded ones, re-encoding reproduces the original bytes
+    exactly, and it works unchanged with :func:`verify_auth` and
+    :func:`verify_auth_batch`; the material is frozen and compares equal to
+    the original on all fields.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_VERIFIER_MAGIC):
+        raise ValueError("not an auditchain verifier encoding")
+    offset = len(_VERIFIER_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    key = read_blob("key")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the verifier")
+    if version != _VERIFIER_VERSION:
+        raise ValueError("unsupported verifier encoding version")
+    return Verifier(key=key, hash_name=hash_name)
 
 
 def encode_stage_verifier(material: Any) -> bytes:

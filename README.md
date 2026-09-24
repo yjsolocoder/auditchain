@@ -2756,6 +2756,19 @@ python3 -m auditchain
   的回执）抛 `TypeError`，魔数、版本、UTF-8、未知算法、截断、尾随、blob 长度、
   空 `key` 或签名宽度非法抛 `ValueError`；结构合法但签名不匹配仍可解码，验签
   返回 `False`；两个入口均为只读
+- `encode_verifier(material)` / `decode_verifier(data)` — 裸 stage-0 验证
+  材料的规范二进制编码与解码，使 `Verifier` 可落盘、跨进程恢复后继续由
+  `verify_auth` / `verify_auth_batch` 离线核验：魔数
+  `b"auditchain/verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
+  UTF-8 blob、key blob（无 stage 字段）；整数为 8 字节无符号大端，blob 为
+  u64 长度前缀加原始字节（零长度也写全零 u64）。解码结果冻结、按全部字段与
+  原材料相等，重编码逐字节相同，对同一标签的核验结论与原件一致。前者只接受
+  `Verifier`，后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；非对应
+  类型或字段类型错（含绕过冻结构造器的材料）抛 `TypeError`，魔数、版本、
+  UTF-8、未知或非固定输出算法、截断、尾随、blob 长度、空 `key` 抛
+  `ValueError`；结构合法但密钥或算法被改动的材料仍可正常编解码，交回核验
+  入口得到不同结论而不抛异常；编码携带明文 stage-0 密钥，不加密也不新增
+  签名原文，须像内存中的材料一样保护；两个入口均为只读且确定
 - `encode_stage_verifier(material)` / `decode_stage_verifier(data)` — 裸交付
   点阶段验证材料的规范二进制编码与解码，使 `StageVerifier` 可落盘、跨进程恢复后
   继续由 `verify_auth_stage` 离线核验：魔数

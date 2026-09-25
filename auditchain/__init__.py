@@ -3,6 +3,7 @@
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
 SignedStageAuthBundle /
+SignedStageAuthAuditBundle /
 SignedAuditBatch /
 SignedAuditReceipt /
 SignedAuthAuditBundle /
@@ -20,6 +21,7 @@ inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
+verify_signed_stage_auth_audit_bundle /
 verify_signed_audit_batch / verify_signed_audit_receipt /
 verify_signed_consistency / verify_signed_prune /
 verify_rotation /
@@ -95,6 +97,7 @@ __all__ = [
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
+    "SignedStageAuthAuditBundle",
     "SignedStageAuthBundle",
     "SignedStageVerifier",
     "SignedVerifier",
@@ -204,6 +207,7 @@ __all__ = [
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
+    "verify_signed_stage_auth_audit_bundle",
     "verify_signed_stage_auth_bundle",
     "verify_signed_stage_verifier",
     "verify_signed_verifier",
@@ -1590,6 +1594,51 @@ class SignedAuthAuditBundle:
 
 
 @dataclass(frozen=True)
+class SignedStageAuthAuditBundle:
+    """Trusted delivery bundle of a signed stage auth batch and a signed audit.
+
+    The post-evolution counterpart of :class:`SignedAuthAuditBundle`: it
+    merges the :class:`SignedStageAuthBundle` of
+    :meth:`AuditLog.signed_stage_auth_bundle` with the
+    :class:`SignedAuditBatch` of :meth:`AuditLog.signed_audit_batch`, so an
+    offline receiver holding only a pre-trusted 32-byte Ed25519 public key
+    gets — in one artifact — both the forward-secure authentication of the
+    selected entries against the delivered post-evolution stage material and
+    the signed evidence that they belong to one snapshot:
+
+    - ``auth``: the :class:`SignedStageAuthBundle` carrying the signed
+      :class:`StageVerifier` and the selected ``(Entry, AuthTag)`` items,
+      whose first tag sits at the delivery stage,
+    - ``audit``: the :class:`SignedAuditBatch` carrying the selected
+      entries' batch inclusion proof and the signed snapshot checkpoint.
+
+    The two packages must be minted under one hash algorithm, and every
+    entry the auth package authenticates must be the very record the audit
+    package carries at the same absolute index; the audit package
+    additionally carries the snapshot's last entry (as every non-empty
+    batch receipt does). Whether all of that holds, and whether either
+    Ed25519 signature verifies, is left to
+    :func:`verify_signed_stage_auth_audit_bundle`.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. Only the container shape is validated here: ``auth`` must be a
+    :class:`SignedStageAuthBundle` and ``audit`` a
+    :class:`SignedAuditBatch`, so a field of the wrong type raises
+    TypeError. The two halves' own internal structure is not checked by
+    this constructor.
+    """
+
+    auth: SignedStageAuthBundle
+    audit: SignedAuditBatch
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.auth, SignedStageAuthBundle):
+            raise TypeError("auth must be a SignedStageAuthBundle")
+        if not isinstance(self.audit, SignedAuditBatch):
+            raise TypeError("audit must be a SignedAuditBatch")
+
+
+@dataclass(frozen=True)
 class SignedAuthAuditContinuation:
     """Cross-snapshot continuation of a signed auth audit, with no new domain.
 
@@ -2614,6 +2663,96 @@ class AuditLog:
         self._key = current_key
         self._stage += count
         return bundle
+
+    def signed_stage_auth_audit_bundle(
+        self,
+        indices: Iterable[int],
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedStageAuthAuditBundle:
+        """Atomically issue a :class:`SignedStageAuthAuditBundle`.
+
+        The one-call fusion of :meth:`signed_stage_auth_bundle` and
+        :meth:`signed_audit_batch`: it delivers the forward-secure tags and
+        signed current-stage :class:`SignedStageVerifier` of the selected
+        entries together with the signed batch audit of those same entries
+        against one snapshot, so the receiver gets post-evolution
+        authentication and snapshot evidence as a single artifact. Both
+        halves are built from the same validated selection and the same
+        ``size`` (defaulting to the current log length): the audit half is
+        exactly what :meth:`signed_audit_batch` mints — it shares the
+        snapshot's last entry (index ``size - 1``) automatically even when
+        ``indices`` does not list it — and the auth half tags exactly the
+        selected indices, byte-for-byte what
+        :meth:`signed_stage_auth_bundle` mints from the same state: the
+        first tag sits at the current delivery stage and the items are
+        issued in ascending absolute-index order, so it never gains a
+        signing domain for that last entry. No new signing message is
+        introduced: the two embedded Ed25519 signatures are byte-for-byte
+        the ones :meth:`signed_stage_auth_bundle` (the stage material's
+        signature, shared with :meth:`export_signed_stage_verifier`) and
+        :meth:`signed_audit_batch` make.
+
+        ``indices`` must be an iterable of distinct non-bool integers each
+        satisfying ``retain_from <= index < size``; as with every batch
+        audit, an empty selection is accepted (the audit still carries the
+        last snapshot entry) and only the empty snapshot (``size == 0``)
+        yields an audit with no entries. ``private_key`` is a 32-byte
+        Ed25519 seed used for the two signatures and never stored. The
+        selection, seed, ``size`` and snapshot rebuildability are all
+        checked while building the read-only audit half, before the auth
+        half's signature and commit; the auth half then re-checks stage
+        capacity and the post-evolution eligibility (a keyed log at
+        ``stage > 0``). Either way a failure never evolves the key, writes
+        tags or changes entries, head and indices. On success the auth half
+        advances the stage exactly once per selected entry; the audit half
+        is read-only. An empty selection still delivers the signed stage
+        material while the stage does not advance, and the call consumes no
+        one-shot eligibility and is repeatable. A non-``bytes`` seed, a
+        non-iterable ``indices``, a non-integer/``bool`` index or a
+        non-integer/``bool`` ``size`` raises TypeError; a seed that is not
+        32 bytes, duplicate indices, a ``size`` outside ``0..len(log)``, an
+        unrebuildable snapshot, stage-capacity exhaustion, keyless mode or
+        the initial stage raises ValueError; an index outside the retained
+        snapshot range raises IndexError.
+        """
+        # Resolve and validate size exactly as audit_batch does: wrong type
+        # is TypeError, an out-of-range size ValueError, before the seed and
+        # the selection are touched.
+        size = self._resolve_size(size)
+        if isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        # Validate the selection against the snapshot range up front. The
+        # audit's automatic last entry is added only to the audit selection;
+        # the auth indices stay exactly the caller's distinct set, so the
+        # auth side never tags an entry the caller did not select.
+        try:
+            iterator = iter(indices)
+        except TypeError:
+            raise TypeError("indices must be an iterable of integers") from None
+        selected: set[int] = set()
+        for index in iterator:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index in selected:
+                raise ValueError(f"duplicate index {index}")
+            if not self._retain_from <= index < size:
+                raise IndexError(
+                    f"no retained entry at index {index} in snapshot of size {size}"
+                )
+            selected.add(index)
+        # Build the read-only audit half first: it also re-checks the
+        # snapshot's rebuildability and adds size - 1 to the audit
+        # selection. It mutates nothing, so a failure here leaves the key
+        # and stage untouched and signs nothing.
+        audit = self.signed_audit_batch(tuple(sorted(selected)), private_key, size)
+        # signed_stage_auth_bundle re-validates its own selection, seed and
+        # stage capacity, requires a post-evolution keyed stage, then signs
+        # the stage material and commits atomically; feed it exactly the
+        # caller's indices (without the audit's appended last entry), in
+        # any order — it sorts them itself.
+        auth = self.signed_stage_auth_bundle(tuple(selected), private_key)
+        return SignedStageAuthAuditBundle(auth=auth, audit=audit)
 
     def entries(self) -> list[Entry]:
         return list(self._entries)
@@ -7067,6 +7206,84 @@ def verify_signed_auth_audit_bundle(bundle: Any, public_key: Any) -> bool:
     if not verify_signed_verifier(checked.auth.verifier, public_key):
         return False
     if not all(verify_signed_auth_bundle(checked.auth, public_key)):
+        return False
+    if not verify_signed_audit_batch(checked.audit, public_key):
+        return False
+
+    auth = checked.auth
+    audit = checked.audit
+    audit_hash_name, _audit_size, _root, audit_entries, _proof = audit.batch
+    # The two packages must be minted under one hash algorithm. The
+    # verifier/audit equalities also cover the empty-selection cases that
+    # never carry per-item evidence.
+    if auth.hash_name != auth.verifier.verifier.hash_name:
+        return False
+    if auth.hash_name != audit_hash_name:
+        return False
+
+    # Every authenticated entry must be exactly the record the audit
+    # package carries at the same absolute index. verify_audit_batch has
+    # already guaranteed the audit entries are distinct and ascending, so a
+    # dict loses no correspondence. Entry equality covers the index (the
+    # lookup key) and all three byte fields.
+    audit_by_index = {entry.index: entry for entry in audit_entries}
+    for entry, _tag in auth.items:
+        if audit_by_index.get(entry.index) != entry:
+            return False
+    return True
+
+
+def verify_signed_stage_auth_audit_bundle(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedStageAuthAuditBundle` against a pre-trusted key.
+
+    The post-evolution counterpart of
+    :func:`verify_signed_auth_audit_bundle`; it confirms the whole
+    trusted-delivery bundle entirely offline, without holding the log, in
+    four steps:
+
+    1. :func:`verify_signed_stage_verifier` checks the nested
+       :class:`SignedStageVerifier` signature with the 32-byte
+       ``public_key`` explicitly (so even an empty auth selection cannot
+       pass vacuously), and :func:`verify_signed_stage_auth_bundle` must
+       return ``True`` at every item position — the delivered stage
+       material authenticates each forward-secure tag from the delivery
+       stage on;
+    2. :func:`verify_signed_audit_batch` verifies the signed batch audit —
+       its shared inclusion proof, its checkpoint signature and its
+       snapshot linkage;
+    3. both packages must name one hash algorithm: the auth bundle's
+       ``hash_name``, its signed stage verifier's algorithm and the audit
+       batch's ``hash_name`` must all agree;
+    4. every entry the auth package authenticates must be byte-for-byte
+       the :class:`Entry` the audit package carries at the same absolute
+       index (the audit package normally also carries the snapshot's last
+       entry, which the auth package need not tag).
+
+    A genuine bundle from the trusted key returns True; a structurally
+    valid bundle signed by another key, whose two packages disagree on the
+    algorithm or snapshot, whose entries differ at a shared index, or
+    whose signatures, tags, proof or checkpoint have been altered returns
+    False. Input that is not a :class:`SignedStageAuthAuditBundle` (or
+    whose container fields have been bypassed to wrong types) raises
+    TypeError; nested structural violations raise exactly the exceptions
+    of :func:`verify_signed_stage_auth_bundle` and
+    :func:`verify_signed_audit_batch` (TypeError or ValueError), and a
+    public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedStageAuthAuditBundle):
+        raise TypeError("bundle must be a SignedStageAuthAuditBundle")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedStageAuthAuditBundle(bundle.auth, bundle.audit)
+
+    # Check the signed stage verifier explicitly as well: with an empty
+    # auth selection verify_signed_stage_auth_bundle reports an empty
+    # tuple, whose all() would otherwise pass vacuously.
+    if not verify_signed_stage_verifier(checked.auth.verifier, public_key):
+        return False
+    if not all(verify_signed_stage_auth_bundle(checked.auth, public_key)):
         return False
     if not verify_signed_audit_batch(checked.audit, public_key):
         return False

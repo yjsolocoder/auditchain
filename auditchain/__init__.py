@@ -7,6 +7,7 @@ SignedStageAuthBundle /
 SignedStageAuthAuditBundle /
 SignedAuditBatch /
 SignedAuditReceipt /
+EncryptedSearchReceipt /
 SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
@@ -96,6 +97,7 @@ __all__ = [
     "BatchInclusionProof",
     "ConsistencyProof",
     "ContinuationChainReport",
+    "EncryptedSearchReceipt",
     "Entry",
     "InclusionProof",
     "IntegrityIssue",
@@ -129,6 +131,7 @@ __all__ = [
     "decode_consistency_proof",
     "decode_continuations",
     "decode_continuation_chain_report",
+    "decode_encrypted_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
     "decode_merkle_frontier",
@@ -174,6 +177,7 @@ __all__ = [
     "encode_consistency_proof",
     "encode_continuations",
     "encode_continuation_chain_report",
+    "encode_encrypted_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
     "encode_merkle_frontier",
@@ -229,6 +233,7 @@ __all__ = [
     "verify_batch_inclusion",
     "verify_consistency",
     "verify_continuation_chain",
+    "verify_encrypted_search_receipt",
     "verify_inclusion",
     "verify_rotated_chain",
     "verify_rotation",
@@ -289,6 +294,13 @@ _PRUNE_RECEIPT_VERSION = 1
 # per hit.
 _SEARCH_RECEIPT_MAGIC = b"auditchain/search-receipt/v1\0"
 _SEARCH_RECEIPT_VERSION = 1
+# Binary framing of encode_encrypted_search_receipt /
+# decode_encrypted_search_receipt: same u64/blob rules as the plain search
+# receipt, persisting the outcome of find_encrypted: each listed hit carries
+# its still-sealed encrypted envelope and is checked offline by decrypting it
+# with the caller-supplied key; no key or plaintext is recorded.
+_ENCRYPTED_SEARCH_MAGIC = b"auditchain/encrypted-search/v1\0"
+_ENCRYPTED_SEARCH_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -1188,6 +1200,117 @@ class SearchReceipt:
     Instances are immutable, may be built positionally and compare by all
     eight fields. Verification only attests that the listed hits are
     genuine; it makes no claim about the completeness of the result set.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    query: bytes
+    start: int
+    stop: int
+    items: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != 1:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        if not isinstance(self.root, (bytes, bytearray)):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        if not isinstance(self.root, bytes):
+            object.__setattr__(self, "root", bytes(self.root))
+        if isinstance(self.query, str):
+            object.__setattr__(self, "query", self.query.encode("utf-8"))
+        elif not isinstance(self.query, bytes):
+            raise TypeError("query must be bytes or str")
+        for name in ("start", "stop"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.start <= self.stop <= self.size:
+            raise ValueError(
+                f"range must satisfy 0 <= start <= stop <= size ({self.size})"
+            )
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of (Entry, proof) pairs")
+        previous_index = -1
+        for item in self.items:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("each item must be an (Entry, proof) tuple")
+            entry, proof = item
+            if not isinstance(entry, Entry):
+                raise TypeError("item entry must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index <= previous_index:
+                raise ValueError("item indices must be in strictly ascending order")
+            if not self.start <= entry.index < self.stop:
+                raise ValueError(
+                    f"entry.index {entry.index} must satisfy "
+                    f"start ({self.start}) <= index < stop ({self.stop})"
+                )
+            previous_index = entry.index
+            if not isinstance(proof, tuple):
+                raise TypeError("item proof must be a tuple of digests")
+            for sibling in proof:
+                if not isinstance(sibling, (bytes, bytearray)):
+                    raise TypeError("proof element must be bytes")
+                if len(sibling) != digest_size:
+                    raise ValueError(f"proof element must be {digest_size} bytes")
+
+
+@dataclass(frozen=True)
+class EncryptedSearchReceipt:
+    """Offline receipt for a keyed search over encrypted entries.
+
+    Issued by :meth:`AuditLog.encrypted_search_receipt` and verified entirely
+    offline by :func:`verify_encrypted_search_receipt`:
+
+    - ``version``: receipt format version, always ``1``,
+    - ``hash_name``: hash algorithm of the log that issued the receipt,
+    - ``size``: number of entries in the snapshot the receipt refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``query``: the normalized query value (a ``str`` query is UTF-8
+      encoded at construction; the stored value is always ``bytes``),
+    - ``start`` / ``stop``: the half-open absolute-index range the search
+      covered, satisfying ``0 <= start <= stop <= size``,
+    - ``items``: ``(Entry, proof)`` pairs in strictly ascending absolute
+      index order, one per listed hit, exactly as for :class:`SearchReceipt`.
+      Each entry's payload is the still-sealed encrypted-entry envelope;
+      verification decrypts it with the caller-supplied key and compares the
+      recovered plaintext against the normalized query. Duplicate plaintexts
+      are listed once per occurrence; a search with no hits (and any empty
+      snapshot) carries ``items == ()``.
+
+    The receipt records neither the key nor any plaintext. Instances are
+    immutable, may be built positionally and compare by all eight fields.
+    As with :class:`SearchReceipt`, verification only attests that the listed
+    hits are genuine; it makes no claim about the completeness of the result
+    set. The constructor fixes only types, widths, ordering and ranges —
+    whether an entry's envelope actually decrypts to the query is left to
+    :func:`verify_encrypted_search_receipt`, so a tampered receipt is still
+    constructible and round-trips.
     """
 
     version: int
@@ -3527,6 +3650,82 @@ class AuditLog:
             items=items,
         )
 
+    def encrypted_search_receipt(
+        self,
+        query: Any,
+        key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> EncryptedSearchReceipt:
+        """Issue an offline :class:`EncryptedSearchReceipt` for a keyed search.
+
+        Runs the same lookup as :meth:`find_encrypted` over the half-open
+        range ``[start, stop)`` of the snapshot of the first ``size`` entries
+        and freezes the outcome into a receipt that
+        :func:`verify_encrypted_search_receipt` can check without holding the
+        log: the receipt records the hash algorithm, the snapshot ``size`` and
+        its Merkle ``root``, the normalized ``query``, the searched range and
+        one ``(Entry, inclusion_proof)`` pair per hit in ascending absolute
+        index order, duplicates listed once per occurrence. Each entry's
+        payload remains the sealed encrypted-entry envelope; the key and the
+        plaintext are never recorded.
+
+        ``query`` accepts ``bytes`` or ``str`` (UTF-8 encoded); anything
+        else raises TypeError. ``key`` must be exactly 32 ``bytes`` — a
+        non-bytes value raises TypeError and a wrong length raises ValueError.
+        ``size`` defaults to the current log length and the snapshot must
+        still be rebuildable (a prefix released by :meth:`prune` is not). The
+        range defaults to the retained segment ``[retain_from, size)``;
+        explicit bounds must be non-bool integers satisfying
+        ``retain_from <= start <= stop <= size``. Wrong types raise TypeError,
+        out-of-range values or an unrebuildable snapshot ValueError. Plain
+        entries and entries sealed under another key never hit, and a valid
+        32-byte key that simply was not an append key yields ``items == ()``.
+        A search with no hits — and any empty snapshot — yields ``items == ()``.
+        The call is read-only: entries, head, authentication state, the
+        encrypted locator index, Merkle roots and proofs are left untouched.
+        """
+        if isinstance(query, str):
+            material = query.encode("utf-8")
+        elif isinstance(query, bytes):
+            material = query
+        else:
+            raise TypeError("query must be bytes or str")
+        _check_key(key)
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        first = self._retain_from
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = size
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= size:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({size})"
+            )
+        root = self.merkle_root(size)
+        items = tuple(
+            (self.entry(index), self.inclusion_proof(index, size))
+            for index in self.find_encrypted(material, key, start, stop)
+        )
+        return EncryptedSearchReceipt(
+            version=_ENCRYPTED_SEARCH_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            query=material,
+            start=start,
+            stop=stop,
+            items=items,
+        )
+
     def verify_entry(self, index: int) -> bool:
         """Check that one retained entry links correctly to its predecessor."""
         entry = self.entry(index)
@@ -5002,6 +5201,75 @@ def verify_search_receipt(receipt: Any) -> bool:
     return True
 
 
+def verify_encrypted_search_receipt(receipt: Any, key: Any) -> bool:
+    """Verify an :class:`EncryptedSearchReceipt` without holding the log.
+
+    Recomputes every listed entry's digest from the entry's fields,
+    re-verifies every inclusion proof against the receipt's snapshot root and
+    then decrypts each sealed envelope with ``key`` via :func:`decrypt_entry`,
+    comparing the recovered plaintext byte-for-byte against the normalized
+    query value; a structurally valid receipt whose entry content, proofs,
+    root or envelopes do not match, or whose ``key`` is not the append key,
+    returns False. Verification only attests that the listed hits are genuine
+    — it makes no claim about whether the result set is complete, so a
+    receipt listing fewer hits than the log would have found is not a
+    failure. Plain entries listed as hits fail to decrypt and therefore fail
+    verification.
+
+    ``key`` must be exactly 32 ``bytes`` — a non-bytes value raises TypeError
+    and a wrong length raises ValueError. A receipt that is not an
+    :class:`EncryptedSearchReceipt` raises TypeError; a receipt whose frozen
+    fields were bypassed into an illegal shape (wrong types, an unknown hash
+    algorithm, an out-of-range range or size, digest-width mismatches,
+    non-ascending items) raises the same TypeError or ValueError construction
+    would. Wrong-key or content failures return False rather than raising.
+    """
+    if not isinstance(receipt, EncryptedSearchReceipt):
+        raise TypeError("receipt must be an EncryptedSearchReceipt")
+    _check_key(key)
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = EncryptedSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+    )
+    for entry, proof in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        if not verify_inclusion(
+            entry.entry_hash,
+            entry.index,
+            checked.size,
+            checked.root,
+            proof,
+            hash_name=checked.hash_name,
+        ):
+            return False
+        try:
+            plaintext = decrypt_entry(entry, key, hash_name=checked.hash_name)
+        except ValueError:
+            # Wrong key, a plain/non-envelope payload, an entry-digest
+            # mismatch or an AEAD authentication failure is a false hit, not
+            # an error: verification returns False rather than raising.
+            return False
+        if not hmac.compare_digest(plaintext, checked.query):
+            return False
+    return True
+
+
 def _unpack_audit_batch(
     receipt: Any,
 ) -> tuple[str, int, bytes, tuple[Entry, ...], tuple[bytes, ...]]:
@@ -5437,6 +5705,142 @@ def decode_search_receipt(data: Any) -> SearchReceipt:
     if offset != len(data):
         raise ValueError("trailing bytes after the receipt")
     receipt = SearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        query=query,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+    )
+    _check_search_receipt_proofs(receipt)
+    return receipt
+
+
+def encode_encrypted_search_receipt(receipt: Any) -> bytes:
+    """Encode an :class:`EncryptedSearchReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/encrypted-search/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in the order ``version`` (always 1), ``hash_name`` (UTF-8
+    blob), ``size``, ``root`` blob, ``query`` blob, ``start``, ``stop`` and
+    item count; each item is ``Entry.index``, ``payload`` blob (the sealed
+    encrypted-entry envelope, written verbatim), ``previous_hash`` blob,
+    ``entry_hash`` blob, proof count and one blob per proof digest, with
+    nothing omitted, reordered or appended — the layout is identical to
+    :func:`encode_search_receipt` apart from the magic. ``receipt`` must be
+    an :class:`EncryptedSearchReceipt` (anything else raises TypeError);
+    every field is re-validated exactly as the constructor would, so a
+    receipt whose frozen fields were bypassed into an illegal shape raises
+    the same TypeError or ValueError, and a proof whose level count does not
+    fit its ``(index, size)`` raises ValueError. Encoding is read-only and
+    deterministic: re-encoding a decoded receipt reproduces the original
+    bytes exactly. No signing material is introduced and no wire format of
+    the other layers changes.
+    """
+    if not isinstance(receipt, EncryptedSearchReceipt):
+        raise TypeError("receipt must be an EncryptedSearchReceipt")
+    checked = EncryptedSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+    )
+    _check_search_receipt_proofs(checked)
+    parts = [
+        _ENCRYPTED_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(checked.query),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry, proof in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+        parts.append(_encode_u64(len(proof), "proof count"))
+        for digest in proof:
+            parts.append(_encode_blob(bytes(digest)))
+    return b"".join(parts)
+
+
+def decode_encrypted_search_receipt(data: Any) -> EncryptedSearchReceipt:
+    """Decode bytes produced by :func:`encode_encrypted_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad
+    magic, a version other than 1, invalid UTF-8 in ``hash_name``, an
+    unknown hash algorithm, truncation, trailing bytes, an oversized blob
+    length, digest-width mismatches, an out-of-range or inverted search
+    range, non-ascending or duplicate item indices, an item index outside
+    the recorded range, or a proof whose level count does not fit its
+    ``(index, size)`` all raise ValueError. The decoded receipt's fields
+    equal the originally encoded ones and satisfy
+    :func:`verify_encrypted_search_receipt` whenever the original did; a
+    structurally valid receipt whose sealed content does not decrypt to the
+    query still decodes and only fails verification. The bytes are consumed
+    exactly, with no trailing data accepted. The call is read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ENCRYPTED_SEARCH_MAGIC):
+        raise ValueError("not an auditchain encrypted-search encoding")
+    offset = len(_ENCRYPTED_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    query = read_blob("query")
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        proof_count = read_u64("proof count")
+        proof = tuple(read_blob("proof element") for _ in range(proof_count))
+        items.append((Entry(index, payload, previous_hash, entry_hash), proof))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = EncryptedSearchReceipt(
         version=version,
         hash_name=hash_name,
         size=size,

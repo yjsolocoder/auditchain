@@ -1430,6 +1430,83 @@ verify_signed_auth_audit_bundle(restored, public_key)  # True：单 bool 结论
   匹配仍可正常解码，`verify_signed_auth_audit_bundle` 返回 `False`。两个入口
   均只读且确定，旧接口不变
 
+#### 演进后阶段认证与批量审计合并交付包（Ed25519）
+
+`SignedStageAuthBundle` 解决"演进后认证标签 + 交付阶段材料从哪来"，
+`SignedAuditBatch` 解决"选中条目属于哪个签名快照"，但二者仍要分别交付、
+分别核对。冻结的 `SignedStageAuthAuditBundle(auth, audit)` 是
+`SignedAuthAuditBundle` 的**阶段对应物**：把
+`SignedStageAuthBundle` 与 `SignedAuditBatch` 合并成**一个**不可变交付包，
+离线方只凭预置信任的 32 字节 Ed25519 公钥，即可在同一凭据上既凭已签名的交付
+阶段材料逐项核验前向安全标签、又确认这些条目属于同一个已签名快照，全程不持有
+日志、也不新增任何签名原文：
+
+```python
+from auditchain import (
+    SignedStageAuthAuditBundle,
+    verify_signed_stage_auth_audit_bundle,
+)
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    log.append(record)
+log.rotate_key()                          # 至少演进过一次才可签发
+bundle = log.signed_stage_auth_audit_bundle([3, 1], seed)   # 一次调用完成签发
+
+# 两半分别等价于同型日志上的既有签发
+twin = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e"):
+    twin.append(record)
+twin.rotate_key()
+auth = twin.signed_stage_auth_bundle([3, 1], seed)
+audit = twin.signed_audit_batch([3, 1], seed)
+bundle.auth == auth     # True：签名阶段材料与标签逐字节相同
+bundle.audit == audit   # True：批量审计与检查点逐字节相同
+verify_signed_stage_auth_audit_bundle(bundle, public_key)  # True：单 bool 结论
+verify_signed_stage_auth_audit_bundle(bundle, other_key)   # False：未信任的公钥
+# 空选择照常交付签名阶段材料；audit 仍带末条，stage 不推进，不耗一次性资格
+empty = log.signed_stage_auth_audit_bundle((), seed)
+verify_signed_stage_auth_audit_bundle(empty, public_key)   # True
+```
+
+- 交付包为冻结的 `SignedStageAuthAuditBundle(auth, audit)`，支持位置构造、
+  按两个字段相等；`auth` 必须是 `SignedStageAuthBundle`，`audit` 必须是
+  `SignedAuditBatch`，容器字段类型错抛 `TypeError`；两半内部的结构契约沿用
+  各自既有核验，构造器不重复校验；签名只认证来源、不加密其中阶段密钥
+- `AuditLog.signed_stage_auth_audit_bundle(indices, private_key, size=None)`
+  在一次调用内原子交付两半：`size` 默认当前长度；`indices` 为互异非 `bool`
+  整数，范围 `retain_from <= i < size`。认证半与
+  `signed_stage_auth_bundle` **逐字节一致**——首个标签位于交付阶段、按索引
+  升序签发，成功恰推进所选条数；审计半沿用 `signed_audit_batch` 的批量审计
+  口径——非空快照**自动并入末条**（索引 `size - 1`，即使未选），认证半**只**
+  对调用方选中的索引签标签，末条未选时不多签标签；仅空快照（`size == 0`）
+  允许空选择且审计无条目。两半签名逐字节复用既有签名原文，**不新增任何签名
+  原文**，同状态同种子两次签发逐字节相同
+- 带认证密钥且**至少演进过一次**（`stage > 0`）才可签发：初始阶段或无密钥
+  模式抛 `ValueError`；调用只读、可任意重复，不消耗 stage-0 的一次性导出
+  资格。空选择仍交付签名阶段材料、`items == ()`、stage 不推进
+- 所有校验（私钥、`size`、索引、重复、保留快照范围、快照可重建性、stage
+  容量与演进后阶段）均在签名与提交之前完成：任何失败都**不演进密钥、不写
+  标签、不改条目与索引**。`private_key` 或 `indices` 类型错、索引非整数或
+  为 `bool` 抛 `TypeError`；索引重复、种子长度非 32 字节、`size` 越界
+  （不在 `0..len(log)`）、快照不可重建、stage 容量不足抛 `ValueError`；
+  索引越出保留快照范围抛 `IndexError`
+- `verify_signed_stage_auth_audit_bundle(bundle, public_key) -> bool` 完全
+  离线只读：要求 ① 嵌套 `SignedStageVerifier` 签名验真（空选择也显式验签，
+  不因零项空过），且 `verify_signed_stage_auth_bundle` 逐项全为 `True`；
+  ② `verify_signed_audit_batch` 验真（含证明、检查点签名与快照链接）；
+  ③ 两包算法一致——认证包算法、其签名阶段材料算法与审计批算法三者相同；
+  ④ 认证包每个索引上的 `Entry` 与审计包同索引 `Entry` 逐字段相等（审计包
+  通常另带末条，认证包无需为其签标签）。算法名不一致，或签名、标签、证明、
+  检查点被改，一律返回 `False`、绝不抛异常；入参不是
+  `SignedStageAuthAuditBundle`（含绕过构造器的容器字段类型错）或公钥不是
+  `bytes` 抛 `TypeError`，公钥非 32 字节抛 `ValueError`，其余嵌套结构非法
+  沿用既有核验入口的 `TypeError` / `ValueError`
+- **本次不提供该交付包的编解码**：需要落盘或跨进程传递时，可分别使用既有
+  `encode_signed_stage_auth_bundle(auth)` 与
+  `encode_signed_audit_batch(audit)`；既有线格式、签名原文与批量签发行为
+  全部不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -2378,6 +2455,13 @@ python3 -m auditchain
   输出算法名），`items` 即 `auth_batch` 的结果元组（必须是 `tuple`，首个标签位于
   交付阶段）；容器字段类型错抛 `TypeError`，项内部的结构契约由
   `verify_signed_stage_auth_bundle` 校验；签名只认证来源、不加密其中阶段密钥
+- `SignedStageAuthAuditBundle(auth, audit)` — 不可变的可信演进后阶段认证与
+  批量审计合并交付包（`SignedAuthAuditBundle` 的阶段对应物），按两个字段
+  相等、支持位置构造；`auth` 为已签名的交付阶段认证批次（必须是
+  `SignedStageAuthBundle`），`audit` 为选中条目同快照的可信批量审计（必须是
+  `SignedAuditBatch`）；容器字段类型错抛 `TypeError`，两半内部的结构契约分别
+  沿用 `verify_signed_stage_auth_bundle` 与 `verify_signed_audit_batch`，构造器
+  不重复校验；签名只认证来源、不加密其中阶段密钥；该交付包不提供编解码
 - `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
@@ -2745,6 +2829,22 @@ python3 -m auditchain
   stage 连续、摘要宽度等）或嵌套结构非法沿用 `verify_signed_stage_verifier` /
   `verify_auth_stage` 的既有异常（`TypeError` / `ValueError`）；签名只认证来源、
   不加密其中阶段密钥，调用只读
+- `verify_signed_stage_auth_audit_bundle(bundle, public_key)` — 凭预先信任的
+  32 字节 Ed25519 公钥离线只读核验 `SignedStageAuthAuditBundle`
+  演进后阶段认证与批量审计合并交付包（由
+  `AuditLog.signed_stage_auth_audit_bundle(indices, private_key, size=None)`
+  原子签发，或用 `signed_stage_auth_bundle` 与 `signed_audit_batch` 的结果
+  手工构造），无需持有日志、不新增签名原文：先显式核验嵌套
+  `SignedStageVerifier` 签名（空选择也验签）且
+  `verify_signed_stage_auth_bundle` 逐项全为 `True`，再由
+  `verify_signed_audit_batch` 核验审计半（证明、检查点签名与快照链接），并要求
+  认证包算法、签名阶段材料算法与审计批算法三者一致、且认证包每个索引上的
+  `Entry` 与审计包同索引条目逐字段相等。算法名不一致，或签名、标签、证明、
+  检查点被改，一律返回 `False` 而不抛异常；入参不是
+  `SignedStageAuthAuditBundle`（含绕过构造器的容器字段类型错）或公钥不是
+  `bytes` 抛 `TypeError`，公钥非 32 字节抛 `ValueError`，其余嵌套结构非法沿用
+  `verify_signed_stage_auth_bundle` / `verify_signed_audit_batch` 的既有异常
+  （`TypeError` / `ValueError`）
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的

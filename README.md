@@ -146,6 +146,54 @@ log.find_encrypted("secret event", wrong_key)  # ()：合法但错误的密钥�
 - 候选命中后必须用查询密钥解密对应封装并把明文与 `P` **逐字节比较**：AEAD
   认证失败或定位摘要碰撞都不会误命中。普通条目、不同密钥追加的条目均不命中
 
+#### 加密定位的离线检索回执
+
+`encrypted_search_receipt` 把一次 `find_encrypted` 的结果固化成可落盘、可离线
+核验的检索回执：无需持有日志，凭追加时密钥 `verify_encrypted_search_receipt`
+即可逐条判定列出的命中是否属实（回执本身不记录密钥）：
+
+```python
+receipt = log.encrypted_search_receipt("secret event", key)  # 范围默认保留段，size 默认当前长度
+receipt.query                                # b"secret event"：str 按 UTF-8 规范化
+receipt.items                                # ((Entry, proof), ...) 按绝对索引严格升序
+verify_encrypted_search_receipt(receipt, key)        # True：离线核验，需同一把密钥
+verify_encrypted_search_receipt(receipt, wrong_key)  # False：密钥错误不抛异常
+log.encrypted_search_receipt("secret", key, 1, 3, size=3)  # 半开范围 [1, 3) + 前 3 条快照
+```
+
+回执为冻结的 `EncryptedSearchReceipt(version=1, hash_name, size, root, query,
+start, stop, items)`，支持位置构造、按全部字段相等：记录算法、快照尺寸与 Merkle
+根、规范化查询值、半开范围 `[start, stop)` 与命中条目；每个命中是 `(Entry, 包含
+证明)` 对（`Entry.payload` 为密文封装），重复明文逐次列出，无命中（及空快照）时
+`items == ()`。查询值只收 `bytes` 或 `str`（后者按 UTF-8 规范化）；`key` 只收
+32 字节 `bytes`；范围默认 `[retain_from, size)`，`size` 默认当前长度且快照须可
+重建。异钥与普通条目不命中，合法但错误的密钥签发时只得 `items == ()`。核验逐条
+重算 `entry_digest`、核验包含证明，再用所给密钥解密封装并比对规范化查询值，密钥
+错误或内容不符返回 `False`；**核验只判定列出的命中是否属实，不判定结果集是否
+完整**，少列条目不算失败。签发与核验均为只读：查询值、密钥、范围或尺寸类型非法
+抛 `TypeError`，密钥长度、范围或尺寸越界、快照不可重建、未知算法或摘要宽度不符
+抛 `ValueError`。
+
+回执可编码为规范字节形式，落盘或传输后恢复并继续离线核验：
+
+```python
+data = encode_encrypted_search_receipt(receipt)      # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_encrypted_search_receipt(data)     # 字段与原回执相等
+encode_encrypted_search_receipt(restored) == data    # True：重复编码字节相同
+verify_encrypted_search_receipt(restored, key)       # True
+```
+
+编码以魔数 `b"auditchain/encrypted-search/v1\0"` 开头，后接恒为 1 的 `version`，
+随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、`size`、`root` blob、
+`query` blob、`start`、`stop` 与命中计数，禁止换序与尾随；整数均为 8 字节无符号
+大端，blob 为 u64 字节长度后接原始字节（零长度也是全零 u64），条目与证明的写法与
+`encode_search_receipt` 相同。`encode_encrypted_search_receipt` 只接受
+`EncryptedSearchReceipt` 并复验全部字段与证明层数（类型错抛 `TypeError`，结构
+非法抛 `ValueError`）；`decode_encrypted_search_receipt` 只接受精确的 `bytes`，
+魔数、版本、非法 UTF-8、未知算法、截断、尾随、长度越界、范围或顺序非法、摘要
+宽度或证明层数不符均抛 `ValueError`。空结果与空快照照常往返且核验通过；内容被
+篡改的回执仍可往返，仅核验判 `False`。
+
 ### 可验证前缀裁剪
 
 ```python
@@ -2678,6 +2726,18 @@ python3 -m auditchain
   完整。类型非法抛 `TypeError`，版本、范围、未知算法、摘要宽度或条目结构
   非法（含索引越出记录范围、非严格升序）抛 `ValueError`；规范二进制编解码由
   `encode_search_receipt` / `decode_search_receipt` 提供
+- `EncryptedSearchReceipt(version, hash_name, size, root, query, start, stop, items)` —
+  不可变的加密定位离线检索回执，把一次按原明文定位加密条目的结果（算法、快照
+  尺寸与 Merkle 根、规范化明文查询值、半开范围 `[start, stop)` 与命中条目）绑成
+  一件可落盘制品，按全部八个字段相等、支持位置构造；`version` 恒为 `1`，`query`
+  只收 `bytes` 或 `str`（后者按 UTF-8 规范化后存储），范围满足
+  `0 <= start <= stop <= size`，`items` 为按绝对索引严格升序的
+  `(Entry, 证明元组)` 元组且每个命中索引落在记录范围内（`Entry.payload` 为密文
+  封装，重复明文逐次列出，无命中与空快照为 `()`）；回执不记录密钥，离线核验须
+  凭追加时密钥并只判定列出的命中是否属实，不判定结果集是否完整。类型非法抛
+  `TypeError`，版本、范围、未知算法、摘要宽度或条目结构非法（含索引越出记录
+  范围、非严格升序）抛 `ValueError`；规范二进制编解码由
+  `encode_encrypted_search_receipt` / `decode_encrypted_search_receipt` 提供
 - `BatchInclusionProof(hash_name, indices, entry_hashes, size, root, proof)` —
   不可变的紧凑批量包含证明凭据，把 `verify_batch_inclusion` 的核验上下文与
   `batch_inclusion_proof` 的共享证明节点绑成一件制品，按全部六个字段相等、支持
@@ -2838,6 +2898,17 @@ python3 -m auditchain
     空快照为 `()`）。`query` 只收 `bytes` 或 `str`（后者按 UTF-8 规范化）；
     查询值、范围或尺寸类型非法抛 `TypeError`，范围或尺寸越界、快照不可重建抛
     `ValueError`；签发为只读，不改变条目、`head`、认证状态、Merkle 根或证明
+  - `encrypted_search_receipt(query, key, start=None, stop=None, size=None)` —
+    把一次按原明文定位加密条目的查找固化为可离线核验的冻结
+    `EncryptedSearchReceipt`：在与 `find_encrypted` 相同的半开范围
+    `[start, stop)`（默认 `[retain_from, size)`）内查找，`size` 默认当前长度且
+    快照须可重建；回执记录算法、快照尺寸与 Merkle 根、规范化明文查询值、范围与
+    命中条目（`(Entry, 包含证明)` 对按绝对索引严格升序，`Entry.payload` 为密文
+    封装，重复明文逐次列出，无命中与空快照为 `()`），不记录密钥。`query` 只收
+    `bytes` 或 `str`（后者按 UTF-8 规范化），`key` 只收 32 字节 `bytes`；查询
+    值、密钥、范围或尺寸类型非法抛 `TypeError`，密钥长度、范围或尺寸越界、快照
+    不可重建抛 `ValueError`；异钥与普通条目不命中，合法但错误的密钥只得
+    `items == ()`；签发为只读，不改变条目、`head`、认证状态、Merkle 根或证明
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
   - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于
@@ -3039,6 +3110,16 @@ python3 -m auditchain
   记录范围等结构非法（含绕过冻结构造器写入的字段）抛 `TypeError` /
   `ValueError`，与构造端一致；结构合法但条目内容、证明、根或命中内容不符返回
   `False`，匹配返回 `True`
+- `verify_encrypted_search_receipt(receipt, key)` — 无需持有日志即可验证
+  `EncryptedSearchReceipt`：逐条重算每个命中条目的 `entry_digest`、核验其包含
+  证明是否落在记录的快照根内，再用所给追加密钥解密封装并比对明文与规范化查询
+  值；只判定列出的命中是否属实，不判定结果集是否完整（少列条目不算失败，空命中
+  与空快照照常核验）。`key` 只收 32 字节 `bytes`；入参不是
+  `EncryptedSearchReceipt` 或密钥类型非法抛 `TypeError`，密钥长度不符抛
+  `ValueError`；字段类型、版本、范围、算法、摘要宽度、索引顺序或命中索引越出
+  记录范围等结构非法（含绕过冻结构造器写入的字段）抛 `TypeError` /
+  `ValueError`，与构造端一致；结构合法但条目内容、证明、根不符，或密钥错误、
+  解密明文与查询值不符返回 `False`（不抛异常），匹配返回 `True`；调用只读
 - `verify_signed_verifier(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519
   公钥离线验证 `AuditLog.export_signed_verifier` 签发的 `SignedVerifier`：从嵌套
   `Verifier` 重建同一签名原文
@@ -3628,6 +3709,21 @@ python3 -m auditchain
   字段与证明层数，后者只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；
   类型错抛 `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度越界、范围或
   顺序非法、摘要宽度或证明层数不符抛 `ValueError`
+- `encode_encrypted_search_receipt(receipt)` / `decode_encrypted_search_receipt(data)` —
+  加密定位检索回执的规范二进制编码与解码，使 `EncryptedSearchReceipt` 可落盘、
+  跨进程恢复后继续凭追加时密钥由 `verify_encrypted_search_receipt` 离线核验
+  （编解码只读且确定）：魔数 `b"auditchain/encrypted-search/v1\0"` 开头，后接
+  恒为 1 的 `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、
+  `size`、`root` blob、`query` blob、`start`、`stop` 与命中计数，禁止换序与
+  尾随；整数为 u64 大端，blob 为 u64 长度前缀加原始字节（零长度也是全零 u64），
+  每个命中依次写 `Entry.index`、`payload` blob、`previous_hash` blob、
+  `entry_hash` blob、证明计数及各摘要 blob（与 `encode_search_receipt` 的条目
+  写法相同）。解码精确消费全部字节，恢复的回执按全部字段与原件相等、重编码逐
+  字节相同；空结果与空快照照常往返且核验通过，内容被篡改的回执仍可往返、仅核验
+  判 `False`。前者只接受 `EncryptedSearchReceipt` 并复验全部字段与证明层数，
+  后者只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；类型错抛
+  `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度越界、范围或顺序非法、
+  摘要宽度或证明层数不符抛 `ValueError`
 - `encode_batch_inclusion_proof(credential)` / `decode_batch_inclusion_proof(data)` —
   紧凑批量包含证明凭据 `BatchInclusionProof` 的规范二进制编码与解码：魔数
   `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据

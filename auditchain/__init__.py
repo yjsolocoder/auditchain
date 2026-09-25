@@ -51,6 +51,7 @@ dump_secure_pruned / load_secure_pruned /
 dump_auth / load_auth /
 dump_pruned_auth / load_pruned_auth /
 dump_signed_pruned_auth / load_signed_pruned_auth /
+dump_signed_hybrid / load_signed_hybrid /
 dump_hybrid / load_hybrid.
 """
 
@@ -133,6 +134,7 @@ __all__ = [
     "dump_secure_log",
     "dump_secure_pruned",
     "dump_signed_auth",
+    "dump_signed_hybrid",
     "dump_signed_pruned_auth",
     "encode_anchored_continuations",
     "encode_audit_batch",
@@ -175,6 +177,7 @@ __all__ = [
     "load_secure_log",
     "load_secure_pruned",
     "load_signed_auth",
+    "load_signed_hybrid",
     "load_signed_pruned_auth",
     "merge_anchor_set",
     "merge_rotated_anchor_set",
@@ -548,6 +551,23 @@ _HYBRID_VERSION = 1
 # auth-state tail B(root) || B(head) || U(stage) || B(K) || U(x).
 _PRUNED_HYBRID_MAGIC = b"auditchain/pruned-hybrid/v1\0"
 _PRUNED_HYBRID_VERSION = 1
+
+# Binary framing of dump_signed_hybrid / load_signed_hybrid: the
+# Ed25519-signed counterpart of the hybrid framing — the same unpruned, keyed,
+# forward-secure log whose history may contain encrypted entries, but exported
+# as one self-certifying byte string instead of being sealed symmetrically.
+# The wire form is D || U(version) || P || S: D is the magic, version the u64
+# envelope version (always 1), P field-by-field the plaintext framing of
+# dump_hybrid
+# (B(h) || U(q) || B(nonce1)…B(nonceq) || U(n) || E1…En || B(root) ||
+# B(head) || U(stage) || B(K) || U(x), each Ei a secure-log record with
+# B(locator)) and S the 64-byte Ed25519 signature over every preceding byte;
+# no further signing domain is introduced and no key is encrypted. As with
+# dump_signed_auth the signature authenticates the export's origin but not its
+# confidentiality — P carries the live evolution key — so the byte string must
+# be protected like key material.
+_SIGNED_HYBRID_MAGIC = b"auditchain/signed-hybrid/v1\0"
+_SIGNED_HYBRID_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -11867,6 +11887,341 @@ def load_pruned_hybrid(data: Any, key: Any) -> AuditLog:
         raise ValueError("recomputed chain head does not match the exported head")
     if not hmac.compare_digest(log.merkle_root(), root):
         raise ValueError("recomputed Merkle root does not match the exported root")
+    log._stage = stage
+    log._verifier_exported = bool(exported)
+    return log
+
+
+def dump_signed_hybrid(log: Any, private_key: Any) -> bytes:
+    """Export an unpruned, keyed log (with encrypt history) as one
+    self-certifying byte string.
+
+    The Ed25519-signed counterpart of :func:`dump_hybrid`: instead of sealing
+    the framing symmetrically, the export is signed with the 32-byte Ed25519
+    seed ``private_key`` and verified offline by :func:`load_signed_hybrid`
+    against the pre-arranged public key. Only an :class:`AuditLog` that holds
+    its complete, unpruned history (``retain_from == 0``) and was **constructed
+    with an authentication key** qualifies; unlike :func:`dump_signed_auth`,
+    its history may contain entries appended with :meth:`AuditLog.encrypt`.
+    The framing carries the complete encrypt nonce history and the
+    encrypted-locator HMAC of every ciphertext, and the current
+    forward-secure evolution key and stage in the clear, so a fresh process
+    can continue evolving from exactly the same point, but it carries no prune
+    checkpoints, encryption keys or verifier material beyond the u64
+    verifier-exported flag.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-hybrid/v1\\0"`` and then writes, strictly in order,
+    the envelope version (always ``1``) as an unsigned 8-byte big-endian
+    integer, then field-by-field the plaintext framing of
+    :func:`dump_hybrid` —
+    ``B(h) || U(q) || B(nonce1)…B(nonceq) || U(n) || E1…En || B(root) ||
+    B(head) || U(stage) || B(K) || U(x)`` — and finally a 64-byte Ed25519
+    signature over every preceding byte. ``U`` is an unsigned 8-byte
+    big-endian integer and ``B(v) = U(len(v)) || v``. No signing domain
+    beyond the signed bytes themselves is introduced and no evolution key is
+    encrypted. The signature authenticates the export's origin; it does
+    **not** encrypt the framing, which carries the live evolution key, so the
+    byte string must be protected like verification key material.
+
+    The call is read-only and deterministic: it never mutates the log, and
+    two dumps of logs in the same state signed with the same seed are
+    byte-for-byte identical (Ed25519 signatures are deterministic); the seed
+    is used for the one signature and is never stored, copied into the dump
+    or added as a separate signing input. A non-:class:`AuditLog` value or a
+    non-``bytes`` seed raises TypeError; a seed that is not 32 bytes, or a
+    log that is pruned or keyless raises ValueError.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, mirroring
+    # dump_signed_auth / dump_hybrid; the loaded key signs once below and is
+    # never stored.
+    signing_key = _load_ed25519_seed(private_key)
+    # Same eligibility as dump_hybrid, minus the symmetric seal: the framing
+    # carries the live evolution key, stage, complete nonce history and
+    # per-entry locators, so only an unpruned log that was constructed with a
+    # key qualifies; encrypt history is exactly what the nonce/locator fields
+    # preserve.
+    if log._retain_from != 0:
+        raise ValueError(
+            "only an unpruned log holding its complete history can be dumped"
+        )
+    if log._key is None:
+        raise ValueError(
+            "only a log constructed with an authentication key can be dumped"
+        )
+    hash_name = log._hash_name
+    digest_size = log._digest_size
+    size = len(log)
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _SIGNED_HYBRID_MAGIC,
+        _encode_u64(_SIGNED_HYBRID_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(len(log._used_nonces), "nonce count"),
+    ]
+    for used_nonce in sorted(log._used_nonces):
+        parts.append(_encode_blob(used_nonce))
+    parts.append(_encode_u64(size, "entries count"))
+    for entry in log._entries:
+        locator = log._encrypted_locators.get(entry.index, b"")
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        parts.append(_encode_blob(locator))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    parts.append(_encode_u64(log._stage, "stage"))
+    parts.append(_encode_blob(log._key))
+    parts.append(_encode_u64(1 if log._verifier_exported else 0, "exported flag"))
+    body = b"".join(parts)
+    # Sign every byte written so far; the signature is the trailing field, so
+    # the wire format verifies without knowing any inner framing offset.
+    signature = signing_key.sign(body)
+    if len(signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    return body + signature
+
+
+def load_signed_hybrid(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable keyed :class:`AuditLog` from
+    :func:`dump_signed_hybrid`, verifying entirely offline.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) and ``public_key`` must be the 32-byte
+    Ed25519 public key pre-arranged with the exporter. After the magic
+    ``b"auditchain/signed-hybrid/v1\\0"`` the stream must contain, strictly
+    in order, the u64 envelope version (only ``1`` is supported), field-by-
+    field the plaintext framing of :func:`dump_hybrid` —
+    ``B(h) || U(q) || B(nonce1)…B(nonceq) || U(n) || E1…En || B(root) ||
+    B(head) || U(stage) || B(K) || U(x)`` — and a final 64-byte Ed25519
+    signature, with no truncation or trailing bytes.
+
+    Verification happens before any state is built: the trailing signature is
+    checked against every preceding byte with ``public_key``; only then is
+    the stream parsed: every nonce blob must carry exactly 12 bytes and the
+    ``q`` nonces must be distinct and in lexicographic order; each ``Ei`` is
+    an :class:`Entry` record in the :func:`dump_secure_log` field order
+    (``U, B, B, B, B``) whose trailing ``B(locator)`` is empty for a plain
+    entry and the digest-width encrypted-locator HMAC for an encrypted one;
+    indices must be exactly ``0..n-1``, every chain digest must have the
+    width of the named hash algorithm, ``K`` (the current evolution key) must
+    be non-empty — at stage 0 it is the construction key, which may have any
+    non-zero length, and after any evolution it is one hash-digest wide — and
+    ``x`` (the verifier-exported flag) must be ``0`` or ``1``. Under the
+    named ``hash_name`` every :func:`entry_digest` and predecessor link is
+    then recomputed from genesis, and the resulting chain head and Merkle
+    root must match ``head`` / ``root``. Classification is driven by the
+    locator, never the payload: a non-empty locator's payload must parse as
+    an encrypted-entry envelope, whose 12-byte nonce is recovered and must
+    not repeat, and the recovered envelope nonces must together be exactly
+    the declared nonce history. Only then is a fresh keyed
+    :class:`AuditLog` built by replaying the payloads through the normal
+    append / encrypted-entry recovery path, with the nonce history, ``K`` as
+    the current key, ``stage`` and the exported flag installed, so its
+    length, absolute indices, head, Merkle root, find index, encrypted
+    locator index, nonce history and stage are exactly those of the dumped
+    log — an already-exported log cannot export stage-0 verifier material
+    again, a previously used nonce is still rejected and a freshly minted
+    tag is byte-identical to the original's in the same state — and
+    forward-secure evolution continues from the same point. The result is
+    fully mutable and shares no state with the caller's buffers.
+
+    A non-``bytes`` ``data`` or ``public_key`` raises TypeError; a public
+    key that is not 32 bytes, a bad magic, version, UTF-8 or hash algorithm,
+    truncation, trailing bytes, a wrong-width, duplicated or misordered
+    nonce, a nonce history that disagrees with the encrypted entries, wrong
+    digest or locator widths, an unparseable ciphertext envelope, an
+    out-of-order index, an out-of-range stage or flag, a wrong-width
+    evolution key, a signature that does not verify or a recomputed
+    chain-head/root mismatch raises ValueError. The call never mutates its
+    inputs; on failure nothing is returned and no partial log escapes.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verification_key = _load_ed25519_public(public_key)
+    if not data.startswith(_SIGNED_HYBRID_MAGIC):
+        raise ValueError("not an auditchain signed-hybrid encoding")
+    if len(data) < _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify the signature over the entire body before parsing any of it, so
+    # a forged or corrupted stream never reaches the chain-replay logic.
+    try:
+        verification_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError("signed-hybrid signature does not verify") from error
+    cursor = len(_SIGNED_HYBRID_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal cursor
+        end = cursor + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[cursor:end], "big")
+        cursor = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal cursor
+        length = read_u64(f"{name} length")
+        end = cursor + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = body[cursor:end]
+        cursor = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_HYBRID_VERSION:
+        raise ValueError(f"unsupported signed-hybrid version {version}")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    nonce_count = read_u64("nonce count")
+    nonce_history: list[bytes] = []
+    previous_nonce: bytes | None = None
+    for _ in range(nonce_count):
+        used_nonce = read_blob("nonce")
+        if len(used_nonce) != _NONCE_BYTES:
+            raise ValueError(f"nonce must be {_NONCE_BYTES} bytes")
+        if previous_nonce is not None and used_nonce <= previous_nonce:
+            raise ValueError(
+                "nonces must be distinct and in lexicographic order"
+            )
+        nonce_history.append(used_nonce)
+        previous_nonce = used_nonce
+    count = read_u64("entries count")
+    raw_entries: list[tuple[int, bytes, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        locator = read_blob("entry.locator")
+        raw_entries.append((index, payload, previous_hash, entry_hash, locator))
+    root = read_blob("root")
+    head = read_blob("head")
+    stage = read_u64("stage")
+    evolution_key = read_blob("evolution key")
+    exported = read_u64("exported flag")
+    if cursor != len(body):
+        raise ValueError("trailing bytes before the signed-hybrid signature")
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    if not evolution_key:
+        raise ValueError("evolution key must be non-empty")
+    if stage > 0 and len(evolution_key) != digest_size:
+        raise ValueError(
+            f"evolution key must be {digest_size} bytes after the first evolution"
+        )
+    if exported not in (0, 1):
+        raise ValueError("exported flag must be 0 or 1")
+
+    # Re-derive the whole chain from genesis under the named hash algorithm,
+    # validate each record's locator/nonce, and simultaneously replay the
+    # payloads into a fresh keyed log so every auxiliary structure (find
+    # index, encrypted locator index, nonce history, frontier) is rebuilt
+    # exactly as the normal append / encrypt paths build them. The evolution
+    # key, stage and verifier-exported flag are only installed after the
+    # replay succeeds, so a failure leaves no partially restored log behind.
+    log = AuditLog(key=evolution_key, hash_name=hash_name)
+    previous = bytes(digest_size)
+    for position, (index, payload, recorded_previous, recorded_hash, locator) in enumerate(
+        raw_entries
+    ):
+        if index != position:
+            raise ValueError("entries must occupy indices 0..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {position}")
+        recomputed = entry_digest(
+            position,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {position}")
+        # Classification is driven by the locator, never by the payload: a
+        # plain append() may legitimately store bytes beginning with the
+        # envelope magic, while an encrypted entry always carries a
+        # digest-width locator HMAC.
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+            # _parse_envelope validates the envelope magic, algorithm and
+            # truncation and returns the embedded 12-byte nonce.
+            _algorithm, entry_nonce, _sealed = _parse_envelope(payload)
+            if len(entry_nonce) != _NONCE_BYTES:
+                raise ValueError(
+                    f"encrypted nonce must be {_NONCE_BYTES} bytes"
+                )
+            if entry_nonce in log._used_nonces:
+                raise ValueError("duplicate encrypted nonce in signed-hybrid log")
+            # Replay the same commit encrypt() performs, seeding the nonce
+            # history and encrypted locator index without any encryption key.
+            entry = Entry(
+                index=position,
+                payload=payload,
+                previous_hash=previous,
+                entry_hash=recomputed,
+            )
+            log._entries.append(entry)
+            log._index.setdefault(
+                _locator_digest(payload, hash_name), []
+            ).append(position)
+            log._encrypted_index.setdefault(locator, []).append(position)
+            log._encrypted_locators[position] = locator
+            log._used_nonces.add(entry_nonce)
+            log._head = recomputed
+        else:
+            # Ordinary entry: replay through the normal append path so the
+            # find index and every other structure match a live append.
+            replayed = log.append(payload)
+            if (
+                replayed.index != index
+                or replayed.previous_hash != recorded_previous
+                or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+            ):
+                raise ValueError(
+                    f"entry chain is inconsistent at index {position}"
+                )
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the exported head")
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the exported root")
+    # The declared nonce history must be exactly the nonces of the encrypted
+    # entries: an unpruned log releases no envelope, so anything more or less
+    # is inconsistent state.
+    if log._used_nonces != set(nonce_history):
+        raise ValueError(
+            "nonce history does not match the encrypted entries"
+        )
     log._stage = stage
     log._verifier_exported = bool(exported)
     return log

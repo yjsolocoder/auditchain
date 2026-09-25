@@ -3280,6 +3280,39 @@ python3 -m auditchain
   索引与认证状态。`key` 须为 32 字节 `bytes`，显式 nonce 须为 12 字节
   `bytes`，`data` 只收 `bytes`；类型错抛 `TypeError`，资格、长度、格式、
   认证或状态冲突抛 `ValueError`；导出只读、失败原子，旧接口不变
+- `dump_signed_hybrid(log, private_key)` /
+  `load_signed_hybrid(data, public_key)` — `dump_hybrid` / `load_hybrid`
+  的 Ed25519 签名版本，把一份**构造时带 `key`、未裁剪（`retain_from == 0`）
+  且历史可含 `encrypt` 密文**的前向安全认证日志导出为自证其真的字节流，
+  仅凭**预置信任**的 32 字节 Ed25519 公钥离线验真后恢复出独立、可变的带
+  密钥 `AuditLog`（长度、绝对索引、链头、Merkle 根、`find` /
+  `find_encrypted` 两种检索索引、完整 nonce 历史、演进 stage 与验证材料
+  导出标志均与原日志一致；恢复后旧 nonce 仍被拒绝、新签标签与原件逐字节
+  相同，可照常追加、加密与演进密钥）：字节流以
+  `b"auditchain/signed-hybrid/v1\0"` 开头，随后**严格依次**写 `version`
+  （恒为 `1`，u64）与 `dump_hybrid` 的明文帧
+  `P = B(h) || U(q) || B(nonce1)…B(nonceq) || U(n) || E1…En ||
+  B(root) || B(head) || U(stage) || B(K) || U(x)`（`q` 个 nonce 各 12
+  字节、按字典序排列，每个 `E` 复用 `dump_secure_log` 的
+  `U, B, B, B, B` 记录与 locator 判型，字段含义与宽度规则全部沿用
+  `dump_hybrid`），末尾追加覆盖此前全部字节的 64 字节 Ed25519 签名，不
+  新增签名域也不加密演进密钥（签名只认证来源，帧内明文携带当前演进密钥，
+  字节流须像密钥材料一样保护）。加载**先验签**再解析，复核 nonce 历史
+  （宽度恰 12 字节、互异且字典序、与密文封装恢复的 nonce 集合完全一致）、
+  locator / 摘要宽度、密文封装可解析且 nonce 不重复、索引恰为 `0..n-1`、
+  `stage` / 标志范围与演进密钥宽度，随后从创世零摘要重算链头并重建
+  Merkle 根，与 `head` / `root` 逐项匹配后才以正常 `append` / 加密条目
+  恢复路径重放并原子装入 nonce 历史、`K`、`stage` 与标志。导出只读且
+  确定（同状态同种子两次导出逐字节相同，私钥用后即弃、从不写入字节流）；
+  `log` 不是 `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`，私钥长度非
+  32 或日志已裁剪 / 构造时无 `key`（含不含密文历史均可）抛
+  `ValueError`。`data` 只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`），公钥类型错抛 `TypeError`；公钥非 32 字节，或魔数、
+  版本、非法 UTF-8、未知 / 非固定输出算法、截断、尾随、nonce 宽度 /
+  顺序 / 与密文不一致、摘要 / locator 宽度、封装不可解析、密文 nonce
+  重复、索引顺序、断链、`stage` / 标志范围、演进密钥为空或宽度不符、
+  验签失败、重算链头 / Merkle 根与帧内记录不符均抛 `ValueError`；失败
+  不留半成品，既有导出恢复、签名原文与线格式不变
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

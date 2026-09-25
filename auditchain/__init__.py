@@ -52,6 +52,7 @@ dump_auth / load_auth /
 dump_pruned_auth / load_pruned_auth /
 dump_signed_pruned_auth / load_signed_pruned_auth /
 dump_signed_hybrid / load_signed_hybrid /
+dump_signed_pruned_hybrid / load_signed_pruned_hybrid /
 dump_hybrid / load_hybrid.
 """
 
@@ -136,6 +137,7 @@ __all__ = [
     "dump_signed_auth",
     "dump_signed_hybrid",
     "dump_signed_pruned_auth",
+    "dump_signed_pruned_hybrid",
     "encode_anchored_continuations",
     "encode_audit_batch",
     "encode_audit_receipt",
@@ -179,6 +181,7 @@ __all__ = [
     "load_signed_auth",
     "load_signed_hybrid",
     "load_signed_pruned_auth",
+    "load_signed_pruned_hybrid",
     "merge_anchor_set",
     "merge_rotated_anchor_set",
     "verify_audit_receipt",
@@ -568,6 +571,24 @@ _PRUNED_HYBRID_VERSION = 1
 # be protected like key material.
 _SIGNED_HYBRID_MAGIC = b"auditchain/signed-hybrid/v1\0"
 _SIGNED_HYBRID_VERSION = 1
+
+# Binary framing of dump_signed_pruned_hybrid / load_signed_pruned_hybrid: the
+# Ed25519-signed counterpart of the pruned-hybrid framing — the same pruned,
+# keyed, forward-secure log whose history may contain encrypted entries,
+# including ciphertexts released by the prune, but exported as one
+# self-certifying byte string instead of being sealed symmetrically. The wire
+# form is D || U(version) || P || S: D is the magic, version the u64 envelope
+# version (always 1), P field-by-field the plaintext framing of
+# dump_pruned_hybrid
+# (B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E || B(root) ||
+# B(head) || U(stage) || B(K) || U(x), each Ei a secure-log record with
+# B(locator)) and S the 64-byte Ed25519 signature over every preceding byte;
+# no further signing domain is introduced and no key is encrypted. As with
+# dump_signed_hybrid the signature authenticates the export's origin but not
+# its confidentiality — P carries the live evolution key — so the byte string
+# must be protected like key material.
+_SIGNED_PRUNED_HYBRID_MAGIC = b"auditchain/signed-pruned-hybrid/v1\0"
+_SIGNED_PRUNED_HYBRID_VERSION = 1
 
 # Stages are encoded as 8-byte big-endian integers inside tags.
 _MAX_STAGE = 1 << 64
@@ -12222,6 +12243,416 @@ def load_signed_hybrid(data: Any, public_key: Any) -> AuditLog:
         raise ValueError(
             "nonce history does not match the encrypted entries"
         )
+    log._stage = stage
+    log._verifier_exported = bool(exported)
+    return log
+
+
+def dump_signed_pruned_hybrid(log: Any, private_key: Any) -> bytes:
+    """Export a pruned, keyed log (with encrypt history) as one
+    self-certifying byte string.
+
+    The Ed25519-signed counterpart of :func:`dump_pruned_hybrid`: instead of
+    sealing the framing symmetrically, the export is signed with the 32-byte
+    Ed25519 seed ``private_key`` and verified offline by
+    :func:`load_signed_pruned_hybrid` against the pre-arranged public key.
+    Only an :class:`AuditLog` that has been pruned (``retain_from > 0``) and
+    was **constructed with an authentication key** qualifies; like
+    :func:`dump_pruned_hybrid` and unlike :func:`dump_signed_pruned_auth`,
+    its history may contain entries appended with :meth:`AuditLog.encrypt`,
+    including ciphertexts released by the prune. The framing carries the
+    prune checkpoint, the prefix frontier, the retained entries, the log's
+    complete nonce history (covering every encrypt nonce ever used, even
+    those of released ciphertexts) and the encrypted-locator HMACs of the
+    retained ciphertexts, and the current forward-secure evolution key and
+    stage in the clear, so a fresh process can continue evolving from
+    exactly the same point, but it carries no prune receipts, encryption
+    keys or verifier material beyond the u64 verifier-exported flag.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-pruned-hybrid/v1\\0"`` and then writes, strictly in
+    order, the envelope version (always ``1``) as an unsigned 8-byte
+    big-endian integer, then field-by-field the plaintext framing of
+    :func:`dump_pruned_hybrid` —
+    ``B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E || B(root) ||
+    B(head) || U(stage) || B(K) || U(x)`` — and finally a 64-byte Ed25519
+    signature over every preceding byte. ``F`` is the pruned-log frontier
+    exactly as encoded by :func:`dump_pruned_auth`, ``Q`` the complete nonce
+    history exactly as in :func:`dump_hybrid` and each retained entry of
+    ``E`` the :func:`dump_secure_log` record (``U, B, B, B, B`` with the
+    locator classification). ``U`` is an unsigned 8-byte big-endian integer
+    and ``B(v) = U(len(v)) || v``. No signing domain beyond the signed bytes
+    themselves is introduced and no evolution key is encrypted; the
+    signature authenticates the export's origin, while the framing carries
+    the live evolution key, so the byte string must be protected like
+    verification key material.
+
+    The call is read-only and deterministic: it never mutates the log, and
+    two dumps of logs in the same state signed with the same seed are
+    byte-for-byte identical (Ed25519 signatures are deterministic); the seed
+    is used for the one signature and is never stored, copied into the dump
+    or added as a separate signing input. A non-:class:`AuditLog` value or a
+    non-``bytes`` seed raises TypeError; a seed that is not 32 bytes, or a
+    log that is unpruned or keyless raises ValueError.
+    """
+    if not isinstance(log, AuditLog):
+        raise TypeError("log must be an AuditLog")
+    # Validate the seed before any eligibility check, mirroring
+    # dump_signed_hybrid / dump_signed_pruned_auth; the loaded key signs once
+    # below and is never stored.
+    signing_key = _load_ed25519_seed(private_key)
+    # Same eligibility as dump_pruned_hybrid, minus the symmetric seal: the
+    # framing carries the checkpoint, frontier, live evolution key, stage,
+    # complete nonce history and per-entry locators, so only a pruned log
+    # that was constructed with a key qualifies; encrypt history — including
+    # ciphertexts released by the prune — is exactly what the nonce/locator
+    # fields preserve.
+    if log._retain_from == 0:
+        raise ValueError(
+            "only a pruned log (retain_from > 0) can be dumped as a signed pruned hybrid log"
+        )
+    if log._key is None:
+        raise ValueError(
+            "only a log constructed with an authentication key can be dumped"
+        )
+    hash_name = log._hash_name
+    digest_size = log._digest_size
+    size = len(log)
+    retain_from = log._retain_from
+    root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    parts = [
+        _SIGNED_PRUNED_HYBRID_MAGIC,
+        _encode_u64(_SIGNED_PRUNED_HYBRID_VERSION, "version"),
+        _encode_blob(hash_name.encode("utf-8")),
+        _encode_u64(size, "entries count"),
+        _encode_u64(retain_from, "retain_from"),
+        _encode_blob(log._checkpoint_head),
+        _encode_u64(len(log._frontier), "frontier count"),
+    ]
+    for height in sorted(log._frontier):
+        parts.append(_encode_u64(height, "frontier height"))
+        parts.append(_encode_blob(log._frontier[height]))
+    parts.append(_encode_u64(len(log._used_nonces), "nonce count"))
+    for used_nonce in sorted(log._used_nonces):
+        parts.append(_encode_blob(used_nonce))
+    parts.append(_encode_u64(len(log._entries), "retained entries count"))
+    for entry in log._entries:
+        locator = log._encrypted_locators.get(entry.index, b"")
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(entry.payload))
+        parts.append(_encode_blob(entry.previous_hash))
+        parts.append(_encode_blob(entry.entry_hash))
+        parts.append(_encode_blob(locator))
+    parts.append(_encode_blob(root))
+    parts.append(_encode_blob(head))
+    parts.append(_encode_u64(log._stage, "stage"))
+    parts.append(_encode_blob(log._key))
+    parts.append(_encode_u64(1 if log._verifier_exported else 0, "exported flag"))
+    body = b"".join(parts)
+    # Sign every byte written so far; the signature is the trailing field, so
+    # the wire format verifies without knowing any inner framing offset.
+    signature = signing_key.sign(body)
+    if len(signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    return body + signature
+
+
+def load_signed_pruned_hybrid(data: Any, public_key: Any) -> AuditLog:
+    """Restore an independent, mutable keyed :class:`AuditLog` from
+    :func:`dump_signed_pruned_hybrid`, verifying entirely offline.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError) and ``public_key`` must be the 32-byte
+    Ed25519 public key pre-arranged with the exporter. After the magic
+    ``b"auditchain/signed-pruned-hybrid/v1\\0"`` the stream must contain,
+    strictly in order, the u64 envelope version (only ``1`` is supported),
+    field-by-field the plaintext framing of :func:`dump_pruned_hybrid` —
+    ``B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E || B(root) ||
+    B(head) || U(stage) || B(K) || U(x)`` — and a final 64-byte Ed25519
+    signature, with no truncation or trailing bytes.
+
+    Verification happens before any state is built: the trailing signature is
+    checked against every preceding byte with ``public_key``; only then is
+    the stream parsed and re-checked exactly like the decrypted framing of
+    :func:`load_pruned_hybrid`: ``r`` must satisfy ``0 < r <= n``,
+    ``checkpoint`` must have the digest width, ``F`` must list one
+    ``U(height) || B(digest)`` pair per set bit of ``r`` in strictly ascending
+    order, ``Q`` must carry the complete lifetime nonce history (every blob
+    exactly 12 bytes, the nonces distinct and in lexicographic order), and
+    ``E`` must carry exactly ``n - r`` records at indices ``r..n-1`` in order,
+    each in the :func:`dump_secure_log` field order (``U, B, B, B, B``) whose
+    trailing ``B(locator)`` is empty for a plain entry and the digest-width
+    encrypted-locator HMAC for an encrypted one; every chain digest must have
+    the width of the named hash algorithm, ``K`` (the current evolution key)
+    must be non-empty — at stage 0 it is the construction key, which may have
+    any non-zero length, and after any evolution it is one hash-digest wide —
+    and ``x`` (the verifier-exported flag) must be ``0`` or ``1``. Under the
+    named ``hash_name`` every :func:`entry_digest` and predecessor link is
+    then recomputed starting from the checkpoint, and the resulting chain
+    head and the Merkle root rebuilt from the frontier and the retained
+    entries must match ``head`` / ``root``. Classification is driven by the
+    locator, never the payload: a non-empty locator's payload must parse as
+    an encrypted-entry envelope, whose 12-byte nonce is recovered, must not
+    repeat among the retained ciphertexts and must be covered by the complete
+    nonce history, which may additionally hold nonces of ciphertexts released
+    by the prune. Only then is a fresh keyed :class:`AuditLog` built with
+    ``retain_from == r``, the checkpoint and frontier installed, the complete
+    nonce history restored and the retained payloads replayed through the
+    normal append / encrypted-entry recovery path, with ``K`` as the current
+    key, ``stage`` and the exported flag installed, so its length, absolute
+    indices, retain point, head, Merkle roots and proofs, find index,
+    encrypted locator index, nonce history and stage are exactly those of the
+    dumped log — an already-exported log cannot export stage-0 verifier
+    material again, a previously used nonce is still rejected and a freshly
+    minted tag is byte-identical to the original's in the same state — and
+    forward-secure evolution continues from the same point. The result is
+    fully mutable and shares no state with the caller's buffers.
+
+    A non-``bytes`` ``data`` or public key raises TypeError; a public key
+    that is not 32 bytes, a bad magic, version, UTF-8 or hash algorithm,
+    truncation, trailing bytes, an out-of-range retain point, wrong digest or
+    locator widths, a frontier that is not exactly the set bits of ``r``, a
+    wrong-width, duplicated or misordered history nonce, an entry count that
+    disagrees with ``n - r``, an out-of-order index, an unparseable
+    ciphertext envelope, a duplicate retained ciphertext nonce, a retained
+    ciphertext nonce missing from the history, an out-of-range stage or flag,
+    a wrong-width evolution key, a signature that does not verify or a
+    recomputed chain-head/root mismatch raises ValueError. The call never
+    mutates its inputs; on failure nothing is returned and no partial log
+    escapes.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    verification_key = _load_ed25519_public(public_key)
+    if not data.startswith(_SIGNED_PRUNED_HYBRID_MAGIC):
+        raise ValueError("not an auditchain signed-pruned-hybrid encoding")
+    if len(data) < _ED25519_SIGNATURE_BYTES:
+        raise ValueError("truncated encoding: missing signature")
+    body = data[:-_ED25519_SIGNATURE_BYTES]
+    signature = data[-_ED25519_SIGNATURE_BYTES:]
+    # Verify the signature over the entire body before parsing any of it, so
+    # a forged or corrupted stream never reaches the chain-replay logic.
+    try:
+        verification_key.verify(signature, body)
+    except InvalidSignature as error:
+        raise ValueError(
+            "signed-pruned-hybrid signature does not verify"
+        ) from error
+    cursor = len(_SIGNED_PRUNED_HYBRID_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal cursor
+        end = cursor + _U64_BYTES
+        if end > len(body):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(body[cursor:end], "big")
+        cursor = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal cursor
+        length = read_u64(f"{name} length")
+        end = cursor + length
+        if end > len(body):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob_value = body[cursor:end]
+        cursor = end
+        return blob_value
+
+    version = read_u64("version")
+    if version != _SIGNED_PRUNED_HYBRID_VERSION:
+        raise ValueError(
+            f"unsupported signed-pruned-hybrid version {version}"
+        )
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    digest_size = _digest_size(hash_name)
+    size = read_u64("entries count")
+    retain_from = read_u64("retain_from")
+    checkpoint = read_blob("checkpoint")
+    if not 0 < retain_from <= size:
+        raise ValueError(
+            "retain_from must satisfy 0 < retain_from <= entries count"
+        )
+    if len(checkpoint) != digest_size:
+        raise ValueError(f"checkpoint must be {digest_size} bytes")
+    frontier_count = read_u64("frontier count")
+    frontier: dict[int, bytes] = {}
+    previous_height = -1
+    for _ in range(frontier_count):
+        height = read_u64("frontier height")
+        digest = read_blob("frontier digest")
+        if height <= previous_height:
+            raise ValueError("frontier heights must be in strictly ascending order")
+        if len(digest) != digest_size:
+            raise ValueError(f"frontier digest must be {digest_size} bytes")
+        frontier[height] = digest
+        previous_height = height
+    expected_heights = [
+        height for height in range(64) if (retain_from >> height) & 1
+    ]
+    if sorted(frontier) != expected_heights:
+        raise ValueError(
+            "frontier heights must be exactly the set bits of retain_from"
+        )
+    # Complete lifetime nonce history: one B(nonce) length-prefixed blob per
+    # nonce, each carrying exactly 12 bytes, in strictly ascending
+    # lexicographic order, which also rules out duplicates.
+    nonce_count = read_u64("nonce count")
+    nonce_history: list[bytes] = []
+    previous_nonce: bytes | None = None
+    for _ in range(nonce_count):
+        used_nonce = read_blob("nonce")
+        if len(used_nonce) != _NONCE_BYTES:
+            raise ValueError(f"nonce must be {_NONCE_BYTES} bytes")
+        if previous_nonce is not None and used_nonce <= previous_nonce:
+            raise ValueError(
+                "nonces must be distinct and in lexicographic order"
+            )
+        nonce_history.append(used_nonce)
+        previous_nonce = used_nonce
+    nonce_history_set = set(nonce_history)
+    count = read_u64("retained entries count")
+    if count != size - retain_from:
+        raise ValueError(
+            "retained entries count must equal entries count minus retain_from"
+        )
+    raw_entries: list[tuple[int, bytes, bytes, bytes, bytes]] = []
+    for _ in range(count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        locator = read_blob("entry.locator")
+        raw_entries.append((index, payload, previous_hash, entry_hash, locator))
+    root = read_blob("root")
+    head = read_blob("head")
+    stage = read_u64("stage")
+    evolution_key = read_blob("evolution key")
+    exported = read_u64("exported flag")
+    if cursor != len(body):
+        raise ValueError(
+            "trailing bytes before the signed-pruned-hybrid signature"
+        )
+    if len(root) != digest_size:
+        raise ValueError(f"root must be {digest_size} bytes")
+    if len(head) != digest_size:
+        raise ValueError(f"head must be {digest_size} bytes")
+    if not evolution_key:
+        raise ValueError("evolution key must be non-empty")
+    if stage > 0 and len(evolution_key) != digest_size:
+        raise ValueError(
+            f"evolution key must be {digest_size} bytes after the first evolution"
+        )
+    if exported not in (0, 1):
+        raise ValueError("exported flag must be 0 or 1")
+
+    # Re-derive the retained chain from the checkpoint under the named hash
+    # algorithm, and simultaneously replay the payloads into a fresh keyed
+    # log with the checkpoint, frontier and retain point installed, so every
+    # auxiliary structure (find index, encrypted locator index, nonce
+    # history, frontier) is rebuilt exactly as the normal append / encrypt
+    # paths build it. The complete nonce history is seeded before the replay
+    # (covering nonces of ciphertexts released by the prune); the evolution
+    # key, stage and verifier-exported flag are only installed after the
+    # replay succeeds, so a failure leaves no partially restored log behind.
+    log = AuditLog(key=evolution_key, hash_name=hash_name)
+    log._retain_from = retain_from
+    log._checkpoint_head = checkpoint
+    log._frontier = dict(frontier)
+    log._head = checkpoint
+    log._used_nonces = set(nonce_history_set)
+    previous = checkpoint
+    seen_nonces: set[bytes] = set()
+    for position, (index, payload, recorded_previous, recorded_hash, locator) in enumerate(
+        raw_entries
+    ):
+        expected_index = retain_from + position
+        if index != expected_index:
+            raise ValueError("entries must occupy indices r..n-1 in order")
+        if len(recorded_previous) != digest_size:
+            raise ValueError(
+                f"entry.previous_hash must be {digest_size} bytes"
+            )
+        if len(recorded_hash) != digest_size:
+            raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+        if recorded_previous != previous:
+            raise ValueError(f"entry chain is broken at index {expected_index}")
+        recomputed = entry_digest(
+            expected_index,
+            previous,
+            payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, recorded_hash):
+            raise ValueError(f"entry digest mismatch at index {expected_index}")
+        # Classification is driven by the locator, never by the payload; the
+        # recovered envelope nonce must be covered by the complete lifetime
+        # history (which may also hold nonces of released ciphertexts) and
+        # unique among the retained ciphertexts.
+        if locator:
+            if len(locator) != digest_size:
+                raise ValueError(
+                    f"encrypted locator must be {digest_size} bytes"
+                )
+            _algorithm, entry_nonce, _sealed = _parse_envelope(payload)
+            if len(entry_nonce) != _NONCE_BYTES:
+                raise ValueError(
+                    f"encrypted nonce must be {_NONCE_BYTES} bytes"
+                )
+            if entry_nonce not in nonce_history_set:
+                raise ValueError(
+                    "retained ciphertext nonce is missing from the nonce history"
+                )
+            if entry_nonce in seen_nonces:
+                raise ValueError(
+                    "duplicate encrypted nonce among retained entries"
+                )
+            seen_nonces.add(entry_nonce)
+            # Replay the same commit encrypt() performs, seeding the
+            # encrypted locator index without any encryption key.
+            entry = Entry(
+                index=expected_index,
+                payload=payload,
+                previous_hash=previous,
+                entry_hash=recomputed,
+            )
+            log._entries.append(entry)
+            log._index.setdefault(
+                _locator_digest(payload, hash_name), []
+            ).append(expected_index)
+            log._encrypted_index.setdefault(locator, []).append(expected_index)
+            log._encrypted_locators[expected_index] = locator
+            log._used_nonces.add(entry_nonce)
+            log._head = recomputed
+        else:
+            # Ordinary entry: replay through the normal append path so the
+            # find index and every other structure match a live append.
+            replayed = log.append(payload)
+            if (
+                replayed.index != index
+                or replayed.previous_hash != recorded_previous
+                or not hmac.compare_digest(replayed.entry_hash, recorded_hash)
+            ):
+                raise ValueError(
+                    f"entry chain is inconsistent at index {expected_index}"
+                )
+        previous = recomputed
+    if not hmac.compare_digest(previous, head):
+        raise ValueError("recomputed chain head does not match the exported head")
+    if not hmac.compare_digest(log.merkle_root(), root):
+        raise ValueError("recomputed Merkle root does not match the exported root")
     log._stage = stage
     log._verifier_exported = bool(exported)
     return log

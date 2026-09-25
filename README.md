@@ -375,6 +375,60 @@ u64），证明元组先写计数。`encode_inclusion_proof` / `encode_consisten
 `ValueError`。解码精确消费全部字节，返回冻结对象；编解码只读且确定，同一凭据
 重复编码、解码后重编码都逐字节相同，交回既有核验入口的结论不变。
 
+### Merkle frontier 冻结凭据（可持久化）
+
+裁剪检查点依赖的 Merkle frontier 此前只在导出恢复线格式内部编码；冻结凭据
+`MerkleFrontier` 把它提升为公开只读制品：覆盖前缀的算法名、前缀尺寸与逐对
+`(高度, 子树根摘要)` 子树对，使 frontier 可以落盘、跨进程恢复并直接交回
+`rebuild_merkle_root` 重建完整快照根：
+
+```python
+frontier = log.merkle_frontier()          # size 默认当前长度
+data = encode_merkle_frontier(frontier)   # bytes，可写文件/发网络
+restored = decode_merkle_frontier(data)   # 冻结 MerkleFrontier，字段与原件相等
+restored == frontier                      # True：按全部字段相等
+encode_merkle_frontier(restored) == data  # True：解码后重编码逐字节相同
+
+# 裁剪后：frontier 覆盖已释放前缀 [0, r)，保留段的 entry_hash 元组拼上即可
+# 重建完整快照根，与签名检查点的根比对即确认保留段接在已释放前缀之后
+receipt = log.seal(r)
+log.prune(r, receipt)
+frontier = log.merkle_frontier(r)            # 覆盖已释放前缀 [0, r)
+root = rebuild_merkle_root(frontier, tuple(e.entry_hash for e in log))
+root == log.merkle_root()                   # True：保留段接在已释放前缀之后
+```
+
+`MerkleFrontier` 不可变、支持位置构造、按全部三个字段相等，字段依次为
+`hash_name`（摘要算法名）、`size`（覆盖前缀尺寸）与 `subtrees`（子树对元组）。
+子树对按高度升序存放，每对为高度整数加该子树根摘要，且高度恰为 `size` 的置位
+高度——即精确覆盖 `[0, size)` 的最大完美子树分解；`size` 须为非 `bool`、非负
+且小于 `2**64` 的整数，每个子树根摘要只接受精确的 `bytes`（拒绝 `bytearray` /
+`memoryview`）且须与算法摘要等宽。字段类型错抛 `TypeError`；未知算法、摘要
+宽度不符、高度为负、非严格升序或与 `size` 置位不符、`size` 为负或超出 u64
+范围抛 `ValueError`。
+
+`merkle_frontier(size=None)` 是 `AuditLog` 的只读捕获入口：`size` 省略时取当前
+长度，返回覆盖前 `size` 条的冻结 `MerkleFrontier`；已裁剪前缀内的快照不可重建，
+`size` 越界或快照不可重建抛 `ValueError`，类型错抛 `TypeError`。
+
+`rebuild_merkle_root(frontier, retained_entry_hashes)` 把凭据的子树与保留段
+`entry_hash` 元组按生成顺序折叠，返回拼上保留段后的完整快照根；调用方拿它与
+签名检查点的根比对，即可确认保留段接在已释放前缀之后。`frontier` 必须是
+`MerkleFrontier`（并复验全部字段），`retained_entry_hashes` 必须是 `bytes`
+摘要元组；类型错抛 `TypeError`，条目摘要为空或宽度不符抛 `ValueError`。调用
+只读且确定。
+
+字节流以魔数 `b"auditchain/frontier/v1\0"` 开头，后接恒为 1 的 `version`
+（u64），随后严格按凭据字段顺序写内容，不得省略、换序或附加：`hash_name` 的
+UTF-8 blob、`size`（u64）、子树对计数（u64），再逐对写高度（u64）与摘要
+blob。整数为 8 字节无符号大端，blob 为 u64 长度前缀加原始字节（零长度也是全零
+u64）。`encode_merkle_frontier` 只接受 `MerkleFrontier`（其他类型，或绕过冻结
+构造器写入的字段类型错，抛 `TypeError`，并复验全部字段）；
+`decode_merkle_frontier` 只接受精确的 `bytes`（拒绝 `bytearray` /
+`memoryview`，抛 `TypeError`），魔数或版本不符、截断、尾随字节、长度或整数
+越界、非法 UTF-8 及上述构造期结构问题均抛 `ValueError`。解码精确消费全部字节，
+返回冻结对象；编解码只读且确定，同一凭据重复编码、解码后重编码都逐字节相同。
+
 ### 可信签名快照检查点（Ed25519）
 
 `sign_root` 用日志持有者按次提供的 Ed25519 私钥种子为某个快照（Merkle 根
@@ -2604,6 +2658,17 @@ python3 -m auditchain
   `verify_consistency` 判定。字段类型错抛 `TypeError`，未知算法、宽度不符、
   尺寸为负或逆序、超出 u64 范围抛 `ValueError`；规范二进制编解码由
   `encode_consistency_proof` / `decode_consistency_proof` 提供
+- `MerkleFrontier(hash_name, size, subtrees)` — 不可变的 Merkle frontier
+  冻结凭据，把裁剪检查点依赖的前缀 frontier（覆盖前缀的算法名、尺寸与
+  完美子树分解）绑成一件公开只读制品，按全部三个字段相等、支持位置构造；
+  `size` 为非 `bool`、非负且小于 `2**64` 的整数，`subtrees` 为按高度严格
+  升序的 `(高度, 子树根摘要)` 对元组，高度恰为 `size` 的置位高度（精确覆盖
+  `[0, size)`），每个子树根摘要只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）且与算法摘要等宽。字段类型错抛 `TypeError`，未知算法、
+  摘要宽度不符、高度为负或非升序、与 `size` 置位不符、`size` 为负或超出
+  u64 范围抛 `ValueError`；规范二进制编解码由 `encode_merkle_frontier` /
+  `decode_merkle_frontier` 提供，拼上保留段重建完整快照根由
+  `rebuild_merkle_root` 提供
 - `SignedRoot(version, hash_name, size, root, head, signature)` — 不可变的 Ed25519
   可信签名快照检查点，按全部字段相等、支持位置构造；`version` 恒为 `1`，`root`
   为前 `size` 条的 Merkle 根，`head` 为该前缀末条摘要（空前缀为该摘要宽度的零
@@ -2761,6 +2826,10 @@ python3 -m auditchain
     `verify_signed_stage_verifier` 凭预信任公钥验真，恢复出的 `verifier` 可直接
     交给 `verify_auth_stage`，签名只认证来源、不加密其中密钥
   - `merkle_root(size=None)` — 前 `size` 条（默认全部）的前缀 Merkle 根；追加不影响已有前缀根
+  - `merkle_frontier(size=None)` — 只读捕获前 `size` 条（默认当前长度）的冻结
+    `MerkleFrontier` 凭据：算法名、覆盖前缀尺寸与逐对 `(高度, 子树根摘要)` 子树对
+    （高度恰为 `size` 的置位高度、按升序存放）；`size` 越界或快照已裁剪抛
+    `ValueError`，类型错抛 `TypeError`；调用只读，不改变日志任何状态
   - `inclusion_proof(index, size=None)` — 叶到根的兄弟摘要不可变元组
   - `batch_inclusion_proof(indices, size=None)` — 为大量条目合并出的紧凑批量
     包含证明，返回 `(indices, proof)`：`indices` 为去重并按绝对索引升序排列的
@@ -2852,6 +2921,13 @@ python3 -m auditchain
   （规则同 `append`）。入参不是 `Entry` 或 `key`/字段类型非法抛 `TypeError`；
   `key` 长度非 32、封装魔数不符或截断、算法号未知、摘要长度不符、`entry_hash`
   不符、密钥错误或 AEAD 认证失败抛 `ValueError`；调用只读，不改变条目或日志
+- `rebuild_merkle_root(frontier, retained_entry_hashes)` — 把冻结
+  `MerkleFrontier` 凭据的子树与保留段 `entry_hash` 元组按生成顺序折叠，返回
+  拼上保留段后的完整快照根；调用方拿它与签名检查点的根比对，即可确认保留段
+  接在已释放前缀之后，无需持有任何已释放 payload。`frontier` 必须是
+  `MerkleFrontier`（字段同样复验），`retained_entry_hashes` 必须是精确
+  `bytes` 摘要元组；类型错抛 `TypeError`，条目摘要为空或宽度与凭据算法不符
+  抛 `ValueError`；调用只读，不改变凭据
 - `verify_inclusion(entry_hash, index, size, root, proof, *, hash_name="sha256")` — 只凭条目摘要、快照大小与根摘要验证包含证明，无需持有日志
 - `verify_batch_inclusion(indices, entry_hashes, size, root, proof, *, hash_name="sha256")` —
   只凭所选条目摘要、快照大小与根摘要离线验证 `batch_inclusion_proof` 的紧凑批量
@@ -3467,6 +3543,17 @@ python3 -m auditchain
   `ValueError`；证明节点数与两尺寸是否相称、能否连起两根由 `verify_consistency`
   判定（节点数不符抛 `ValueError`，内容不符返回 `False`），内容不符的凭据仍
   照常往返
+- `encode_merkle_frontier(credential)` / `decode_merkle_frontier(data)` —
+  Merkle frontier 冻结凭据 `MerkleFrontier` 的规范二进制编码与解码：魔数
+  `b"auditchain/frontier/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据
+  字段顺序写 hash_name 的 UTF-8 blob、size、子树对计数及逐对高度（u64）与
+  子树根摘要 blob；尺寸、计数与高度为 u64 大端，其余为 u64 长度前缀 blob。
+  解码精确消费全部字节，恢复对象冻结且按全部字段与原件相等、重编码逐字节
+  相同，可直接交回 `rebuild_merkle_root` 跨进程重建完整快照根。前者只接受
+  `MerkleFrontier`，后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；非对应类型或绕过冻结构造器写入的字段类型错抛 `TypeError`，
+  魔数或版本不符、截断、尾随字节、长度或整数越界、非法 UTF-8、未知算法、
+  摘要宽度不符、高度取值或顺序非法、与 `size` 置位不符抛 `ValueError`
 - `dump_log(log, private_key)` / `load_log(data, public_key)` — 完整日志状态的
   签名导出与离线恢复，使一份完整、未裁剪、无认证、无加密历史的日志可落盘、跨进程
   恢复为独立、可变的普通无密钥 `AuditLog`：字节流为

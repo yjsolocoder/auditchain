@@ -2255,7 +2255,9 @@ restored.auth(5)                       # 重启后继续演进
   `inclusion_proof(i, …)` 对已裁剪索引抛 `ValueError`
 - `verify()` 从创世摘要（裁剪后从检查点）开始校验持有的链段；需要定位具体问题时用
   `verify_report()`，它返回不可变 `IntegrityReport`，按期望绝对索引升序列出每条不匹配，
-  并在末尾核对链头（重写最后一条也无法蒙混过关）
+  并在末尾核对链头（重写最后一条也无法蒙混过关）；诊断结论可经
+  `encode_integrity_report` / `decode_integrity_report` 编码为规范字节落盘、
+  跨进程恢复，恢复对象按全部字段与原件相等、结论不变
 - 保留点及之后任意快照的 `merkle_root`、`inclusion_proof`、`consistency_proof`
   重建结果与未裁剪日志相同；完全落在已裁剪前缀内的快照无法重建，抛 `ValueError`
   （空快照 `size=0` 是内容无关常量，始终可用）
@@ -2512,7 +2514,8 @@ python3 -m auditchain
 - `IntegrityReport(ok, issues)` — 不可变的链校验报告，按字段相等、支持位置构造；
   `issues` 仅含 `IntegrityIssue`，`ok` 当且仅当 `issues` 为空。问题按期望绝对索引升序，
   同一位置依次为 `"index"`、`"previous_hash"`、`"entry_hash"`，`("head", None)` 只能在末尾；
-  顺序或 `ok`/`issues` 不一致抛 `ValueError`，类型非法抛 `TypeError`
+  顺序或 `ok`/`issues` 不一致抛 `ValueError`，类型非法抛 `TypeError`；规范二进制编解码由
+  `encode_integrity_report` / `decode_integrity_report` 提供
 - `GENESIS_HASH` — `bytes(32)` 全零起始前驱摘要（sha256 创世前驱；其他宽度日志用其自身 `digest_size` 个零）
 - `AuditLog(*, key=None, hash_name="sha256")` — 传入非空 `bytes` 类型 `key` 开启前向安全认证，
   省略则为无密钥模式；`key` 只接受 `bytes`（`bytearray` / `memoryview` 抛 `TypeError`），
@@ -3151,6 +3154,23 @@ python3 -m auditchain
   （拒绝 `bytearray` / `memoryview`）；魔数、版本、结论位非 0/1、成功却带
   位置或问题码、失败却缺问题码、问题码非法、截断、尾随、blob 长度越界或非法
   UTF-8 抛 `ValueError`；解码返回字段相等的冻结报告，重编码逐字节相同
+- `encode_integrity_report(report)` / `decode_integrity_report(data)` —
+  链校验完整性报告 `IntegrityReport` 的规范二进制编码与解码，使诊断结论可落盘、
+  跨进程恢复且结论不变（编解码只读且确定，不新增签名原文，既有链校验、核验与
+  诊断入口不变）：字节流严格为
+  `D || U(1) || U(v) || U(n) || (B(c) || U(i))…`，其中
+  `D = b"auditchain/integrity-report/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`（零长 blob 也写全零 u64）；`v` 为结论位（成功 0、
+  失败 1），`n` 为问题项计数，随后按报告次序逐项写问题码 `c` 的 UTF-8 blob
+  （取值限 `"index"` / `"previous_hash"` / `"entry_hash"` / `"head"`）与绝对
+  位置 `i`（无位置的 `"head"` 项写 `0`）；问题按绝对索引升序，同一位置沿用
+  `"index"`、`"previous_hash"`、`"entry_hash"` 次序，`"head"` 项只能在最后。
+  前者只收 `IntegrityReport`（其他类型或绕过冻结构造器写入的字段类型错抛
+  `TypeError`，问题码非法、位置与码不配对、顺序不对或位置超出 u64 范围抛
+  `ValueError`），后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`）；
+  魔数、版本、结论位非 0/1、成功却带问题项、失败却缺问题码、问题码非法、
+  位置与码不配对、顺序不对、截断、尾随、blob 长度越界或非法 UTF-8 抛
+  `ValueError`；解码返回字段相等的冻结报告，重编码逐字节相同
 - `AnchoredContinuationChain(receipts, start, end)` — 冻结的锚定续接链包，
   把非空 `SignedAuthAuditContinuation` tuple 与首尾两个 `SignedRoot` 锚点
   绑为一件可持久化制品；支持位置/关键字构造、按全部三字段相等（可哈希）；

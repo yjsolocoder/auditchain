@@ -40,6 +40,7 @@ encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
 encode_continuation_chain_report / decode_continuation_chain_report /
+encode_integrity_report / decode_integrity_report /
 encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
@@ -111,6 +112,7 @@ __all__ = [
     "decode_auth_batch",
     "decode_continuations",
     "decode_continuation_chain_report",
+    "decode_integrity_report",
     "decode_prune_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
@@ -149,6 +151,7 @@ __all__ = [
     "encode_auth_batch",
     "encode_continuations",
     "encode_continuation_chain_report",
+    "encode_integrity_report",
     "encode_prune_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
@@ -424,6 +427,17 @@ _CONTINUATION_CHAIN_VERSION = 1
 # diagnosis, and introduces no new signing message.
 _CHAIN_REPORT_MAGIC = b"auditchain/chain-report/v1\0"
 _CHAIN_REPORT_VERSION = 1
+
+# Binary framing of encode_integrity_report / decode_integrity_report: a
+# fixed magic, then the envelope version as a u64 (always 1), the verdict
+# as a u64 (0 success, 1 failure), the issue count as a u64 and, per issue
+# in report order, the issue code as a u64-length-prefixed UTF-8 blob and
+# the absolute position as a u64 (0 for the index-less "head" issue), in
+# that strict order and with nothing else. It carries no signatures, only
+# the frozen chain-verification diagnosis, and introduces no new signing
+# message.
+_INTEGRITY_REPORT_MAGIC = b"auditchain/integrity-report/v1\0"
+_INTEGRITY_REPORT_VERSION = 1
 
 # Binary framing of encode_anchored_continuations /
 # decode_anchored_continuations: a fixed magic, then the envelope version as
@@ -8394,6 +8408,154 @@ def decode_continuation_chain_report(data: Any) -> ContinuationChainReport:
             "'rotation_link'"
         )
     return ContinuationChainReport(False, index, code)
+
+
+def encode_integrity_report(report: Any) -> bytes:
+    """Encode an :class:`IntegrityReport` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/integrity-report/v1\\0"``, followed strictly, in this
+    fixed order, by the u64 envelope version (always 1), the verdict, the
+    issue count and one code/position pair per issue — nothing may be
+    omitted, reordered or appended, and no signature is carried. Every
+    integer is an unsigned 8-byte big-endian value and every code is a
+    u64-length-prefixed UTF-8 blob (a zero length is an all-zero u64).
+    The verdict is ``0`` for success and ``1`` for failure; each issue
+    writes the UTF-8 bytes of its code — one of ``"index"``,
+    ``"previous_hash"``, ``"entry_hash"`` and ``"head"`` — followed by
+    its absolute position as a u64, the index-less ``"head"`` issue
+    writing position ``0``. Issues appear in report order: ascending
+    absolute index, the canonical code order at one position and the
+    trailing ``"head"`` issue last.
+
+    ``report`` must be an :class:`IntegrityReport` — anything else
+    raises TypeError; fields written with wrong types by bypassing the
+    frozen constructor (``object.__setattr__``) likewise raise TypeError,
+    because every field, including each nested issue, is re-validated
+    through the constructor. An illegal issue code, a code/position
+    mismatch, a broken issue order or a position outside the u64 range
+    raises ValueError. The call is read-only and deterministic: it never
+    mutates the report, and re-encoding a decoded report reproduces the
+    original bytes exactly, so a chain-verification diagnosis can be
+    landed on disk and restored in another process with the same verdict
+    and issues.
+    """
+    if not isinstance(report, IntegrityReport):
+        raise TypeError("report must be an IntegrityReport")
+    # Re-validate every field even when the frozen constructor was
+    # bypassed with object.__setattr__, so corrupted fields raise exactly
+    # as the constructor would: TypeError for wrong types, ValueError for
+    # illegal values, an ok/issues mismatch or a broken issue order. Each
+    # issue is rebuilt as well, so a corrupted IntegrityIssue raises the
+    # same way instead of slipping past the container's isinstance check.
+    if not isinstance(report.issues, tuple):
+        raise TypeError("issues must be a tuple")
+    issues = tuple(
+        IntegrityIssue(issue.code, issue.index)
+        if isinstance(issue, IntegrityIssue)
+        else issue
+        for issue in report.issues
+    )
+    checked = IntegrityReport(report.ok, issues)
+    parts = [
+        _INTEGRITY_REPORT_MAGIC,
+        _encode_u64(_INTEGRITY_REPORT_VERSION, "version"),
+        _encode_u64(0 if checked.ok else 1, "verdict"),
+        _encode_u64(len(checked.issues), "issues count"),
+    ]
+    for issue in checked.issues:
+        parts.append(_encode_blob(issue.code.encode("utf-8")))
+        parts.append(
+            _encode_u64(
+                issue.index if issue.index is not None else 0, "issue index"
+            )
+        )
+    return b"".join(parts)
+
+
+def decode_integrity_report(data: Any) -> IntegrityReport:
+    """Decode bytes produced by :func:`encode_integrity_report`.
+
+    ``data`` must be exactly ``bytes`` (anything else, including
+    ``bytearray`` and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/integrity-report/v1\\0"`` it must contain, strictly in
+    order, the u64 version (only ``1`` is supported), the u64 verdict
+    (``0`` success, ``1`` failure), the u64 issue count and, per issue,
+    the u64-length-prefixed UTF-8 code blob and the u64 position,
+    consumed whole with no trailing bytes. A success verdict must carry
+    a zero issue count and a failure verdict at least one issue; every
+    code must be one of ``"index"``, ``"previous_hash"``,
+    ``"entry_hash"`` and ``"head"``, the ``"head"`` issue must carry
+    position ``0`` and may only be the final issue, and indexed issues
+    must appear in ascending position order with the canonical code
+    order at one position. A bad magic or version, a verdict other than
+    0/1, a success/failure count mismatch, truncation, trailing bytes,
+    an oversized blob length, invalid UTF-8, an unknown code, a
+    code/position mismatch or a broken issue order raises ValueError.
+
+    The returned object is a frozen :class:`IntegrityReport` whose
+    fields equal the originally encoded report's; re-encoding it
+    reproduces the original bytes exactly, and its verdict is the same
+    before and after the round trip.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_INTEGRITY_REPORT_MAGIC):
+        raise ValueError("not an auditchain integrity-report encoding")
+    offset = len(_INTEGRITY_REPORT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _INTEGRITY_REPORT_VERSION:
+        raise ValueError(f"unsupported integrity-report version {version}")
+    verdict = read_u64("verdict")
+    if verdict not in (0, 1):
+        raise ValueError(f"integrity-report verdict must be 0 or 1, got {verdict}")
+    count = read_u64("issues count")
+    issues = []
+    for _ in range(count):
+        raw_code = read_blob("issue code")
+        try:
+            code = raw_code.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("issue code is not valid UTF-8") from error
+        if code not in _ISSUE_CODES:
+            raise ValueError(
+                f"unknown issue code {code!r}; expected one of "
+                f"'index', 'previous_hash', 'entry_hash', 'head'"
+            )
+        position = read_u64("issue index")
+        if code == _ISSUE_HEAD:
+            if position != 0:
+                raise ValueError("a 'head' issue must carry position 0")
+            issues.append(IntegrityIssue(code, None))
+        else:
+            issues.append(IntegrityIssue(code, position))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the integrity report")
+    if verdict == 0 and issues:
+        raise ValueError("a successful integrity report must carry no issues")
+    if verdict == 1 and not issues:
+        raise ValueError("a failed integrity report must carry at least one issue")
+    return IntegrityReport(verdict == 0, tuple(issues))
 
 
 def inspect_anchored_continuations(

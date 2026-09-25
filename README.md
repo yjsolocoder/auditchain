@@ -3313,6 +3313,44 @@ python3 -m auditchain
   重复、索引顺序、断链、`stage` / 标志范围、演进密钥为空或宽度不符、
   验签失败、重算链头 / Merkle 根与帧内记录不符均抛 `ValueError`；失败
   不留半成品，既有导出恢复、签名原文与线格式不变
+- `dump_signed_pruned_hybrid(log, private_key)` /
+  `load_signed_pruned_hybrid(data, public_key)` —
+  `dump_pruned_hybrid` / `load_pruned_hybrid` 的 Ed25519 签名版本，也是
+  `dump_signed_hybrid` / `load_signed_hybrid` 的已裁剪对应物，把一份**构造时
+  带 `key`、已裁剪（`retain_from > 0`）且历史可含 `encrypt` 密文**（含被
+  裁剪释放的密文）的前向安全认证日志导出为自证其真的字节流，仅凭**预置
+  信任**的 32 字节 Ed25519 公钥离线验真后恢复出独立、可变的带密钥
+  `AuditLog`（长度、绝对索引、`retain_from`、链头、完整 Merkle 根与包含
+  证明、`find` / `find_encrypted` 两种检索索引、完整 nonce 历史、演进
+  stage 与验证材料导出标志均与原日志一致；恢复后旧 nonce 仍被拒绝、新签
+  标签与原件逐字节相同，可照常追加、加密、再裁剪与演进密钥）：字节流以
+  `b"auditchain/signed-pruned-hybrid/v1\0"` 开头，随后**严格依次**写
+  `version`（恒为 `1`，u64）与 `dump_pruned_hybrid` 的明文帧
+  `P = B(h) || U(n) || U(r) || B(checkpoint) || F || Q || E ||
+  B(root) || B(head) || U(stage) || B(K) || U(x)`（`F` 沿用
+  `dump_pruned_auth` 的 frontier 编码，高度恰为 `r` 的置位；`Q` 为完整
+  nonce 历史，12 字节、字典序、含被释放密文的 nonce；`E` 为 u64 计数
+  （恰 `n - r`）后按 `r..n-1` 排列的 `dump_secure_log` 记录
+  （`U, B, B, B, B`，locator 判型），字段含义与宽度规则全部沿用
+  `dump_pruned_hybrid`），末尾追加覆盖此前全部字节的 64 字节 Ed25519
+  签名，不新增签名域也不加密演进密钥（签名只认证来源，帧内明文携带当前
+  演进密钥，字节流须像密钥材料一样保护）。加载**先验签**再解析，复核
+  `0 < r <= n`、checkpoint / frontier 结构、完整 nonce 历史（宽度恰
+  12 字节、互异且字典序，保留密文 nonce 须被历史覆盖且不重复）、locator /
+  摘要宽度、密文封装可解析、条目计数与索引、`stage` / 标志范围与演进密钥
+  宽度，从检查点重算链头并由 frontier 与保留条目重建 Merkle 根，与
+  `head` / `root` 逐项匹配后才以正常 `append` / 加密条目恢复路径重放并
+  原子装入完整 nonce 历史、`K`、`stage` 与标志。导出只读且确定（同状态
+  同种子两次导出逐字节相同，私钥用后即弃、从不写入字节流）；`log` 不是
+  `AuditLog` 或私钥不是 `bytes` 抛 `TypeError`，私钥长度非 32 或日志未
+  裁剪 / 构造时无 `key` 抛 `ValueError`。`data` 只接受精确的 `bytes`
+  （拒绝 `bytearray` / `memoryview`），公钥类型错抛 `TypeError`；公钥非
+  32 字节，或魔数、版本、非法 UTF-8、未知 / 非固定输出算法、截断、尾随、
+  保留点越界、checkpoint / frontier / 摘要 / locator 宽度、frontier 非
+  `r` 的置位、nonce 宽度 / 顺序、保留密文 nonce 缺失或重复、条目计数与
+  `n - r` 不符、索引顺序、断链、封装不可解析、`stage` / 标志范围、演进
+  密钥为空或宽度不符、验签失败、重算链头 / Merkle 根与帧内记录不符均抛
+  `ValueError`；失败不留半成品，既有导出恢复、签名原文与线格式不变
 - `verify_auth(entry, tag, verifier)` — 先校验 `tag.stage`（非 `bool` 整数且 `< 2**64`），
   再用 `entry_digest` 核对 `entry.entry_hash` 与条目内容一致，
   最后把验证方密钥演进到 `tag.stage` 校验 HMAC，无需持有日志；匹配返回 `True`，

@@ -32,6 +32,8 @@ encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_verifier / decode_signed_verifier /
 encode_signed_stage_auth_bundle / decode_signed_stage_auth_bundle /
+encode_signed_stage_auth_audit_bundle /
+decode_signed_stage_auth_audit_bundle /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_audit_receipt / decode_signed_audit_receipt /
 encode_signed_auth_audit_continuation /
@@ -122,6 +124,7 @@ __all__ = [
     "decode_signed_consistency",
     "decode_signed_prune",
     "decode_signed_root",
+    "decode_signed_stage_auth_audit_bundle",
     "decode_signed_stage_auth_bundle",
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
@@ -159,6 +162,7 @@ __all__ = [
     "encode_signed_consistency",
     "encode_signed_prune",
     "encode_signed_root",
+    "encode_signed_stage_auth_audit_bundle",
     "encode_signed_stage_auth_bundle",
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
@@ -378,6 +382,19 @@ _SIGNED_STAGE_AUTH_BUNDLE_VERSION = 1
 # algorithm to equal the signed audit batch's algorithm.
 _SIGNED_AUTH_AUDIT_MAGIC = b"auditchain/auth-audit/v1\0"
 _SIGNED_AUTH_AUDIT_VERSION = 1
+
+# Binary framing of encode_signed_stage_auth_audit_bundle /
+# decode_signed_stage_auth_audit_bundle: a fixed magic, then the envelope
+# version as a u64 and two u64-length-prefixed blobs holding the complete
+# canonical encode_signed_stage_auth_bundle and
+# encode_signed_audit_batch bytes, in that order and with nothing else. The
+# signed-stage-auth-bundle decoder already pins its batch algorithm to the
+# signed stage verifier's algorithm; this envelope additionally requires the
+# signed audit batch's algorithm to equal that one algorithm.
+_SIGNED_STAGE_AUTH_AUDIT_MAGIC = (
+    b"auditchain/signed-stage-auth-audit/v1\0"
+)
+_SIGNED_STAGE_AUTH_AUDIT_VERSION = 1
 
 # Binary framing of encode_signed_auth_audit_continuation /
 # decode_signed_auth_audit_continuation: a fixed magic, then the envelope
@@ -7278,6 +7295,145 @@ def decode_signed_stage_auth_bundle(data: Any) -> SignedStageAuthBundle:
     return SignedStageAuthBundle(
         verifier=verifier, hash_name=hash_name, items=items
     )
+
+
+def encode_signed_stage_auth_audit_bundle(bundle: Any) -> bytes:
+    """Encode a :class:`SignedStageAuthAuditBundle` into canonical bytes.
+
+    The byte stream is ``D || U(1) || B(A) || B(M)`` with
+    ``D = b"auditchain/signed-stage-auth-audit/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the signed stage auth bundle blob and the
+    signed audit batch blob — nothing may be omitted, reordered or appended.
+    ``A`` is the complete canonical output of
+    :func:`encode_signed_stage_auth_bundle` over ``bundle.auth`` and ``M``
+    the complete canonical output of :func:`encode_signed_audit_batch` over
+    ``bundle.audit``. No new signing message is introduced: encoding is
+    read-only and only re-uses the existing canonical encodings.
+
+    ``bundle`` must be a :class:`SignedStageAuthAuditBundle` — anything else
+    raises TypeError; nested structural problems raise exactly the
+    exceptions of :func:`encode_signed_stage_auth_bundle` and
+    :func:`encode_signed_audit_batch` (TypeError or ValueError), and a
+    bundle whose signed audit batch names a hash algorithm other than the
+    one the auth half (and its signed delivery-stage verifier) mints under
+    raises ValueError — encoding never leaves a half result. The encoding
+    carries the stage key in the clear — it authenticates provenance only,
+    never encrypts — so the bytes must be protected exactly like a bare
+    :class:`StageVerifier`. Encoding is deterministic: re-encoding a decoded
+    bundle reproduces the original bytes exactly, and a structurally valid
+    bundle whose signatures, tags, proof or checkpoint do not match encodes
+    just as well.
+    """
+    if not isinstance(bundle, SignedStageAuthAuditBundle):
+        raise TypeError(
+            "bundle must be a SignedStageAuthAuditBundle"
+        )
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedStageAuthAuditBundle(bundle.auth, bundle.audit)
+    # Encode both nested parts first; their own re-validation classifies
+    # every nested type/structure error with its existing TypeError /
+    # ValueError discipline (the auth encoder also pins its batch algorithm
+    # to the signed stage verifier's). Only once both canonical byte strings
+    # exist do we require the audit half to name that same algorithm, so a
+    # disagreeing bundle raises ValueError without returning any (half)
+    # result.
+    auth_blob = encode_signed_stage_auth_bundle(checked.auth)
+    audit_blob = encode_signed_audit_batch(checked.audit)
+    if checked.auth.hash_name != checked.audit.batch[0]:
+        raise ValueError(
+            "signed audit batch hash_name does not match the signed stage "
+            "auth bundle"
+        )
+    return b"".join((
+        _SIGNED_STAGE_AUTH_AUDIT_MAGIC,
+        _encode_u64(_SIGNED_STAGE_AUTH_AUDIT_VERSION, "version"),
+        _encode_blob(auth_blob),
+        _encode_blob(audit_blob),
+    ))
+
+
+def decode_signed_stage_auth_audit_bundle(
+    data: Any,
+) -> SignedStageAuthAuditBundle:
+    """Decode bytes produced by :func:`encode_signed_stage_auth_audit_bundle`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-stage-auth-audit/v1\\0"`` it must contain,
+    strictly in order, the u64 envelope version (only ``1`` is supported),
+    one length-prefixed signed stage auth bundle blob and one
+    length-prefixed signed audit batch blob, with no trailing bytes. Each
+    blob is handed whole to the existing decoder —
+    :func:`decode_signed_stage_auth_bundle` and
+    :func:`decode_signed_audit_batch` respectively — so every nested framing
+    and structural rule is theirs, and the signed audit batch's hash
+    algorithm must equal the auth bundle's algorithm (which already equals
+    its signed stage verifier's). A bad magic or version, truncation, an
+    oversized blob length, trailing bytes, an illegal nested encoding or a
+    hash algorithm disagreement between the two parts raises ValueError.
+
+    The returned object is a frozen :class:`SignedStageAuthAuditBundle`
+    whose two fields equal the originally encoded ones (an empty auth batch
+    round-trips as ``()`` and the zero-item structure is not omitted), and
+    re-encoding reproduces the original bytes exactly. A structurally sound
+    encoding whose signatures, tags, proof or checkpoint simply do not
+    verify still decodes; :func:`verify_signed_stage_auth_audit_bundle`
+    reports False without raising.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_STAGE_AUTH_AUDIT_MAGIC):
+        raise ValueError(
+            "not an auditchain signed-stage-auth-audit encoding"
+        )
+    offset = len(_SIGNED_STAGE_AUTH_AUDIT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_STAGE_AUTH_AUDIT_VERSION:
+        raise ValueError(
+            f"unsupported signed-stage-auth-audit version {version}"
+        )
+    auth_blob = read_blob("signed stage auth bundle")
+    audit_blob = read_blob("signed audit batch")
+    if offset != len(data):
+        raise ValueError(
+            "trailing bytes after the signed stage auth audit bundle"
+        )
+    # Decode both nested blobs with their existing decoders; their own
+    # magic, version, truncation/trailing-byte and structural checks apply
+    # verbatim (the auth decoder also pins its batch algorithm to the
+    # signed stage verifier's algorithm).
+    auth = decode_signed_stage_auth_bundle(auth_blob)
+    audit = decode_signed_audit_batch(audit_blob)
+    # The two packages must be minted under one hash algorithm.
+    if auth.hash_name != audit.batch[0]:
+        raise ValueError(
+            "signed audit batch hash_name does not match the signed stage "
+            "auth bundle"
+        )
+    return SignedStageAuthAuditBundle(auth=auth, audit=audit)
 
 
 def verify_signed_auth_audit_bundle(bundle: Any, public_key: Any) -> bool:

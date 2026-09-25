@@ -7,6 +7,7 @@ SignedStageAuthBundle /
 SignedStageAuthAuditBundle /
 SignedAuditBatch /
 SignedAuditReceipt /
+SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
@@ -23,6 +24,7 @@ inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
 verify_signed_audit_batch / verify_signed_audit_receipt /
+verify_signed_search_receipt /
 verify_signed_consistency / verify_signed_prune /
 verify_rotation /
 verify_rotation_chain /
@@ -42,6 +44,7 @@ encode_signed_stage_auth_audit_bundle /
 decode_signed_stage_auth_audit_bundle /
 encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_audit_receipt / decode_signed_audit_receipt /
+encode_signed_search_receipt / decode_signed_search_receipt /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
@@ -110,6 +113,7 @@ __all__ = [
     "SignedConsistency",
     "SignedPrune",
     "SignedRoot",
+    "SignedSearchReceipt",
     "SignedStageAuthBundle",
     "SignedStageAuthAuditBundle",
     "SignedStageVerifier",
@@ -142,6 +146,7 @@ __all__ = [
     "decode_signed_consistency",
     "decode_signed_prune",
     "decode_signed_root",
+    "decode_signed_search_receipt",
     "decode_signed_stage_auth_audit_bundle",
     "decode_signed_stage_auth_bundle",
     "decode_signed_stage_verifier",
@@ -186,6 +191,7 @@ __all__ = [
     "encode_signed_consistency",
     "encode_signed_prune",
     "encode_signed_root",
+    "encode_signed_search_receipt",
     "encode_signed_stage_auth_audit_bundle",
     "encode_signed_stage_auth_bundle",
     "encode_signed_stage_verifier",
@@ -236,6 +242,7 @@ __all__ = [
     "verify_signed_consistency",
     "verify_signed_prune",
     "verify_signed_root",
+    "verify_signed_search_receipt",
     "verify_signed_stage_auth_bundle",
     "verify_signed_stage_auth_audit_bundle",
     "verify_signed_stage_verifier",
@@ -384,6 +391,14 @@ _SIGNED_AUDIT_BATCH_VERSION = 1
 # encode_signed_root bytes, in that order and with nothing else.
 _SIGNED_AUDIT_RECEIPT_MAGIC = b"auditchain/signed-audit-receipt/v1\0"
 _SIGNED_AUDIT_RECEIPT_VERSION = 1
+
+# Binary framing of encode_signed_search_receipt /
+# decode_signed_search_receipt: a fixed magic, then the envelope version as a
+# u64 and two u64-length-prefixed blobs holding the complete canonical
+# encode_search_receipt and encode_signed_root bytes, in that order and with
+# nothing else.
+_SIGNED_SEARCH_RECEIPT_MAGIC = b"auditchain/signed-search-receipt/v1\0"
+_SIGNED_SEARCH_RECEIPT_VERSION = 1
 
 # Binary framing of encode_signed_consistency / decode_signed_consistency:
 # a fixed magic, then the envelope version as a u64, two u64-length-prefixed
@@ -1676,6 +1691,51 @@ class SignedAuditReceipt:
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, AuditReceipt):
             raise TypeError("receipt must be an AuditReceipt")
+        if not isinstance(self.checkpoint, SignedRoot):
+            raise TypeError("checkpoint must be a SignedRoot")
+        if (
+            self.receipt.hash_name != self.checkpoint.hash_name
+            or self.receipt.size != self.checkpoint.size
+            or self.receipt.root != self.checkpoint.root
+        ):
+            raise ValueError(
+                "receipt and checkpoint must describe the same snapshot "
+                "(hash_name, size and root must be equal)"
+            )
+
+
+@dataclass(frozen=True)
+class SignedSearchReceipt:
+    """Content-search receipt sealed by a pre-trusted Ed25519 key.
+
+    Bundles the :class:`SearchReceipt` of :meth:`AuditLog.search_receipt`
+    with the :class:`SignedRoot` checkpoint of :meth:`AuditLog.sign_root`, so
+    an offline receiver holding only a pre-trusted 32-byte Ed25519 public key
+    can confirm in one artifact that the listed hits with their per-hit
+    inclusion proofs, the snapshot Merkle root and the chain head were all
+    issued by the log holder — without holding the :class:`AuditLog`:
+
+    - ``receipt``: the :class:`SearchReceipt` produced by
+      :meth:`AuditLog.search_receipt`,
+    - ``checkpoint``: the :class:`SignedRoot` produced by
+      :meth:`AuditLog.sign_root` for the same rebuildable snapshot.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. ``receipt`` must be a :class:`SearchReceipt` and ``checkpoint`` a
+    :class:`SignedRoot` — a field of the wrong type raises TypeError — and the
+    two must describe the same snapshot: equal ``hash_name``, ``size`` and
+    ``root``, or the package could never attest one rebuildable snapshot; a
+    mismatch raises ValueError. The receipt's own structural contract is left
+    to :class:`SearchReceipt`, and whether the checkpoint signature is genuine
+    is left to :func:`verify_signed_search_receipt`.
+    """
+
+    receipt: SearchReceipt
+    checkpoint: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, SearchReceipt):
+            raise TypeError("receipt must be a SearchReceipt")
         if not isinstance(self.checkpoint, SignedRoot):
             raise TypeError("checkpoint must be a SignedRoot")
         if (
@@ -3466,6 +3526,41 @@ class AuditLog:
             stop=stop,
             items=items,
         )
+
+    def signed_search_receipt(
+        self,
+        query: Any,
+        private_key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> SignedSearchReceipt:
+        """Issue a :class:`SignedSearchReceipt`: a content-search receipt
+        sealed by a pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``receipt =
+        search_receipt(query, start, stop, size)`` followed by
+        ``checkpoint = sign_root(private_key, size)`` (the searched range and
+        snapshot ``size`` defaulting exactly as :meth:`search_receipt` does),
+        bundled as one :class:`SignedSearchReceipt`. The receipt lets an
+        offline receiver re-verify every listed hit and its inclusion proof
+        against the snapshot Merkle root, and the checkpoint lets the same
+        receiver confirm — using only a pre-trusted 32-byte Ed25519 public
+        key — that the root and chain head were issued by the log holder; no
+        new signing message is introduced, the checkpoint signs exactly the
+        :meth:`sign_root` message. The call is read-only and repeatable: it
+        never changes entries, head, authentication state, Merkle roots or
+        proofs, and issuing twice from the same state with the same seed is
+        byte-for-byte identical. A failure (a bad query value, range, size or
+        seed) raises before the bundle is constructed, leaving all state
+        unchanged and returning no half-built artifact.
+        """
+        # Validate and build the receipt first, exactly as the public method
+        # does; sign_root() is read-only as well, so either failure leaves the
+        # log untouched and nothing new is ever signed.
+        receipt = self.search_receipt(query, start, stop, size)
+        checkpoint = self.sign_root(private_key, size)
+        return SignedSearchReceipt(receipt=receipt, checkpoint=checkpoint)
 
     def verify_entry(self, index: int) -> bool:
         """Check that one retained entry links correctly to its predecessor."""
@@ -6842,6 +6937,68 @@ def verify_signed_audit_receipt(bundle: Any, public_key: Any) -> bool:
     return verify_signed_root(checkpoint, public_key)
 
 
+def verify_signed_search_receipt(package: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedSearchReceipt` against a pre-trusted Ed25519 key.
+
+    Confirms both parts of the sealed package without holding the log:
+    :func:`verify_search_receipt` re-verifies every listed hit's entry digest,
+    per-hit inclusion proof and query match against the receipt's snapshot
+    root, and :func:`verify_signed_root` verifies the checkpoint signature
+    with the 32-byte ``public_key``. The two parts are then required to
+    describe the same snapshot — equal ``hash_name``, ``size`` and ``root``.
+    A genuine sealed package from the trusted key returns True; a structurally
+    valid package signed by another key, whose parts disagree, or whose
+    entries, proofs, root or signature have been altered returns False. Input
+    that is not a :class:`SignedSearchReceipt` (or whose container fields have
+    been bypassed to wrong types) raises TypeError; nested structural
+    violations raise exactly the exceptions of :class:`SearchReceipt` and
+    :func:`verify_signed_root` (TypeError or ValueError), and a public key
+    that is not 32 ``bytes`` raises ValueError (a non-``bytes`` key
+    TypeError). The call is read-only and never mutates the package.
+    """
+    if not isinstance(package, SignedSearchReceipt):
+        raise TypeError("package must be a SignedSearchReceipt")
+    # Re-validate the container fields even for an instance whose fields were
+    # set bypassing the frozen constructor, so container-type corruption
+    # raises TypeError exactly as the constructor would.
+    if not isinstance(package.receipt, SearchReceipt):
+        raise TypeError("receipt must be a SearchReceipt")
+    if not isinstance(package.checkpoint, SignedRoot):
+        raise TypeError("checkpoint must be a SignedRoot")
+    # Re-validate the nested structures as their own constructors would, so a
+    # bypassed field raises exactly the constructor's TypeError or ValueError
+    # rather than being reported as False.
+    receipt = SearchReceipt(
+        package.receipt.version,
+        package.receipt.hash_name,
+        package.receipt.size,
+        package.receipt.root,
+        package.receipt.query,
+        package.receipt.start,
+        package.receipt.stop,
+        package.receipt.items,
+    )
+    checkpoint = SignedRoot(
+        package.checkpoint.version,
+        package.checkpoint.hash_name,
+        package.checkpoint.size,
+        package.checkpoint.root,
+        package.checkpoint.head,
+        package.checkpoint.signature,
+    )
+    # The two parts must describe the same snapshot; a package whose parts
+    # disagree is a mismatch, not a structural error.
+    if (
+        receipt.hash_name != checkpoint.hash_name
+        or receipt.size != checkpoint.size
+        or receipt.root != checkpoint.root
+    ):
+        return False
+    if not verify_search_receipt(receipt):
+        return False
+    return verify_signed_root(checkpoint, public_key)
+
+
 def verify_signed_consistency(receipt: Any, public_key: Any) -> bool:
     """Verify a :class:`SignedConsistency` against a pre-trusted Ed25519 key.
 
@@ -8094,6 +8251,109 @@ def decode_signed_audit_receipt(data: Any) -> SignedAuditReceipt:
     receipt = decode_audit_receipt(receipt_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedAuditReceipt(receipt=receipt, checkpoint=checkpoint)
+
+
+def encode_signed_search_receipt(package: Any) -> bytes:
+    """Encode a :class:`SignedSearchReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-search-receipt/v1\\0"``; it then writes, strictly in
+    order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the receipt blob and the checkpoint blob — nothing
+    may be omitted, reordered or appended. Each blob is a u64 byte length
+    followed by the raw bytes: the receipt blob is the complete canonical
+    output of :func:`encode_search_receipt` over ``package.receipt`` and the
+    checkpoint blob is the complete canonical output of
+    :func:`encode_signed_root` over ``package.checkpoint``. No new signing
+    message is introduced: encoding is read-only and only re-uses the
+    existing canonical encodings.
+
+    ``package`` must be a :class:`SignedSearchReceipt` — anything else, or a
+    package whose container fields have been bypassed to wrong types, raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_search_receipt` and :func:`encode_signed_root` (TypeError or
+    ValueError), as does a pair that does not describe the same snapshot.
+    Encoding is deterministic: re-encoding a decoded package reproduces the
+    original bytes exactly, and a structurally valid package whose signature
+    does not match encodes just as well.
+    """
+    if not isinstance(package, SignedSearchReceipt):
+        raise TypeError("package must be a SignedSearchReceipt")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would and a pair describing two
+    # different snapshots raises its ValueError before any bytes are emitted.
+    checked = SignedSearchReceipt(package.receipt, package.checkpoint)
+    receipt_blob = encode_search_receipt(checked.receipt)
+    checkpoint_blob = encode_signed_root(checked.checkpoint)
+    return b"".join((
+        _SIGNED_SEARCH_RECEIPT_MAGIC,
+        _encode_u64(_SIGNED_SEARCH_RECEIPT_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        _encode_blob(checkpoint_blob),
+    ))
+
+
+def decode_signed_search_receipt(data: Any) -> SignedSearchReceipt:
+    """Decode bytes produced by :func:`encode_signed_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-search-receipt/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed receipt blob and one length-prefixed checkpoint blob,
+    with no trailing bytes. Each blob is handed whole to the existing
+    decoder — :func:`decode_search_receipt` and :func:`decode_signed_root`
+    respectively — so every nested framing and structural rule is theirs. A
+    bad magic or version, truncation, an oversized blob length, trailing
+    bytes or an illegal nested encoding raises ValueError, as does a decoded
+    pair whose receipt and checkpoint do not describe the same snapshot.
+
+    The returned object is a frozen :class:`SignedSearchReceipt` whose fields
+    equal the originally encoded ones, and re-encoding reproduces the
+    original bytes exactly. A structurally sound encoding whose checkpoint
+    signature simply does not verify still decodes;
+    :func:`verify_signed_search_receipt` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_SEARCH_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain signed-search-receipt encoding")
+    offset = len(_SIGNED_SEARCH_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_SEARCH_RECEIPT_VERSION:
+        raise ValueError(
+            f"unsupported signed-search-receipt version {version}"
+        )
+    receipt_blob = read_blob("receipt")
+    checkpoint_blob = read_blob("checkpoint")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed search receipt")
+    # Decode both nested blobs with their existing decoders; their own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    receipt = decode_search_receipt(receipt_blob)
+    checkpoint = decode_signed_root(checkpoint_blob)
+    return SignedSearchReceipt(receipt=receipt, checkpoint=checkpoint)
 
 
 def encode_signed_consistency(receipt: Any) -> bytes:

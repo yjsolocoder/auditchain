@@ -254,6 +254,51 @@ blob 均为 u64 字节长度后接原始字节（零长度也是全零 u64）。
 证明不匹配的结构合法回执仍可正常编解码，仅 `verify_audit_batch` 返回 `False`。
 编解码均为只读，不改变五元组与日志的任何状态。
 
+### 紧凑批量包含证明凭据（可持久化）
+
+`batch_inclusion_proof` 生成的共享节点元组本身只是内存对象；冻结凭据
+`BatchInclusionProof` 把 `verify_batch_inclusion` 所需的全部核验上下文与证明节点
+绑成一件制品，使紧凑批量包含证明可以落盘、跨进程恢复并直接交回既有离线核验入口：
+
+```python
+indices, proof = log.batch_inclusion_proof([1, 3, 5])
+entry_hashes = tuple(log.entry(i).entry_hash for i in indices)
+credential = BatchInclusionProof(
+    "sha256", indices, entry_hashes, len(log), log.merkle_root(), proof,
+)
+data = encode_batch_inclusion_proof(credential)   # bytes：魔数 + 规范二进制
+restored = decode_batch_inclusion_proof(data)     # 另一进程中恢复
+restored == credential                            # True：按全部字段相等
+encode_batch_inclusion_proof(restored) == data    # True：重编码逐字节相同
+verify_batch_inclusion(                           # True：直接交回既有核验入口
+    restored.indices, restored.entry_hashes, restored.size,
+    restored.root, restored.proof, hash_name=restored.hash_name,
+)
+```
+
+凭据不可变、支持位置构造、按全部六个字段相等，字段依次为 `hash_name`（摘要算法
+名）、`indices`（索引元组）、`entry_hashes`（条目摘要元组）、`size`（快照尺寸）、
+`root`（快照根）与 `proof`（证明节点元组，保持生成时的元组顺序）。`indices` 须为
+非空、互异且严格升序的非 `bool` 整数元组；`entry_hashes` 须与 `indices` 等长；
+`size` 须为正且索引未越界（`0 <= index < size`）；条目摘要、快照根与每个证明节点
+只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）且须与算法摘要等宽。证明
+节点数是否与所选叶子相称、能否重建出根，凭据不作判断，交给既有
+`verify_batch_inclusion`：节点数不符抛 `ValueError`，内容不符返回 `False`。字段
+类型错一律抛 `TypeError`；未知算法、宽度不符、索引非升序或越界、两序列不等长、
+`size` 非正或超出 u64 范围抛 `ValueError`。
+
+字节流以魔数 `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 `version`
+（u64），随后严格按凭据字段顺序写内容，不得省略或换序：`hash_name` 的 UTF-8
+blob、`indices` 计数（u64）及逐个索引（u64）、`entry_hashes` 计数（u64）及逐个
+摘要 blob、`size`（u64）、`root` blob、`proof` 节点计数（u64）及逐个节点 blob。
+索引与尺寸写 8 字节无符号大端整数，其余内容写 u64 长度前缀 blob（零长度也是全零
+u64），三个元组均先写计数。`encode_batch_inclusion_proof` 只接受
+`BatchInclusionProof`（其他类型，或绕过冻结构造器写入的字段类型错，抛
+`TypeError`）；`decode_batch_inclusion_proof` 只接受精确的 `bytes`（拒绝
+`bytearray` / `memoryview`，抛 `TypeError`），魔数或版本不符、截断、尾随字节、
+长度或整数越界、非法 UTF-8 及上述构造期结构问题均抛 `ValueError`。解码精确消费
+全部字节；编解码只读且确定，同一凭据重复编码、解码后重编码都逐字节相同。
+
 ### 可信签名快照检查点（Ed25519）
 
 `sign_root` 用日志持有者按次提供的 Ed25519 私钥种子为某个快照（Merkle 根
@@ -2450,6 +2495,17 @@ python3 -m auditchain
   必含 `index == size - 1` 的末条（在 items 末尾）及其包含证明**，`size == 0` 时
   `items` 必须为 `()`；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或
   条目结构非法（含非空回执缺失末条、空回执携带条目）抛 `ValueError`
+- `BatchInclusionProof(hash_name, indices, entry_hashes, size, root, proof)` —
+  不可变的紧凑批量包含证明凭据，把 `verify_batch_inclusion` 的核验上下文与
+  `batch_inclusion_proof` 的共享证明节点绑成一件制品，按全部六个字段相等、支持
+  位置构造；`indices` 为非空、互异且严格升序的非 `bool` 整数元组，`entry_hashes`
+  为与之等长的条目摘要元组，`size` 为正且索引未越界，`root` 为快照 Merkle 根，
+  `proof` 保持生成时的元组顺序；条目摘要、快照根与每个证明节点只接受精确的
+  `bytes`（拒绝 `bytearray` / `memoryview`）且与算法摘要等宽；证明节点数与根的
+  重建交由 `verify_batch_inclusion` 判定。字段类型错抛 `TypeError`，未知算法、
+  宽度不符、索引非升序或越界、两序列不等长、`size` 非正或超出 u64 范围抛
+  `ValueError`；规范二进制编解码由 `encode_batch_inclusion_proof` /
+  `decode_batch_inclusion_proof` 提供
 - `SignedRoot(version, hash_name, size, root, head, signature)` — 不可变的 Ed25519
   可信签名快照检查点，按全部字段相等、支持位置构造；`version` 恒为 `1`，`root`
   为前 `size` 条的 Merkle 根，`head` 为该前缀末条摘要（空前缀为该摘要宽度的零
@@ -3274,6 +3330,19 @@ python3 -m auditchain
   非五元组、非 bytes 或字段类型错抛 `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、
   范围、宽度、顺序、缺末条或节点数不符抛 `ValueError`；内容、根或证明不匹配仍可解码，
   但 `verify_audit_batch` 返回 `False`
+- `encode_batch_inclusion_proof(credential)` / `decode_batch_inclusion_proof(data)` —
+  紧凑批量包含证明凭据 `BatchInclusionProof` 的规范二进制编码与解码：魔数
+  `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据
+  字段顺序写 hash_name 的 UTF-8 blob、indices 计数及逐个索引、entry_hashes 计数及
+  逐个摘要 blob、size、root blob、proof 节点计数及逐个节点 blob；索引与尺寸为 u64
+  大端，其余为 u64 长度前缀 blob，三个元组先写计数。解码精确消费全部字节，恢复对象
+  按全部字段与原件相等、重编码逐字节相同，可直接交回 `verify_batch_inclusion` 离线
+  核验。前者只接受 `BatchInclusionProof`，后者只接受精确的 `bytes`（拒绝
+  `bytearray` / `memoryview`）；非对应类型或绕过冻结构造器写入的字段类型错抛
+  `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度或整数越界、宽度、索引
+  顺序或范围、两序列不等长或 `size` 非法抛 `ValueError`；证明节点数与根是否相称
+  由 `verify_batch_inclusion` 判定（节点数不符抛 `ValueError`，内容不符返回
+  `False`）
 - `dump_log(log, private_key)` / `load_log(data, public_key)` — 完整日志状态的
   签名导出与离线恢复，使一份完整、未裁剪、无认证、无加密历史的日志可落盘、跨进程
   恢复为独立、可变的普通无密钥 `AuditLog`：字节流为

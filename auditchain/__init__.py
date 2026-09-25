@@ -1,6 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
+BatchInclusionProof /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
 SignedStageAuthBundle /
 SignedStageAuthAuditBundle /
@@ -28,6 +29,7 @@ verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
+encode_batch_inclusion_proof / decode_batch_inclusion_proof /
 encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_verifier / decode_signed_verifier /
@@ -84,6 +86,7 @@ __all__ = [
     "AuditLog",
     "AuditReceipt",
     "AuthTag",
+    "BatchInclusionProof",
     "ContinuationChainReport",
     "Entry",
     "IntegrityIssue",
@@ -110,6 +113,7 @@ __all__ = [
     "decode_audit_batch",
     "decode_audit_receipt",
     "decode_auth_batch",
+    "decode_batch_inclusion_proof",
     "decode_continuations",
     "decode_continuation_chain_report",
     "decode_integrity_report",
@@ -149,6 +153,7 @@ __all__ = [
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_auth_batch",
+    "encode_batch_inclusion_proof",
     "encode_continuations",
     "encode_continuation_chain_report",
     "encode_integrity_report",
@@ -263,6 +268,11 @@ _BATCH_VERSION = 1
 # needs, with no verifier material of any kind.
 _AUTH_BATCH_MAGIC = b"auditchain/auth-batch/v1\0"
 _AUTH_BATCH_VERSION = 1
+# Binary framing of encode_batch_inclusion_proof / decode_batch_inclusion_proof:
+# same u64/blob rules, binding the verify_batch_inclusion context (algorithm,
+# indices, entry digests, snapshot size and root) to the shared proof nodes.
+_BATCH_INCLUSION_MAGIC = b"auditchain/batch-inclusion/v1\0"
+_BATCH_INCLUSION_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
 
@@ -1102,6 +1112,92 @@ class AuditReceipt:
                 "a receipt for a non-empty snapshot must include the entry "
                 "at index size - 1"
             )
+
+
+@dataclass(frozen=True)
+class BatchInclusionProof:
+    """Offline credential binding a compact batch inclusion proof to its context.
+
+    Ties everything :func:`verify_batch_inclusion` needs into one artifact, so
+    a proof minted by :meth:`AuditLog.batch_inclusion_proof` can be persisted
+    and restored in another process without re-holding the log:
+
+    - ``hash_name``: hash algorithm of the log the proof came from,
+    - ``indices``: strictly ascending tuple of the selected absolute indices,
+    - ``entry_hashes``: tuple of the selected entries' digests, exactly as
+      long as ``indices``,
+    - ``size``: number of entries in the snapshot the proof refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``proof``: the shared proof node tuple, in generation order.
+
+    Instances are immutable, may be built positionally and compare by all six
+    fields. Whether the proof node count fits the selected leaves and whether
+    the nodes rebuild ``root`` is left to :func:`verify_batch_inclusion`: a
+    wrong node count raises ValueError there and a mere content mismatch
+    returns False; the constructor only fixes the shape, widths and ordering.
+    """
+
+    hash_name: str
+    indices: tuple[int, ...]
+    entry_hashes: tuple[bytes, ...]
+    size: int
+    root: bytes
+    proof: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+
+        if not isinstance(self.indices, tuple):
+            raise TypeError("indices must be a tuple of integers")
+        if not self.indices:
+            raise ValueError("indices must be non-empty")
+        previous = -1
+        for index in self.indices:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("indices must be non-bool integers")
+            if index <= previous:
+                raise ValueError(
+                    "indices must be strictly ascending with no duplicates"
+                )
+            previous = index
+
+        if not isinstance(self.entry_hashes, tuple):
+            raise TypeError("entry_hashes must be a tuple of digests")
+        if len(self.entry_hashes) != len(self.indices):
+            raise ValueError("entry_hashes must have the same length as indices")
+        for entry_hash in self.entry_hashes:
+            if not isinstance(entry_hash, bytes):
+                raise TypeError("entry_hashes elements must be bytes")
+            if len(entry_hash) != digest_size:
+                raise ValueError(f"entry_hash must be {digest_size} bytes")
+
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if not 0 < self.size < _U64_LIMIT:
+            raise ValueError("size must satisfy 0 < size < 2**64")
+        if self.indices[-1] >= self.size:
+            raise ValueError(
+                f"index {self.indices[-1]} must satisfy "
+                f"0 <= index < size ({self.size})"
+            )
+
+        # root and every proof node must be exact bytes: bytearray and
+        # memoryview are rejected rather than copied, so a received credential
+        # never silently aliases a mutable caller buffer.
+        if not isinstance(self.root, bytes):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof elements must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
 
 
 @dataclass(frozen=True)
@@ -4830,6 +4926,132 @@ def decode_audit_batch(data: Any) -> tuple[str, int, bytes, tuple[Entry, ...], t
     # algorithm, ranges, digest widths, ordering, last entry and node count.
     _unpack_audit_batch(receipt)
     return receipt
+
+
+def encode_batch_inclusion_proof(credential: Any) -> bytes:
+    """Encode a :class:`BatchInclusionProof` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/batch-inclusion/v1\\0"``; indices and sizes are unsigned
+    8-byte big-endian integers and every other field is a u64 byte length
+    followed by the raw bytes (a zero length is an all-zero u64). Fields
+    appear strictly in credential order, with nothing omitted, reordered or
+    appended: ``version`` (always 1), ``hash_name`` (UTF-8 blob), the
+    ``indices`` count followed by one u64 per index, the ``entry_hashes``
+    count followed by one blob per digest, ``size``, the ``root`` blob, and
+    the ``proof`` node count followed by one blob per node in generation
+    order.
+
+    ``credential`` must be a :class:`BatchInclusionProof` — anything else, or
+    a field of the wrong type (including fields overwritten through
+    ``object.__setattr__`` bypassing the frozen constructor), raises
+    TypeError; an unknown hash algorithm, a digest of the wrong width,
+    non-ascending or out-of-range indices, mismatched ``indices`` /
+    ``entry_hashes`` lengths or a ``size`` outside the u64 range raise
+    ValueError. The call is read-only and deterministic: it never mutates the
+    credential, and re-encoding a decoded one reproduces the original bytes
+    exactly, so a proof can be persisted and restored in another process and
+    handed straight to :func:`verify_batch_inclusion`.
+    """
+    if not isinstance(credential, BatchInclusionProof):
+        raise TypeError("credential must be a BatchInclusionProof")
+    # Re-validate every field even for a credential built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = BatchInclusionProof(
+        credential.hash_name,
+        credential.indices,
+        credential.entry_hashes,
+        credential.size,
+        credential.root,
+        credential.proof,
+    )
+    parts = [
+        _BATCH_INCLUSION_MAGIC,
+        _encode_u64(_BATCH_INCLUSION_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(len(checked.indices), "indices count"),
+    ]
+    for index in checked.indices:
+        parts.append(_encode_u64(index, "index"))
+    parts.append(_encode_u64(len(checked.entry_hashes), "entry_hashes count"))
+    for entry_hash in checked.entry_hashes:
+        parts.append(_encode_blob(entry_hash))
+    parts.append(_encode_u64(checked.size, "size"))
+    parts.append(_encode_blob(checked.root))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for node in checked.proof:
+        parts.append(_encode_blob(node))
+    return b"".join(parts)
+
+
+def decode_batch_inclusion_proof(data: Any) -> BatchInclusionProof:
+    """Decode bytes produced by :func:`encode_batch_inclusion_proof`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, a digest
+    whose width does not match the named algorithm, empty, non-ascending,
+    duplicate or out-of-range indices, mismatched ``indices`` /
+    ``entry_hashes`` lengths or a non-positive ``size`` raise ValueError. The
+    whole input is consumed exactly; the returned credential is a frozen
+    :class:`BatchInclusionProof` whose fields equal the originally encoded
+    ones, re-encoding it reproduces the original bytes exactly, and it can be
+    passed to :func:`verify_batch_inclusion` in another process exactly as
+    the original could.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_BATCH_INCLUSION_MAGIC):
+        raise ValueError("not an auditchain batch-inclusion-proof encoding")
+    offset = len(_BATCH_INCLUSION_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _BATCH_INCLUSION_VERSION:
+        raise ValueError("unsupported batch-inclusion-proof version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    index_count = read_u64("indices count")
+    indices = tuple(read_u64("index") for _ in range(index_count))
+    entry_hash_count = read_u64("entry_hashes count")
+    entry_hashes = tuple(read_blob("entry_hash") for _ in range(entry_hash_count))
+    size = read_u64("size")
+    root = read_blob("root")
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the batch inclusion proof")
+    return BatchInclusionProof(
+        hash_name=hash_name,
+        indices=indices,
+        entry_hashes=entry_hashes,
+        size=size,
+        root=root,
+        proof=proof,
+    )
 
 
 def _unpack_auth_batch(

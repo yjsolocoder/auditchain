@@ -3,6 +3,7 @@
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
 BatchInclusionProof / InclusionProof / ConsistencyProof /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
+MerkleFrontier /
 SignedStageAuthBundle /
 SignedStageAuthAuditBundle /
 SignedAuditBatch /
@@ -13,6 +14,7 @@ ContinuationChainReport / AnchoredContinuationChain /
 RotatedChain /
 RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
+rebuild_merkle_root /
 verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
 verify_audit_receipt /
 verify_audit_batch / inspect_continuation_chain / inspect_anchors /
@@ -45,6 +47,7 @@ decode_signed_auth_audit_continuation /
 encode_continuations / decode_continuations /
 encode_continuation_chain_report / decode_continuation_chain_report /
 encode_integrity_report / decode_integrity_report /
+encode_merkle_frontier / decode_merkle_frontier /
 encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
@@ -95,6 +98,7 @@ __all__ = [
     "InclusionProof",
     "IntegrityIssue",
     "IntegrityReport",
+    "MerkleFrontier",
     "PruneReceipt",
     "RotatedAnchorSet",
     "RotatedChain",
@@ -123,6 +127,7 @@ __all__ = [
     "decode_continuation_chain_report",
     "decode_inclusion_proof",
     "decode_integrity_report",
+    "decode_merkle_frontier",
     "decode_prune_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
@@ -165,6 +170,7 @@ __all__ = [
     "encode_continuation_chain_report",
     "encode_inclusion_proof",
     "encode_integrity_report",
+    "encode_merkle_frontier",
     "encode_prune_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
@@ -206,6 +212,7 @@ __all__ = [
     "load_signed_pruned_hybrid",
     "merge_anchor_set",
     "merge_rotated_anchor_set",
+    "rebuild_merkle_root",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -285,6 +292,13 @@ _INCLUSION_MAGIC = b"auditchain/inclusion/v1\0"
 _INCLUSION_VERSION = 1
 _CONSISTENCY_MAGIC = b"auditchain/consistency/v1\0"
 _CONSISTENCY_VERSION = 1
+# Binary framing of encode_merkle_frontier / decode_merkle_frontier: same
+# u64/blob rules, freezing the perfect-subtree frontier covering a snapshot
+# prefix (the checkpoint dependency of a pruned log) as a public read-only
+# credential: version, hash name UTF-8 blob, covered prefix size, a subtree
+# pair count and one U(height) || B(digest) pair per set bit of the size.
+_FRONTIER_MAGIC = b"auditchain/frontier/v1\0"
+_FRONTIER_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
 
@@ -1355,6 +1369,77 @@ class ConsistencyProof:
                 raise TypeError("proof elements must be bytes")
             if len(node) != digest_size:
                 raise ValueError(f"proof element must be {digest_size} bytes")
+
+
+@dataclass(frozen=True)
+class MerkleFrontier:
+    """Frozen Merkle frontier covering a snapshot prefix.
+
+    The public, read-only form of the perfect-subtree stack a pruned log
+    keeps internally as its checkpoint dependency. It captures the Merkle
+    structure of the released prefix ``[0, size)`` so it can be persisted and
+    restored in another process without any released payload:
+
+    - ``hash_name``: hash algorithm of the log the frontier came from,
+    - ``size``: number of leaves (entries) the frontier covers,
+    - ``subtrees``: ``(height, digest)`` pairs in strictly ascending height
+      order, one pair per set bit of ``size``; a subtree of height ``h``
+      holds ``2**h`` leaves and ``digest`` is that subtree's root.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. An empty prefix (``size == 0``) carries no pairs. The
+    constructor fixes the types, widths and height structure: pair heights
+    must be exactly the set bits of ``size`` in strictly ascending order and
+    every digest must be exact ``bytes`` of the named algorithm's digest
+    width.
+    """
+
+    hash_name: str
+    size: int
+    subtrees: tuple[tuple[int, bytes], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be a non-bool integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+
+        if not isinstance(self.subtrees, tuple):
+            raise TypeError("subtrees must be a tuple of (height, digest) pairs")
+        checked: list[tuple[int, bytes]] = []
+        previous_height = -1
+        for pair in self.subtrees:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError("each subtree must be a (height, digest) tuple")
+            height, digest = pair
+            if not isinstance(height, int) or isinstance(height, bool):
+                raise TypeError("subtree height must be a non-bool integer")
+            if height < 0:
+                raise ValueError("subtree height must be non-negative")
+            if height >= _U64_BYTES * 8:
+                raise ValueError("subtree height must satisfy height < 64")
+            if height <= previous_height:
+                raise ValueError("subtree heights must be in strictly ascending order")
+            previous_height = height
+            # bytearray / memoryview are rejected rather than copied, so a
+            # received credential never aliases a mutable caller buffer.
+            if not isinstance(digest, bytes):
+                raise TypeError("subtree digest must be bytes")
+            if len(digest) != digest_size:
+                raise ValueError(f"subtree digest must be {digest_size} bytes")
+            checked.append((height, digest))
+        expected_heights = {
+            height for height in range(_U64_BYTES * 8) if (self.size >> height) & 1
+        }
+        if {height for height, _digest in checked} != expected_heights:
+            raise ValueError("subtree heights must be exactly the set bits of size")
+        object.__setattr__(self, "subtrees", tuple(checked))
 
 
 @dataclass(frozen=True)
@@ -3342,6 +3427,32 @@ class AuditLog:
             return _hash_parts(self._hash_name, _EMPTY_DOMAIN)
         self._require_retained_snapshot(size)
         return self._fold_occupied(self._occupied_at(size))
+
+    def merkle_frontier(self, size: int | None = None) -> MerkleFrontier:
+        """Freeze the perfect-subtree frontier covering the first ``size`` entries.
+
+        Defaults to the current log length. The returned read-only
+        :class:`MerkleFrontier` names the hash algorithm, the covered prefix
+        size and, in ascending height order, the roots of the maximal perfect
+        subtrees covering that prefix (one pair per set bit of ``size``).
+        After a prune the frontier at ``retain_from`` is exactly the
+        checkpoint the log keeps of the released prefix; a frontier at any
+        rebuildable prefix size captures the same structure without holding
+        the payloads. The call is read-only: it never changes entries, head,
+        authentication state, Merkle roots or proofs. A non-integer (or
+        ``bool``) ``size`` raises TypeError; an out-of-range size or a
+        snapshot already released by :meth:`prune` raises ValueError.
+        """
+        if isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        self._require_retained_snapshot(size)
+        occupied = self._occupied_at(size)
+        return MerkleFrontier(
+            self._hash_name,
+            size,
+            tuple((height, occupied[height]) for height in sorted(occupied)),
+        )
 
     def _frontier_blocks(self) -> dict[tuple[int, int], bytes]:
         """Checkpoint subtrees as ``(height, level node index)`` nodes."""
@@ -5442,6 +5553,167 @@ def decode_consistency_proof(data: Any) -> ConsistencyProof:
         new_root=new_root,
         proof=proof,
     )
+
+
+def _fold_frontier(hash_name: str, occupied: dict[int, bytes]) -> bytes:
+    """Snapshot root folded from a height-keyed perfect-subtree frontier.
+
+    Low blocks are the rightmost subtrees; they fold in from the right. An
+    empty frontier is the canonical empty-tree root.
+    """
+    if not occupied:
+        return _hash_parts(hash_name, _EMPTY_DOMAIN)
+    root: bytes | None = None
+    for height in sorted(occupied):
+        node = occupied[height]
+        root = node if root is None else _node_hash(node, root, hash_name)
+    return root  # type: ignore[return-value]
+
+
+def rebuild_merkle_root(frontier: Any, entry_hashes: Any) -> bytes:
+    """Rebuild a full snapshot root from a frontier and a retained segment.
+
+    ``frontier`` is a frozen :class:`MerkleFrontier` covering a released
+    prefix and ``entry_hashes`` is a tuple of retained entry digests in
+    chain order — the segment that immediately follows the covered prefix.
+    The retained leaves are appended onto the frontier's perfect subtrees
+    exactly as a live log folds them, and the root of the resulting full
+    snapshot is returned. Comparing it with the root of a signed checkpoint
+    confirms the retained segment really follows the released prefix the
+    frontier was frozen for.
+
+    ``frontier`` must be a :class:`MerkleFrontier` and ``entry_hashes`` a
+    tuple of exact ``bytes`` digests (a wrong type, including
+    ``bytearray`` / ``memoryview``, raises TypeError); an unknown hash
+    algorithm, an empty digest or a digest whose width differs from the
+    frontier algorithm's raises ValueError. The call is read-only.
+    """
+    if not isinstance(frontier, MerkleFrontier):
+        raise TypeError("frontier must be a MerkleFrontier")
+    if not isinstance(entry_hashes, tuple):
+        raise TypeError("entry_hashes must be a tuple of entry digests")
+    # Re-validate the credential even if its fields were overwritten through
+    # object.__setattr__, bypassing the frozen constructor.
+    MerkleFrontier(frontier.hash_name, frontier.size, frontier.subtrees)
+    digest_size = _digest_size(frontier.hash_name)
+    occupied = {height: digest for height, digest in frontier.subtrees}
+    for entry_hash in entry_hashes:
+        if not isinstance(entry_hash, bytes):
+            raise TypeError("entry hash must be bytes")
+        if len(entry_hash) == 0:
+            raise ValueError("entry hash must not be empty")
+        if len(entry_hash) != digest_size:
+            raise ValueError(f"entry hash must be {digest_size} bytes")
+        node = _leaf_hash(entry_hash, frontier.hash_name)
+        height = 0
+        while height in occupied:
+            node = _node_hash(occupied.pop(height), node, frontier.hash_name)
+            height += 1
+        occupied[height] = node
+    return _fold_frontier(frontier.hash_name, occupied)
+
+
+def encode_merkle_frontier(credential: Any) -> bytes:
+    """Encode a :class:`MerkleFrontier` into its canonical binary form.
+
+    The encoding starts with the magic ``b"auditchain/frontier/v1\\0"``;
+    every integer is an unsigned 8-byte big-endian value and every blob is a
+    u64 byte length followed by the raw bytes (a zero length is an all-zero
+    u64). Fields appear strictly in credential order, with nothing omitted,
+    reordered or appended: ``version`` (always 1), the ``hash_name`` UTF-8
+    blob, the covered prefix ``size``, the subtree pair count and, per pair
+    in strictly ascending height order, ``height`` followed by the subtree
+    root ``digest`` blob.
+
+    ``credential`` must be a :class:`MerkleFrontier` — anything else, or a
+    field of the wrong type (including fields overwritten through
+    ``object.__setattr__`` bypassing the frozen constructor), raises
+    TypeError; an unknown hash algorithm, a digest of the wrong width, an
+    illegal height or ordering, a pair set that does not match the set bits
+    of ``size``, or a size outside the u64 range raises ValueError. The call
+    is read-only and deterministic: it never mutates the credential, and
+    re-encoding a decoded one reproduces the original bytes exactly, so a
+    frontier can be persisted and restored in another process and handed to
+    :func:`rebuild_merkle_root`.
+    """
+    if not isinstance(credential, MerkleFrontier):
+        raise TypeError("credential must be a MerkleFrontier")
+    # Re-validate every field even for a credential built with
+    # object.__setattr__ bypassing the frozen constructor.
+    checked = MerkleFrontier(
+        credential.hash_name, credential.size, credential.subtrees
+    )
+    parts = [
+        _FRONTIER_MAGIC,
+        _encode_u64(_FRONTIER_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_u64(len(checked.subtrees), "subtree count"),
+    ]
+    for height, digest in checked.subtrees:
+        parts.append(_encode_u64(height, "subtree height"))
+        parts.append(_encode_blob(digest))
+    return b"".join(parts)
+
+
+def decode_merkle_frontier(data: Any) -> MerkleFrontier:
+    """Decode bytes produced by :func:`encode_merkle_frontier`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, a size
+    outside the u64 range, a digest whose width does not match the named
+    algorithm, or an illegal subtree height value or ordering — including a
+    pair set that is not exactly the set bits of ``size`` — raises
+    ValueError. The whole input is consumed exactly; the returned
+    credential is a frozen :class:`MerkleFrontier` whose fields equal the
+    originally encoded ones, re-encoding it reproduces the original bytes
+    exactly, and it can be passed to :func:`rebuild_merkle_root` in another
+    process exactly as the original could.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_FRONTIER_MAGIC):
+        raise ValueError("not an auditchain merkle-frontier encoding")
+    offset = len(_FRONTIER_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _FRONTIER_VERSION:
+        raise ValueError("unsupported merkle-frontier version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    pair_count = read_u64("subtree count")
+    subtrees = tuple(
+        (read_u64("subtree height"), read_blob("subtree digest"))
+        for _ in range(pair_count)
+    )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the merkle frontier")
+    return MerkleFrontier(hash_name=hash_name, size=size, subtrees=subtrees)
 
 
 def _unpack_auth_batch(

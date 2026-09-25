@@ -1,7 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
-BatchInclusionProof /
+BatchInclusionProof / InclusionProof / ConsistencyProof /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
 SignedStageAuthBundle /
 SignedStageAuthAuditBundle /
@@ -30,6 +30,8 @@ encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_batch_inclusion_proof / decode_batch_inclusion_proof /
+encode_inclusion_proof / decode_inclusion_proof /
+encode_consistency_proof / decode_consistency_proof /
 encode_auth_batch / decode_auth_batch /
 encode_signed_root / decode_signed_root /
 encode_signed_verifier / decode_signed_verifier /
@@ -87,8 +89,10 @@ __all__ = [
     "AuditReceipt",
     "AuthTag",
     "BatchInclusionProof",
+    "ConsistencyProof",
     "ContinuationChainReport",
     "Entry",
+    "InclusionProof",
     "IntegrityIssue",
     "IntegrityReport",
     "PruneReceipt",
@@ -114,8 +118,10 @@ __all__ = [
     "decode_audit_receipt",
     "decode_auth_batch",
     "decode_batch_inclusion_proof",
+    "decode_consistency_proof",
     "decode_continuations",
     "decode_continuation_chain_report",
+    "decode_inclusion_proof",
     "decode_integrity_report",
     "decode_prune_receipt",
     "decode_rotation",
@@ -154,8 +160,10 @@ __all__ = [
     "encode_audit_receipt",
     "encode_auth_batch",
     "encode_batch_inclusion_proof",
+    "encode_consistency_proof",
     "encode_continuations",
     "encode_continuation_chain_report",
+    "encode_inclusion_proof",
     "encode_integrity_report",
     "encode_prune_receipt",
     "encode_rotation",
@@ -273,6 +281,10 @@ _AUTH_BATCH_VERSION = 1
 # indices, entry digests, snapshot size and root) to the shared proof nodes.
 _BATCH_INCLUSION_MAGIC = b"auditchain/batch-inclusion/v1\0"
 _BATCH_INCLUSION_VERSION = 1
+_INCLUSION_MAGIC = b"auditchain/inclusion/v1\0"
+_INCLUSION_VERSION = 1
+_CONSISTENCY_MAGIC = b"auditchain/consistency/v1\0"
+_CONSISTENCY_VERSION = 1
 _U64_BYTES = 8
 _U64_LIMIT = 1 << 64
 
@@ -1157,6 +1169,8 @@ class BatchInclusionProof:
         for index in self.indices:
             if not isinstance(index, int) or isinstance(index, bool):
                 raise TypeError("indices must be non-bool integers")
+            if index < 0:
+                raise ValueError("indices must be non-negative")
             if index <= previous:
                 raise ValueError(
                     "indices must be strictly ascending with no duplicates"
@@ -1174,9 +1188,11 @@ class BatchInclusionProof:
                 raise ValueError(f"entry_hash must be {digest_size} bytes")
 
         if not isinstance(self.size, int) or isinstance(self.size, bool):
-            raise TypeError("size must be an integer")
-        if not 0 < self.size < _U64_LIMIT:
-            raise ValueError("size must satisfy 0 < size < 2**64")
+            raise TypeError("size must be a non-bool integer")
+        if self.size <= 0:
+            raise ValueError("size must be positive")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
         if self.indices[-1] >= self.size:
             raise ValueError(
                 f"index {self.indices[-1]} must satisfy "
@@ -1190,6 +1206,147 @@ class BatchInclusionProof:
             raise TypeError("root must be bytes")
         if len(self.root) != digest_size:
             raise ValueError(f"root must be {digest_size} bytes")
+
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof elements must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+
+
+@dataclass(frozen=True)
+class InclusionProof:
+    """Offline credential binding a single-entry inclusion proof to its context.
+
+    Ties everything :func:`verify_inclusion` needs into one artifact, so a
+    proof minted by :meth:`AuditLog.inclusion_proof` can be persisted and
+    restored in another process without re-holding the log:
+
+    - ``hash_name``: hash algorithm of the log the proof came from,
+    - ``index``: absolute index of the proven entry within the snapshot,
+    - ``size``: number of entries in the snapshot the proof refers to,
+    - ``entry_hash``: digest of the proven entry,
+    - ``root``: Merkle root of that snapshot,
+    - ``proof``: the sibling-node tuple, in generation order.
+
+    Instances are immutable, may be built positionally and compare by all six
+    fields. Whether the proof node count fits the leaf and whether the nodes
+    rebuild ``root`` is left to :func:`verify_inclusion`: a wrong node count
+    raises ValueError there and a mere content mismatch returns False; the
+    constructor only fixes the types, widths and ranges.
+    """
+
+    hash_name: str
+    index: int
+    size: int
+    entry_hash: bytes
+    root: bytes
+    proof: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+
+        if not isinstance(self.index, int) or isinstance(self.index, bool):
+            raise TypeError("index must be a non-bool integer")
+        if self.index < 0:
+            raise ValueError("index must be non-negative")
+
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be a non-bool integer")
+        if self.size <= 0:
+            raise ValueError("size must be positive")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        if self.index >= self.size:
+            raise ValueError(
+                f"index {self.index} must satisfy "
+                f"0 <= index < size ({self.size})"
+            )
+
+        # entry_hash, root and every proof node must be exact bytes: bytearray
+        # and memoryview are rejected rather than copied, so a received
+        # credential never silently aliases a mutable caller buffer.
+        if not isinstance(self.entry_hash, bytes):
+            raise TypeError("entry_hash must be bytes")
+        if len(self.entry_hash) != digest_size:
+            raise ValueError(f"entry_hash must be {digest_size} bytes")
+
+        if not isinstance(self.root, bytes):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof elements must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+
+
+@dataclass(frozen=True)
+class ConsistencyProof:
+    """Offline credential binding a cross-snapshot consistency proof to context.
+
+    Ties everything :func:`verify_consistency` needs into one artifact, so a
+    proof minted by :meth:`AuditLog.consistency_proof` can be persisted and
+    restored in another process without re-holding the log:
+
+    - ``hash_name``: hash algorithm of the log the proof came from,
+    - ``old_size``: number of entries in the earlier snapshot,
+    - ``old_root``: Merkle root of the earlier snapshot,
+    - ``new_size``: number of entries in the later snapshot,
+    - ``new_root``: Merkle root of the later snapshot,
+    - ``proof``: the proof node tuple, in generation (RFC 6962 SUBPROOF)
+      order.
+
+    Instances are immutable, may be built positionally and compare by all six
+    fields. Whether the proof node count fits the two sizes and whether the
+    nodes connect the two roots is left to :func:`verify_consistency`: a wrong
+    node count raises ValueError there and a mere content mismatch returns
+    False; the constructor only fixes the types, widths, ordering and ranges.
+    """
+
+    hash_name: str
+    old_size: int
+    old_root: bytes
+    new_size: int
+    new_root: bytes
+    proof: tuple[bytes, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+
+        if not isinstance(self.old_size, int) or isinstance(self.old_size, bool):
+            raise TypeError("old_size must be a non-bool integer")
+        if not isinstance(self.new_size, int) or isinstance(self.new_size, bool):
+            raise TypeError("new_size must be a non-bool integer")
+        if self.old_size < 0 or self.new_size < 0:
+            raise ValueError("sizes must be non-negative")
+        if self.old_size > self.new_size:
+            raise ValueError("old_size must not exceed new_size")
+        if self.new_size >= _U64_LIMIT:
+            raise ValueError("sizes must satisfy size < 2**64")
+
+        # old_root, new_root and every proof node must be exact bytes:
+        # bytearray and memoryview are rejected rather than copied, so a
+        # received credential never silently aliases a mutable caller buffer.
+        if not isinstance(self.old_root, bytes):
+            raise TypeError("old_root must be bytes")
+        if len(self.old_root) != digest_size:
+            raise ValueError(f"old_root must be {digest_size} bytes")
+
+        if not isinstance(self.new_root, bytes):
+            raise TypeError("new_root must be bytes")
+        if len(self.new_root) != digest_size:
+            raise ValueError(f"new_root must be {digest_size} bytes")
 
         if not isinstance(self.proof, tuple):
             raise TypeError("proof must be a tuple of digests")
@@ -5050,6 +5207,239 @@ def decode_batch_inclusion_proof(data: Any) -> BatchInclusionProof:
         entry_hashes=entry_hashes,
         size=size,
         root=root,
+        proof=proof,
+    )
+
+
+def encode_inclusion_proof(credential: Any) -> bytes:
+    """Encode an :class:`InclusionProof` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/inclusion/v1\\0"``; indices and sizes are unsigned 8-byte
+    big-endian integers and every other field is a u64 byte length followed
+    by the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in credential order, with nothing omitted, reordered or
+    appended: ``version`` (always 1), ``hash_name`` (UTF-8 blob), ``index``,
+    ``size``, the ``entry_hash`` blob, the ``root`` blob, and the ``proof``
+    node count followed by one blob per node in generation order.
+
+    ``credential`` must be an :class:`InclusionProof` — anything else, or a
+    field of the wrong type (including fields overwritten through
+    ``object.__setattr__`` bypassing the frozen constructor), raises
+    TypeError; an unknown hash algorithm, a digest of the wrong width, a
+    negative or out-of-range ``index``, or a non-positive or oversized
+    ``size`` raises ValueError. The call is read-only and deterministic: it
+    never mutates the credential, and re-encoding a decoded one reproduces
+    the original bytes exactly, so a proof can be persisted and restored in
+    another process and handed straight to :func:`verify_inclusion`.
+    """
+    if not isinstance(credential, InclusionProof):
+        raise TypeError("credential must be an InclusionProof")
+    # Re-validate every field even for a credential built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = InclusionProof(
+        credential.hash_name,
+        credential.index,
+        credential.size,
+        credential.entry_hash,
+        credential.root,
+        credential.proof,
+    )
+    parts = [
+        _INCLUSION_MAGIC,
+        _encode_u64(_INCLUSION_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.index, "index"),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(checked.entry_hash),
+        _encode_blob(checked.root),
+        _encode_u64(len(checked.proof), "proof count"),
+    ]
+    for node in checked.proof:
+        parts.append(_encode_blob(node))
+    return b"".join(parts)
+
+
+def decode_inclusion_proof(data: Any) -> InclusionProof:
+    """Decode bytes produced by :func:`encode_inclusion_proof`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, a
+    digest whose width does not match the named algorithm, a negative or
+    out-of-range ``index`` or a non-positive ``size`` raise ValueError. The
+    whole input is consumed exactly; the returned credential is a frozen
+    :class:`InclusionProof` whose fields equal the originally encoded ones,
+    re-encoding it reproduces the original bytes exactly, and it can be
+    passed to :func:`verify_inclusion` in another process exactly as the
+    original could.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_INCLUSION_MAGIC):
+        raise ValueError("not an auditchain inclusion-proof encoding")
+    offset = len(_INCLUSION_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _INCLUSION_VERSION:
+        raise ValueError("unsupported inclusion-proof version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    index = read_u64("index")
+    size = read_u64("size")
+    entry_hash = read_blob("entry_hash")
+    root = read_blob("root")
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the inclusion proof")
+    return InclusionProof(
+        hash_name=hash_name,
+        index=index,
+        size=size,
+        entry_hash=entry_hash,
+        root=root,
+        proof=proof,
+    )
+
+
+def encode_consistency_proof(credential: Any) -> bytes:
+    """Encode a :class:`ConsistencyProof` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/consistency/v1\\0"``; sizes are unsigned 8-byte big-endian
+    integers and every other field is a u64 byte length followed by the raw
+    bytes (a zero length is an all-zero u64). Fields appear strictly in
+    credential order, with nothing omitted, reordered or appended:
+    ``version`` (always 1), ``hash_name`` (UTF-8 blob), ``old_size``, the
+    ``old_root`` blob, ``new_size``, the ``new_root`` blob, and the
+    ``proof`` node count followed by one blob per node in generation (RFC
+    6962 SUBPROOF) order.
+
+    ``credential`` must be a :class:`ConsistencyProof` — anything else, or a
+    field of the wrong type (including fields overwritten through
+    ``object.__setattr__`` bypassing the frozen constructor), raises
+    TypeError; an unknown hash algorithm, a digest of the wrong width,
+    negative or reversed sizes, or a size outside the u64 range raises
+    ValueError. The call is read-only and deterministic: it never mutates
+    the credential, and re-encoding a decoded one reproduces the original
+    bytes exactly, so a proof can be persisted and restored in another
+    process and handed straight to :func:`verify_consistency`.
+    """
+    if not isinstance(credential, ConsistencyProof):
+        raise TypeError("credential must be a ConsistencyProof")
+    # Re-validate every field even for a credential built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = ConsistencyProof(
+        credential.hash_name,
+        credential.old_size,
+        credential.old_root,
+        credential.new_size,
+        credential.new_root,
+        credential.proof,
+    )
+    parts = [
+        _CONSISTENCY_MAGIC,
+        _encode_u64(_CONSISTENCY_VERSION, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.old_size, "old_size"),
+        _encode_blob(checked.old_root),
+        _encode_u64(checked.new_size, "new_size"),
+        _encode_blob(checked.new_root),
+        _encode_u64(len(checked.proof), "proof count"),
+    ]
+    for node in checked.proof:
+        parts.append(_encode_blob(node))
+    return b"".join(parts)
+
+
+def decode_consistency_proof(data: Any) -> ConsistencyProof:
+    """Decode bytes produced by :func:`encode_consistency_proof`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown or non-fixed-output hash
+    algorithm, truncation, trailing bytes, an oversized blob length, a
+    digest whose width does not match the named algorithm, a reversed or
+    oversized size pair, or a size outside the u64 range raises ValueError.
+    The whole input is consumed exactly; the returned credential is a
+    frozen :class:`ConsistencyProof` whose fields equal the originally
+    encoded ones, re-encoding it reproduces the original bytes exactly, and
+    it can be passed to :func:`verify_consistency` in another process
+    exactly as the original could.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_CONSISTENCY_MAGIC):
+        raise ValueError("not an auditchain consistency-proof encoding")
+    offset = len(_CONSISTENCY_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _CONSISTENCY_VERSION:
+        raise ValueError("unsupported consistency-proof version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    old_size = read_u64("old_size")
+    old_root = read_blob("old_root")
+    new_size = read_u64("new_size")
+    new_root = read_blob("new_root")
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the consistency proof")
+    return ConsistencyProof(
+        hash_name=hash_name,
+        old_size=old_size,
+        old_root=old_root,
+        new_size=new_size,
+        new_root=new_root,
         proof=proof,
     )
 

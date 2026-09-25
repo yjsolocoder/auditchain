@@ -284,7 +284,7 @@ verify_batch_inclusion(                           # True：直接交回既有核
 只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）且须与算法摘要等宽。证明
 节点数是否与所选叶子相称、能否重建出根，凭据不作判断，交给既有
 `verify_batch_inclusion`：节点数不符抛 `ValueError`，内容不符返回 `False`。字段
-类型错一律抛 `TypeError`；未知算法、宽度不符、索引非升序或越界、两序列不等长、
+类型错一律抛 `TypeError`；未知算法、宽度不符、索引为负、非升序或越界、两序列不等长、
 `size` 非正或超出 u64 范围抛 `ValueError`。
 
 字节流以魔数 `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 `version`
@@ -298,6 +298,82 @@ u64），三个元组均先写计数。`encode_batch_inclusion_proof` 只接受
 `bytearray` / `memoryview`，抛 `TypeError`），魔数或版本不符、截断、尾随字节、
 长度或整数越界、非法 UTF-8 及上述构造期结构问题均抛 `ValueError`。解码精确消费
 全部字节；编解码只读且确定，同一凭据重复编码、解码后重编码都逐字节相同。
+
+### 单条包含与跨快照一致性证明凭据（可持久化）
+
+`inclusion_proof` 与 `consistency_proof` 的证明元组本身只是内存对象；冻结凭据
+`InclusionProof` 与 `ConsistencyProof` 分别把 `verify_inclusion` /
+`verify_consistency` 所需的全部核验上下文与证明节点绑成一件制品，使两类证明可以
+落盘、跨进程恢复并直接交回既有离线核验入口：
+
+```python
+# 单条包含证明
+proof = log.inclusion_proof(3)
+credential = InclusionProof(
+    "sha256", 3, len(log), log.entry(3).entry_hash, log.merkle_root(), proof,
+)
+data = encode_inclusion_proof(credential)
+restored = decode_inclusion_proof(data)
+restored == credential                            # True：按全部字段相等
+encode_inclusion_proof(restored) == data          # True：重编码逐字节相同
+verify_inclusion(                                 # True：直接交回既有核验入口
+    restored.entry_hash, restored.index, restored.size,
+    restored.root, restored.proof, hash_name=restored.hash_name,
+)
+
+# 跨快照一致性证明
+nodes = log.consistency_proof(3, 6)
+credential = ConsistencyProof(
+    "sha256", 3, log.merkle_root(3), 6, log.merkle_root(6), nodes,
+)
+data = encode_consistency_proof(credential)
+restored = decode_consistency_proof(data)
+encode_consistency_proof(restored) == data        # True
+verify_consistency(                               # True
+    restored.old_size, restored.old_root,
+    restored.new_size, restored.new_root, restored.proof,
+    hash_name=restored.hash_name,
+)
+```
+
+`InclusionProof` 不可变、支持位置构造、按全部六个字段相等，字段依次为
+`hash_name`（摘要算法名）、`index`（条目绝对索引）、`size`（快照尺寸）、
+`entry_hash`（条目摘要）、`root`（快照根）与 `proof`（兄弟节点元组，保持生成时的
+元组顺序）。`index` 须为非 `bool`、非负且落在快照内（`0 <= index < size`），
+`size` 须为正；条目摘要、快照根与每个证明节点只接受精确的 `bytes`（拒绝
+`bytearray` / `memoryview`）且须与算法摘要等宽。
+
+`ConsistencyProof` 同样不可变、支持位置构造、按全部六个字段相等，字段依次为
+`hash_name`、`old_size`（旧快照尺寸）、`old_root`（旧快照根）、`new_size`
+（新快照尺寸）、`new_root`（新快照根）与 `proof`（证明节点元组，保持生成时的
+RFC 6962 SUBPROOF 顺序）。两尺寸均须为非 `bool`、非负、不超过 u64 上界，且
+`old_size <= new_size`；`old_size == 0` 与 `old_size == new_size` 均为合法构造
+（对应空证明）；旧根、新根与每个证明节点只接受精确的 `bytes` 且须与算法摘要
+等宽。
+
+两类凭据的证明节点数是否与叶子 / 两尺寸相称、能否重建根或连起两根，凭据不作
+判断，分别交给既有 `verify_inclusion` / `verify_consistency`：节点数不符抛
+`ValueError`，内容不符返回 `False`；内容不符的凭据仍照常往返。字段类型错一律抛
+`TypeError`；未知算法、摘要宽度不符、负索引或越界、尺寸逆序或超出 u64 范围在
+构造与编解码两端都抛 `ValueError`。
+
+字节流分别以魔数 `b"auditchain/inclusion/v1\0"` 与
+`b"auditchain/consistency/v1\0"` 开头，后接恒为 1 的 `version`（u64），随后严格
+按凭据字段顺序写内容，不得省略、换序或附加：
+
+- 包含证明：`hash_name` 的 UTF-8 blob、`index`（u64）、`size`（u64）、
+  `entry_hash` blob、`root` blob、`proof` 节点计数（u64）及逐个节点 blob；
+- 一致性证明：`hash_name` 的 UTF-8 blob、`old_size`（u64）、`old_root` blob、
+  `new_size`（u64）、`new_root` blob、`proof` 节点计数（u64）及逐个节点 blob。
+
+索引与尺寸写 8 字节无符号大端整数，其余内容写 u64 长度前缀 blob（零长度也是全零
+u64），证明元组先写计数。`encode_inclusion_proof` / `encode_consistency_proof`
+只接受对应凭据（其他类型，或绕过冻结构造器写入的字段类型错，抛 `TypeError`，并
+复验全部字段）；`decode_inclusion_proof` / `decode_consistency_proof` 只接受精确
+的 `bytes`（拒绝 `bytearray` / `memoryview`，抛 `TypeError`），魔数或版本不符、
+截断、尾随字节、长度或整数越界、非法 UTF-8 及上述构造期结构问题均抛
+`ValueError`。解码精确消费全部字节，返回冻结对象；编解码只读且确定，同一凭据
+重复编码、解码后重编码都逐字节相同，交回既有核验入口的结论不变。
 
 ### 可信签名快照检查点（Ed25519）
 
@@ -2503,9 +2579,31 @@ python3 -m auditchain
   `proof` 保持生成时的元组顺序；条目摘要、快照根与每个证明节点只接受精确的
   `bytes`（拒绝 `bytearray` / `memoryview`）且与算法摘要等宽；证明节点数与根的
   重建交由 `verify_batch_inclusion` 判定。字段类型错抛 `TypeError`，未知算法、
-  宽度不符、索引非升序或越界、两序列不等长、`size` 非正或超出 u64 范围抛
+  宽度不符、索引为负、非升序或越界、两序列不等长、`size` 非正或超出 u64 范围抛
   `ValueError`；规范二进制编解码由 `encode_batch_inclusion_proof` /
   `decode_batch_inclusion_proof` 提供
+- `InclusionProof(hash_name, index, size, entry_hash, root, proof)` —
+  不可变的单条包含证明凭据，把 `verify_inclusion` 的核验上下文与
+  `inclusion_proof` 的兄弟节点元组绑成一件制品，按全部六个字段相等、支持
+  位置构造；`index` 为非 `bool`、非负且落在快照内（`0 <= index < size`）的
+  整数，`size` 为正且小于 `2**64`，`entry_hash` 为被证条目摘要，`root` 为
+  快照 Merkle 根，`proof` 保持生成时的元组顺序；条目摘要、快照根与每个证明
+  节点只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）且与算法摘要
+  等宽；证明节点数与根的重建交由 `verify_inclusion` 判定。字段类型错抛
+  `TypeError`，未知算法、宽度不符、负索引或越界、`size` 非正或超出 u64 范围
+  抛 `ValueError`；规范二进制编解码由 `encode_inclusion_proof` /
+  `decode_inclusion_proof` 提供
+- `ConsistencyProof(hash_name, old_size, old_root, new_size, new_root, proof)` —
+  不可变的跨快照一致性证明凭据，把 `verify_consistency` 的核验上下文与
+  `consistency_proof` 的 RFC 6962 SUBPROOF 节点元组绑成一件制品，按全部六个
+  字段相等、支持位置构造；`old_size` / `new_size` 均为非 `bool`、非负且小于
+  `2**64` 的整数且满足 `old_size <= new_size`（两尺寸相等或旧尺寸为 0 时证明
+  为空），`old_root` / `new_root` 分别为两快照的 Merkle 根，`proof` 保持生成
+  时的元组顺序；两根与每个证明节点只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）且与算法摘要等宽；证明节点数与两根的衔接交由
+  `verify_consistency` 判定。字段类型错抛 `TypeError`，未知算法、宽度不符、
+  尺寸为负或逆序、超出 u64 范围抛 `ValueError`；规范二进制编解码由
+  `encode_consistency_proof` / `decode_consistency_proof` 提供
 - `SignedRoot(version, hash_name, size, root, head, signature)` — 不可变的 Ed25519
   可信签名快照检查点，按全部字段相等、支持位置构造；`version` 恒为 `1`，`root`
   为前 `size` 条的 Merkle 根，`head` 为该前缀末条摘要（空前缀为该摘要宽度的零
@@ -3343,6 +3441,32 @@ python3 -m auditchain
   顺序或范围、两序列不等长或 `size` 非法抛 `ValueError`；证明节点数与根是否相称
   由 `verify_batch_inclusion` 判定（节点数不符抛 `ValueError`，内容不符返回
   `False`）
+- `encode_inclusion_proof(credential)` / `decode_inclusion_proof(data)` —
+  单条包含证明凭据 `InclusionProof` 的规范二进制编码与解码：魔数
+  `b"auditchain/inclusion/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据
+  字段顺序写 hash_name 的 UTF-8 blob、index、size、entry_hash blob、root blob、
+  proof 节点计数及逐个节点 blob；索引与尺寸为 u64 大端，其余为 u64 长度前缀
+  blob，证明元组先写计数。解码精确消费全部字节，恢复对象按全部字段与原件相等、
+  重编码逐字节相同，可直接交回 `verify_inclusion` 离线核验。前者只接受
+  `InclusionProof`，后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；非对应类型或绕过冻结构造器写入的字段类型错抛 `TypeError`，
+  魔数、版本、UTF-8、算法、截断、尾随、长度或整数越界、宽度、负索引或索引越界、
+  `size` 非正抛 `ValueError`；证明节点数与叶子是否相称由 `verify_inclusion`
+  判定（节点数不符抛 `ValueError`，内容不符返回 `False`），内容不符的凭据仍
+  照常往返
+- `encode_consistency_proof(credential)` / `decode_consistency_proof(data)` —
+  跨快照一致性证明凭据 `ConsistencyProof` 的规范二进制编码与解码：魔数
+  `b"auditchain/consistency/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据
+  字段顺序写 hash_name 的 UTF-8 blob、old_size、old_root blob、new_size、
+  new_root blob、proof 节点计数及逐个节点 blob；尺寸为 u64 大端，其余为 u64
+  长度前缀 blob，证明元组先写计数。解码精确消费全部字节，恢复对象按全部字段与
+  原件相等、重编码逐字节相同，可直接交回 `verify_consistency` 离线核验。前者只
+  接受 `ConsistencyProof`，后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；非对应类型或绕过冻结构造器写入的字段类型错抛 `TypeError`，
+  魔数、版本、UTF-8、算法、截断、尾随、长度或整数越界、宽度、尺寸为负或逆序抛
+  `ValueError`；证明节点数与两尺寸是否相称、能否连起两根由 `verify_consistency`
+  判定（节点数不符抛 `ValueError`，内容不符返回 `False`），内容不符的凭据仍
+  照常往返
 - `dump_log(log, private_key)` / `load_log(data, public_key)` — 完整日志状态的
   签名导出与离线恢复，使一份完整、未裁剪、无认证、无加密历史的日志可落盘、跨进程
   恢复为独立、可变的普通无密钥 `AuditLog`：字节流为

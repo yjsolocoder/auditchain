@@ -107,6 +107,8 @@ class BatchInclusionProofConstructorTest(BatchInclusionProofTestBase):
         for bad, exc in (
             ([1, 3, 5], TypeError),
             ((), ValueError),
+            ((-1,), ValueError),
+            ((-1, 3), ValueError),
             ((1, 1), ValueError),
             ((3, 1), ValueError),
             ((True,), TypeError),

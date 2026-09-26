@@ -2191,8 +2191,45 @@ cont.bundle == bundle and cont.consistency == consistency   # True
   `TypeError`，公钥非 32 字节抛 `ValueError`，嵌套结构非法沿用
   `verify_signed_stage_auth_audit_bundle` / `verify_signed_consistency`
   的既有异常（`TypeError` / `ValueError`）；调用只读
-- 本凭据本次**不提供编解码**：既有线格式、签名原文、导出与批量签发行为
-  全部不变
+- `encode_signed_stage_auth_audit_continuation(receipt)` /
+  `decode_signed_stage_auth_audit_continuation(data)` 把整个演进后跨快照
+  续接凭据序列化为只读、确定的规范二进制并原样还原，使续接凭据可落盘、跨进程
+  恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不引入任何新的签名原文：
+
+```python
+from auditchain import (
+    decode_signed_stage_auth_audit_continuation,
+    encode_signed_stage_auth_audit_continuation,
+)
+
+data = encode_signed_stage_auth_audit_continuation(cont)       # bytes，可写文件/发网络
+restored = decode_signed_stage_auth_audit_continuation(data)  # 冻结续接凭据
+restored == cont                                              # True：字段相等
+encode_signed_stage_auth_audit_continuation(restored) == data # True：重编码逐字节相同
+verify_signed_stage_auth_audit_continuation(restored, public_key)  # True：无需持有日志
+```
+
+  字节流严格为 `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/stage-auth-audit-continuation/v1\0"`，`U` 为 8 字节
+  无符号大端整数，`B(x) = U(len(x)) || x`（零长 blob 也写全零 u64 长度
+  前缀）；`A` 须逐字节等于
+  `encode_signed_stage_auth_audit_bundle(bundle)` 的完整输出，`C` 为
+  `encode_signed_consistency(consistency)` 的完整输出，顺序固定为阶段认证
+  审计包在前、一致性凭据在后，禁止换序与尾随，解码精确消费两个 blob 且
+  **禁止尾随字节**，分别原样交给既有
+  `decode_signed_stage_auth_audit_bundle` 与 `decode_signed_consistency`，
+  嵌套异常沿用对应既有编解码器。`encode` 只接受
+  `SignedStageAuthAuditContinuation`（其余类型抛 `TypeError`，含绕过冻结
+  构造器写入的字段类型错），`decode` 只接受精确的 `bytes`（拒绝
+  `bytearray` / `memoryview`）；魔数或版本不符、截断、尾随、blob 长度越界
+  或任一嵌套格式非法均抛 `ValueError`；编解码不校验签名、标签、证明内容及
+  两半关联，两半快照或算法不一致照常往返，结构合法但验真不匹配仍可解码，
+  `verify_signed_stage_auth_audit_continuation` 返回 `False` 而不抛异常；
+  **空选择与空快照照常往返**，零项不省略任何结构，恢复前后核验结论一致。
+  解码结果为冻结对象、按两个字段与原件相等，重编码逐字节相同。编解码不新增
+  任何签名原文，也不加密其中的阶段密钥，字节流须像验证材料一样保护；两个
+  入口均只读且确定，既有各线格式、签名原文、导出与批量签发行为全部不变，
+  续接凭据族的其余编解码入口也不动
 
 #### 跨快照认证审计续接（Ed25519）
 
@@ -3308,7 +3345,9 @@ python3 -m auditchain
   `SignedConsistency`；容器字段类型错抛 `TypeError`；两半是否关联（算法一致及
   一致性 `new` 检查点与审计检查点全字段相等）不由构造器判定，两半内部的
   结构契约分别沿用 `verify_signed_stage_auth_audit_bundle` 与
-  `verify_signed_consistency`；该凭据本次不提供编解码，线格式、签名原文与
+  `verify_signed_consistency`；规范二进制编解码由
+  `encode_signed_stage_auth_audit_continuation` /
+  `decode_signed_stage_auth_audit_continuation` 提供，线格式、签名原文与
   既有导出/批量签发行为不变
 - `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
@@ -3944,8 +3983,7 @@ python3 -m auditchain
   `SignedStageAuthAuditContinuation`（含绕过构造器的容器字段类型错）抛
   `TypeError`，公钥不是 `bytes` 抛 `TypeError`、非 32 字节抛
   `ValueError`，嵌套结构非法沿用既有核验入口的 `TypeError` /
-  `ValueError`；该凭据本次不提供编解码，既有线格式、签名原文、导出与批量
-  签发行为不变，调用只读
+  `ValueError`；调用只读
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
@@ -4180,6 +4218,31 @@ python3 -m auditchain
   （`verify_signed_stage_auth_audit_bundle` 返回 `False`）；编码携带明文阶段
   密钥（只认证来源、不加密），字节流须像材料本体一样保护；两个入口均只读且
   确定，既有各线格式、签名原文、一次性导出与批量签发行为全部不变
+- `encode_signed_stage_auth_audit_continuation(receipt)` /
+  `decode_signed_stage_auth_audit_continuation(data)` — 演进后阶段认证审计
+  跨快照续接凭据的规范二进制编码与解码，使
+  `SignedStageAuthAuditContinuation` 可落盘、跨进程恢复后继续凭预置信任的
+  Ed25519 公钥离线验真，且不新增任何签名原文：字节流严格为
+  `D || U(1) || B(A) || B(C)`，其中
+  `D = b"auditchain/stage-auth-audit-continuation/v1\0"`，`U` 为 8 字节
+  无符号大端整数，`B(x) = U(len(x)) || x`（零长 blob 也写全零 u64 前缀）；
+  `A` 须逐字节等于
+  `encode_signed_stage_auth_audit_bundle(bundle)` 的完整输出，`C` 为
+  `encode_signed_consistency(consistency)` 的完整输出，阶段认证审计包在前、
+  一致性凭据在后，顺序固定、禁止换序与尾随，解码精确消费两个 blob 并禁止
+  尾随字节，分别交给既有 `decode_signed_stage_auth_audit_bundle` 与
+  `decode_signed_consistency`，嵌套异常沿用对应既有编解码器。前者只接受
+  `SignedStageAuthAuditContinuation`（其余类型抛 `TypeError`，含绕过冻结
+  构造器写入的字段类型错），后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`）；魔数或版本不符、截断、尾随、blob 长度越界或任一嵌套格式
+  非法抛 `ValueError`；解码对象按两个字段与原件相等、冻结且重编码逐字节
+  相同；**空选择与空快照照常往返**，零项不省略任何结构，恢复前后核验结论
+  一致；编解码不校验签名、标签、证明内容及两半关联，两半快照或算法不一致
+  照常往返，结构合法但验真不匹配仍可解码
+  （`verify_signed_stage_auth_audit_continuation` 返回 `False` 而不抛异常）；
+  不新增签名原文也不加密其中阶段密钥，字节流须像验证材料一样保护；两个
+  入口均只读且确定，既有各线格式、签名原文、导出与批量签发行为全部不变，
+  续接凭据族的其余编解码入口也不动
 - `encode_signed_auth_audit_continuation(receipt)` /
   `decode_signed_auth_audit_continuation(data)` — 跨快照认证审计续接凭据的
   规范二进制编码与解码，使 `SignedAuthAuditContinuation` 可落盘、跨进程恢复后

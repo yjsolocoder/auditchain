@@ -2854,6 +2854,15 @@ python3 -m auditchain
   `root` 必须相等，容器字段类型错抛 `TypeError`，两部分不描述同一快照抛
   `ValueError`，签名真伪由 `verify_signed_search_receipt` 判定；规范二进制编解码
   由 `encode_signed_search_receipt` / `decode_signed_search_receipt` 提供
+- `SignedEncryptedSearchReceipt(receipt, checkpoint)` — 不可变的可信加密检索
+  回执交付包，按两个字段相等、支持位置构造；`receipt` 为
+  `encrypted_search_receipt` 的 `EncryptedSearchReceipt`（必须是
+  `EncryptedSearchReceipt`，其自身结构契约由该类校验），`checkpoint` 为同一可
+  重建快照的 `SignedRoot`（必须是 `SignedRoot`）；两部分的 `hash_name`、`size`、
+  `root` 必须相等，容器字段类型错抛 `TypeError`，两部分不描述同一快照抛
+  `ValueError`，签名真伪由 `verify_signed_encrypted_search_receipt` 判定；规范
+  二进制编解码由 `encode_signed_encrypted_search_receipt` /
+  `decode_signed_encrypted_search_receipt` 提供
 - `SignedPrune(receipt, checkpoint)` — 不可变的可信签名裁剪授权，按两个字段
   相等、支持位置构造；`receipt` 为 `seal` 的前缀裁剪回执（必须是
   `PruneReceipt`），`checkpoint` 为同一前缀的 `SignedRoot`（必须是
@@ -3051,6 +3060,17 @@ python3 -m auditchain
     范围、尺寸或种子类型非法抛 `TypeError`，范围或尺寸越界、快照不可重建、
     种子非 32 字节抛 `ValueError`；离线用 `verify_signed_search_receipt`
     凭预信任公钥验真
+  - `signed_encrypted_search_receipt(query, key, private_key, start=None,
+    stop=None, size=None)` — 只读、可重复签发可信加密检索回执交付包，返回不可变
+    `SignedEncryptedSearchReceipt`：先调用 `encrypted_search_receipt(query, key,
+    start, stop, size)`（范围默认保留段、`size` 默认当前长度，语义与默认值沿用
+    既有加密检索签发），再调用 `sign_root(private_key, size)`，据此构造
+    `SignedEncryptedSearchReceipt(receipt, checkpoint)`，两部分描述同一可重建
+    快照，且不新增签名原文；同状态同种子两次签发逐字节相同。失败（非法查询值、
+    密钥、范围、种子或 `size`）在构造前抛出，不留半成品、不改变日志状态；
+    查询值、密钥、范围、尺寸或种子类型非法抛 `TypeError`，密钥或种子非 32
+    字节、范围或尺寸越界、快照不可重建抛 `ValueError`；离线用
+    `verify_signed_encrypted_search_receipt` 凭追加密钥与预信任公钥验真
   - `sign_prune(private_key, size=None)` — 只读签发可信签名裁剪授权，返回不可变
     `SignedPrune`：先调用 `seal(size)`，再调用 `sign_root(private_key, size)`
     （`size` 默认当前长度），据此构造 `SignedPrune(receipt, checkpoint)`，两部分
@@ -3245,6 +3265,20 @@ python3 -m auditchain
   回执或检查点结构非法时沿用 `SearchReceipt` / `verify_signed_root` 的既有
   异常（`TypeError` / `ValueError`），公钥长度非 32 字节抛 `ValueError`；
   调用只读
+- `verify_signed_encrypted_search_receipt(bundle, key, public_key)` — 凭追加
+  密钥与预先信任的 32 字节 Ed25519 公钥离线验证
+  `AuditLog.signed_encrypted_search_receipt` 签发的
+  `SignedEncryptedSearchReceipt` 可信加密检索回执交付包，无需持有日志：先调用
+  `verify_encrypted_search_receipt`（重验每个列出命中的摘要与包含证明对快照根，
+  并以 `key` 解密密封封装比对查询值）与 `verify_signed_root`（核验检查点签名），
+  并要求两部分的 `hash_name`、`size`、`root` 一致，三者皆为真才返回 `True`。
+  沿用既有加密回执口径：只判定列出的命中属实，少列不算失败；公钥不受信任、
+  追加密钥不符、两部分不一致，或条目 / 证明 / 根 / 封装 / 签名被改均返回
+  `False` 而不抛异常。入参不是 `SignedEncryptedSearchReceipt`（含绕过构造器的
+  容器字段类型错）、密钥或公钥不是 `bytes` 抛 `TypeError`；嵌套的回执或检查点
+  结构非法时沿用 `EncryptedSearchReceipt` / `verify_signed_root` 的既有异常
+  （`TypeError` / `ValueError`），密钥或公钥长度非 32 字节抛 `ValueError`；
+  调用只读
 - `verify_signed_prune(item, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_prune` 签发的 `SignedPrune` 裁剪授权，无需持有日志：
   先用 `verify_signed_root` 校验检查点签名，再要求回执与检查点描述同一前缀——
@@ -3393,6 +3427,21 @@ python3 -m auditchain
   `ValueError`、容器字段类型错抛 `TypeError`，嵌套错误沿用既有编码器），后者只
   接受 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob
   长度或嵌套格式非法抛 `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，
+  结构合法但验真不匹配仍可解码（验包返回 `False`，恢复前后核验结论一致）；
+  两个入口均为只读且确定
+- `encode_signed_encrypted_search_receipt(bundle)` /
+  `decode_signed_encrypted_search_receipt(data)` — 可信加密检索回执交付包的
+  规范二进制编码与解码，使 `SignedEncryptedSearchReceipt` 可落盘、跨进程传输后
+  继续凭追加密钥与预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
+  `b"auditchain/signed-encrypted-search/v1\0"` 开头，严格依次写 version=1
+  （u64）、receipt blob、checkpoint blob（不允许省略、换序或附加字段）；每个
+  blob 为 u64 字节长度前缀加原始字节，内容分别是既有
+  `encode_encrypted_search_receipt` 与 `encode_signed_root` 的完整规范字节，
+  解码精确消费两个 blob 并分别交给既有解码器。前者只接受
+  `SignedEncryptedSearchReceipt`（外层或两部分快照不一致抛 `ValueError`、容器
+  字段类型错抛 `TypeError`，嵌套错误沿用既有编码器），后者只接受 `bytes`
+  （拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度或
+  嵌套格式非法抛 `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，
   结构合法但验真不匹配仍可解码（验包返回 `False`，恢复前后核验结论一致）；
   两个入口均为只读且确定
 - `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —

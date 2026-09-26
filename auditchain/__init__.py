@@ -11,7 +11,7 @@ EncryptedSearchReceipt /
 SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
-ContinuationChainReport / AnchoredContinuationChain /
+ContinuationChainReport / AnchoredContinuationChain / AnchorSet /
 RotatedChain /
 RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
@@ -54,6 +54,7 @@ encode_integrity_report / decode_integrity_report /
 encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
+encode_anchor_set / decode_anchor_set /
 encode_rotated_anchor / decode_rotated_anchor /
 encode_rotated_anchor_set / decode_rotated_anchor_set /
 encode_signed_consistency / decode_signed_consistency /
@@ -91,6 +92,7 @@ from cryptography.hazmat.primitives.serialization import (
 
 __all__ = [
     "AnchoredContinuationChain",
+    "AnchorSet",
     "AuditLog",
     "AuditReceipt",
     "AuthTag",
@@ -125,6 +127,7 @@ __all__ = [
     "Verifier",
     "GENESIS_HASH",
     "decode_anchored_continuations",
+    "decode_anchor_set",
     "decode_audit_batch",
     "decode_audit_receipt",
     "decode_auth_batch",
@@ -172,6 +175,7 @@ __all__ = [
     "dump_signed_pruned_auth",
     "dump_signed_pruned_hybrid",
     "encode_anchored_continuations",
+    "encode_anchor_set",
     "encode_audit_batch",
     "encode_audit_receipt",
     "encode_auth_batch",
@@ -529,6 +533,14 @@ _INTEGRITY_REPORT_VERSION = 1
 # start and end anchors, in that order and with nothing else.
 _ANCHORED_CONTINUATION_MAGIC = b"auditchain/anchor/v1\0"
 _ANCHORED_CONTINUATION_VERSION = 1
+
+# Binary framing of encode_anchor_set / decode_anchor_set: a fixed magic,
+# then the envelope version as a u64, the package count as a u64 and one
+# u64-length-prefixed blob per AnchoredContinuationChain package in tuple
+# order (each the complete canonical encode_anchored_continuations
+# output), with nothing else.
+_ANCHOR_SET_MAGIC = b"auditchain/anchor-set/v1\0"
+_ANCHOR_SET_VERSION = 1
 
 # Binary framing of encode_rotated_anchor / decode_rotated_anchor: a fixed
 # magic, then the envelope version as a u64 and four u64-length-prefixed
@@ -2452,6 +2464,44 @@ class AnchoredContinuationChain:
             raise TypeError("start must be a SignedRoot")
         if not isinstance(self.end, SignedRoot):
             raise TypeError("end must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class AnchorSet:
+    """Several anchored continuation chain packages as one artifact.
+
+    Bundles a non-empty tuple of :class:`AnchoredContinuationChain`
+    packages — the separately landed batches of one continuation chain —
+    in traversal order and nothing else, so the whole set can be saved,
+    transferred and restored across processes as a single self-contained
+    artifact and later diagnosed with :func:`inspect_anchor_set` or
+    merged with :func:`merge_anchor_set`:
+
+    - ``items``: the non-empty tuple of
+      :class:`AnchoredContinuationChain` packages, in traversal order.
+
+    Instances are immutable, may be built positionally and compare by the
+    field (and are hashable). Only the container shape is validated here:
+    ``items`` must be a non-empty ``tuple`` holding only
+    :class:`AnchoredContinuationChain` objects — a non-tuple field or a
+    wrongly typed item raises TypeError, an empty tuple raises
+    ValueError. Whether the packages verify internally and join
+    anchor-to-anchor across the set is left to
+    :func:`inspect_anchor_set`.
+    """
+
+    items: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a non-empty tuple")
+        if len(self.items) == 0:
+            raise ValueError("items must be a non-empty tuple")
+        for item in self.items:
+            if not isinstance(item, AnchoredContinuationChain):
+                raise TypeError(
+                    "each item must be an AnchoredContinuationChain"
+                )
 
 
 @dataclass(frozen=True)
@@ -11381,6 +11431,106 @@ def decode_anchored_continuations(data: Any) -> AnchoredContinuationChain:
     if offset != len(data):
         raise ValueError("trailing bytes after the anchored continuations")
     return AnchoredContinuationChain(receipts, start, end)
+
+
+def encode_anchor_set(bundle: Any) -> bytes:
+    """Encode an :class:`AnchorSet` into canonical bytes.
+
+    The byte stream is ``D || U(1) || U(n) || B(P0) … B(Pn-1)`` with
+    ``D = b"auditchain/anchor-set/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the package count ``n`` and one
+    length-prefixed blob per package in ``bundle.items`` order — each
+    ``Pi`` byte-for-byte the complete canonical output of
+    :func:`encode_anchored_continuations` over ``items[i]``. Nothing may
+    be omitted, reordered or appended. The framing re-uses the existing
+    encoding only, introduces no new signing message and is read-only:
+    it never mutates the bundle.
+
+    ``bundle`` must be an :class:`AnchorSet` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_anchored_continuations` (TypeError or ValueError),
+    propagated unchanged. Encoding is deterministic: re-encoding a
+    decoded bundle reproduces the original bytes exactly.
+    """
+    if not isinstance(bundle, AnchorSet):
+        raise TypeError("bundle must be an AnchorSet")
+    parts = [
+        _ANCHOR_SET_MAGIC,
+        _encode_u64(_ANCHOR_SET_VERSION, "version"),
+        _encode_u64(len(bundle.items), "package count"),
+    ]
+    for item in bundle.items:
+        parts.append(_encode_blob(encode_anchored_continuations(item)))
+    return b"".join(parts)
+
+
+def decode_anchor_set(data: Any) -> AnchorSet:
+    """Decode bytes produced by :func:`encode_anchor_set`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray``
+    and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/anchor-set/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported) and the
+    non-zero u64 package count ``n`` followed by exactly ``n``
+    length-prefixed package blobs, all consumed whole with no trailing
+    bytes. Every package blob is handed whole to
+    :func:`decode_anchored_continuations`, so its framing and structural
+    rules apply verbatim and its exceptions propagate unchanged. A bad
+    magic or version, truncation, an oversized blob length, trailing
+    bytes or a zero package count raises ValueError, as does an illegal
+    nested encoding.
+
+    Signatures, tags, proofs, the adjacency between receipts and the
+    anchoring within and across packages are not checked here — only
+    :func:`inspect_anchor_set` confirms the decoded packages verify and
+    join as one chain; a structurally well-formed set whose credentials
+    fail to verify still decodes. The returned bundle is a frozen
+    :class:`AnchorSet` whose field equals the originally encoded one,
+    the tuple preserves the encoded order, and re-encoding reproduces
+    the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_ANCHOR_SET_MAGIC):
+        raise ValueError("not an auditchain anchor-set encoding")
+    offset = len(_ANCHOR_SET_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _ANCHOR_SET_VERSION:
+        raise ValueError(f"unsupported anchor-set version {version}")
+    package_count = read_u64("package count")
+    if package_count == 0:
+        raise ValueError("anchor set must contain at least one package")
+    items = []
+    for position in range(package_count):
+        items.append(
+            decode_anchored_continuations(
+                read_blob(f"anchored package {position}")
+            )
+        )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the anchor set")
+    return AnchorSet(tuple(items))
 
 
 def encode_rotated_anchor(x: Any) -> bytes:

@@ -37,6 +37,8 @@ verify_signed_consistency / verify_signed_prune /
 verify_rotation /
 verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
+encode_full_encrypted_search_receipt /
+decode_full_encrypted_search_receipt /
 encode_full_search_receipt / decode_full_search_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
@@ -148,6 +150,7 @@ __all__ = [
     "decode_continuations",
     "decode_continuation_chain_report",
     "decode_encrypted_search_receipt",
+    "decode_full_encrypted_search_receipt",
     "decode_full_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
@@ -198,6 +201,7 @@ __all__ = [
     "encode_continuations",
     "encode_continuation_chain_report",
     "encode_encrypted_search_receipt",
+    "encode_full_encrypted_search_receipt",
     "encode_full_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
@@ -340,6 +344,10 @@ _FULL_SEARCH_VERSION = 1
 # the encrypted search receipt, listing every entry of the searched range
 # with one shared compact batch proof plus the issuer-recorded hit indices.
 _FULL_ENCRYPTED_SEARCH_VERSION = 1
+# Binary framing of encode_full_encrypted_search_receipt /
+# decode_full_encrypted_search_receipt: same u64/blob rules as the full
+# search receipt, appending the hit-index count and one u64 per hit.
+_FULL_ENCRYPTED_SEARCH_MAGIC = b"auditchain/full-encrypted-search/v1\0"
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -6879,6 +6887,159 @@ def decode_full_search_receipt(data: Any) -> FullSearchReceipt:
         stop=stop,
         items=tuple(items),
         proof=proof,
+    )
+    _check_full_search_receipt_proof(receipt)
+    return receipt
+
+
+def encode_full_encrypted_search_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`FullEncryptedSearchReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/full-encrypted-search/v1\\0"``; every integer is an
+    unsigned 8-byte big-endian value and every blob is a u64 byte length
+    followed by the raw bytes (a zero length is an all-zero u64). Apart
+    from the magic and the trailing hit segment, the layout is exactly
+    :func:`encode_full_search_receipt`: ``version`` (always 1),
+    ``hash_name`` (UTF-8 blob), ``size``, ``root`` blob, ``query`` blob,
+    ``start``, ``stop``, item count, one item per listed entry —
+    ``Entry.index``, ``payload`` blob (the sealed envelope written
+    verbatim), ``previous_hash`` blob, ``entry_hash`` blob — and the
+    shared proof node count followed by one blob per proof digest. The hit
+    segment then writes the hit-index count and, per hit, one bare u64
+    index, with nothing omitted, reordered or appended. ``receipt`` must be
+    a :class:`FullEncryptedSearchReceipt` (anything else raises
+    TypeError); every field is re-validated exactly as the constructor
+    would, so a receipt whose frozen fields were bypassed into an illegal
+    shape raises the same TypeError or ValueError, and a shared proof
+    whose node count does not fit the listed indices and ``size`` raises
+    ValueError. Encoding is read-only and deterministic: re-encoding a
+    decoded receipt reproduces the original bytes exactly, so a receipt
+    can be persisted and restored in another process and handed straight
+    to :func:`verify_full_encrypted_search_receipt`.
+    """
+    if not isinstance(receipt, FullEncryptedSearchReceipt):
+        raise TypeError("receipt must be a FullEncryptedSearchReceipt")
+    checked = FullEncryptedSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+        receipt.hits,
+    )
+    _check_full_search_receipt_proof(checked)
+    parts = [
+        _FULL_ENCRYPTED_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(checked.query),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for digest in checked.proof:
+        parts.append(_encode_blob(bytes(digest)))
+    parts.append(_encode_u64(len(checked.hits), "hits count"))
+    for hit in checked.hits:
+        parts.append(_encode_u64(hit, "hit index"))
+    return b"".join(parts)
+
+
+def decode_full_encrypted_search_receipt(data: Any) -> FullEncryptedSearchReceipt:
+    """Decode bytes produced by :func:`encode_full_encrypted_search_receipt`.
+
+    ``data`` must be ``bytes`` — ``bytearray``, ``memoryview`` and every
+    other type raise TypeError. A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, an unknown hash algorithm,
+    truncation, trailing bytes, an oversized blob length, digest-width
+    mismatches, an out-of-range or inverted search range, non-ascending,
+    duplicate or out-of-range item indices, an incomplete coverage of the
+    searched range, a non-empty proof on an empty range, a shared proof
+    whose node count does not fit the listed indices and ``size``, or
+    duplicate, non-ascending or out-of-range hit indices all raise
+    ValueError. The decoded receipt is frozen, its fields equal the
+    originally encoded ones and re-encoding it reproduces the original
+    bytes exactly; it can be handed to
+    :func:`verify_full_encrypted_search_receipt` in another process. A
+    structurally valid receipt whose sealed content, proof or root does
+    not match still decodes and only fails verification. The bytes are
+    consumed exactly, with no trailing data accepted. The call is
+    read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_FULL_ENCRYPTED_SEARCH_MAGIC):
+        raise ValueError("not an auditchain full-encrypted-search encoding")
+    offset = len(_FULL_ENCRYPTED_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    query = read_blob("query")
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    hit_count = read_u64("hits count")
+    hits = tuple(read_u64("hit index") for _ in range(hit_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = FullEncryptedSearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        query=query,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+        proof=proof,
+        hits=hits,
     )
     _check_full_search_receipt_proof(receipt)
     return receipt

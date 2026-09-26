@@ -382,7 +382,39 @@ stop, items, proof, hits)`，支持位置构造、按全部十个字段相等：
 非法字段）在构造与核验两端都抛 `ValueError`；篡改的内容、证明或根一律返回
 `False` 不抛异常；入参不是 `FullEncryptedSearchReceipt` 或密钥类型错抛
 `TypeError`，密钥长度、范围与尺寸越界、快照不可重建、未知算法或摘要宽度不符
-抛 `ValueError`。本次不提供该回执的编解码。
+抛 `ValueError`。**纯空范围（`items == proof == hits == ()` 而 `size > 0`）的
+回执不携带任何可核对证据，记录的快照根不参与比对**，因此只凭结构判真；空快照
+（`size == 0`）则只接受规范空树根，根被改动时核验返回 `False` 而不抛异常。
+
+回执可编码为规范字节形式，落盘或传输后跨进程恢复并继续持钥离线核验：
+
+```python
+data = encode_full_encrypted_search_receipt(receipt)      # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_full_encrypted_search_receipt(data)     # 恢复对象冻结、按全部字段相等
+encode_full_encrypted_search_receipt(restored) == data    # True：重复/解码后重编码逐字节相同
+verify_full_encrypted_search_receipt(restored, key)       # True：跨进程恢复后继续持钥核验
+```
+
+编码以魔数 `b"auditchain/full-encrypted-search/v1\0"`（含 NUL 结尾）开头，后接
+恒为 1 的 `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、
+`size`、`root` blob、`query` blob、`start`、`stop` 与条目计数；除魔数与末尾
+命中段外，布局与 `encode_full_search_receipt` 完全一致——每个条目依次写
+`Entry.index`、`payload` blob（密封封装原样写入）、`previous_hash` blob、
+`entry_hash` blob，再写共享证明的节点计数及各摘要 blob，整数均为 8 字节无符号
+大端，blob 为 u64 字节长度后接原始字节（零长度也是全零 u64）。命中段先写命中
+索引计数，再逐个写**裸 8 字节无符号大端整数**（无长度前缀），严格保持升序，
+零项也写全零计数，禁止换序与尾随。
+`encode_full_encrypted_search_receipt` 只接受 `FullEncryptedSearchReceipt` 并
+复验全部字段与证明节点数（类型错抛 `TypeError`，结构非法、证明节点数与所列
+条目及 `size` 不相称或整数溢出 u64 抛 `ValueError`）；
+`decode_full_encrypted_search_receipt` 只接受精确的 `bytes`（拒绝
+`bytearray` / `memoryview`，其余类型抛 `TypeError`），魔数或版本不符、非法
+UTF-8、未知算法、截断、尾随、长度越界、范围或顺序非法、覆盖不全、摘要宽度或
+证明节点数不符、命中索引重复或乱序或越出记录范围均抛 `ValueError`。解码精确
+消费全部字节，空范围与空快照照常往返（条目、证明与命中三个空计数一个不省）；
+**内容、证明、根或命中被篡改的回执照常往返，仅核验判 `False`**；纯空范围
+回执往返后记录的根同样不参与比对。本层不新增任何签名原文，签名封装不在范围，
+既有查找、检索回执与各线格式全部不变。
 
 ### 可验证前缀裁剪
 
@@ -3004,7 +3036,10 @@ python3 -m auditchain
   `entry_hash` 与每个证明节点）只接受精确的 `bytes`，`bytearray` /
   `memoryview` 抛 `TypeError`。类型非法抛 `TypeError`，版本、范围、未知
   算法、摘要宽度、条目结构、覆盖或命中索引非法（含空范围携带非空证明）抛
-  `ValueError`；本次不提供编解码
+  `ValueError`；纯空范围（`size > 0` 而条目、证明、命中皆空）不携带可核对
+  证据、记录的根不参与比对，空快照只接受规范空树根；规范二进制编解码由
+  `encode_full_encrypted_search_receipt` /
+  `decode_full_encrypted_search_receipt` 提供
 - `BatchInclusionProof(hash_name, indices, entry_hashes, size, root, proof)` —
   不可变的紧凑批量包含证明凭据，把 `verify_batch_inclusion` 的核验上下文与
   `batch_inclusion_proof` 的共享证明节点绑成一件制品，按全部六个字段相等、支持
@@ -3467,8 +3502,10 @@ python3 -m auditchain
   命中集与回执记录的 `hits` 逐项一致且真实性成立才返回 `True`——与
   `verify_encrypted_search_receipt` 不同，少列或伪造命中是核验失败而非静默
   遗漏。普通条目、异钥封装与解密失败都不算命中也不判失败；记录了命中的回执
-  在错误密钥下返回 `False`，零命中回执不考验密钥、只按真实性判定；篡改的
-  内容、证明或根一律返回 `False` 而不抛异常。入参不是
+  在错误密钥下返回 `False`，零命中回执不考验密钥、只按真实性判定；纯空范围
+  （`size > 0` 而条目、证明、命中皆空）不携带可核对证据、记录的快照根不参与
+  比对，空快照则只接受规范空树根（根被改动时返回 `False`）；篡改的内容、
+  证明或根一律返回 `False` 而不抛异常。入参不是
   `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
   版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序或命中索引非法（含绕过
   冻结构造器写入的字段）抛 `ValueError`；调用只读
@@ -4168,6 +4205,28 @@ python3 -m auditchain
   `bytearray` / `memoryview`）；类型错抛 `TypeError`，魔数或版本不符、UTF-8、
   算法、截断、尾随、长度越界、范围或顺序非法、摘要宽度或证明层数不符抛
   `ValueError`
+- `encode_full_encrypted_search_receipt(receipt)` /
+  `decode_full_encrypted_search_receipt(data)` — 完整加密检索回执的规范二进制
+  编码与解码，使 `FullEncryptedSearchReceipt` 可落盘、跨进程恢复后继续由
+  `verify_full_encrypted_search_receipt` 持密钥离线核验（两个入口均只读且
+  确定）：魔数 `b"auditchain/full-encrypted-search/v1\0"`（含 NUL 结尾）开头，
+  后接恒为 1 的 `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8
+  blob）、`size`、`root` blob、`query` blob、`start`、`stop` 与条目计数；
+  除魔数与末尾命中段外布局与 `encode_full_search_receipt` 完全一致，每个条目
+  依次写 `Entry.index`、`payload` blob（密封加密封装原样写入）、
+  `previous_hash` blob、`entry_hash` blob，再写共享证明的节点计数及各摘要
+  blob，整数为 u64 大端，blob 为 u64 长度前缀加原始字节（零长度也是全零
+  u64）；命中段先写命中索引计数，再逐个写裸 8 字节无符号大端索引，禁止换序
+  与尾随。解码精确消费全部字节，恢复对象冻结、按全部字段与原件相等、重编码
+  逐字节相同；空范围与空快照照常往返，条目、证明与命中三个零计数一个不省；
+  内容、证明、根或命中被篡改的回执仍可往返、仅核验判 `False`；纯空范围
+  （`size > 0`）回执不携带可核对证据、记录的根不参与比对，空快照只接受规范
+  空树根。前者只接受 `FullEncryptedSearchReceipt` 并复验全部字段与证明节点
+  数，后者只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；非对应
+  类型或绕过冻结构造器写入的字段类型错抛 `TypeError`，魔数或版本不符、
+  UTF-8、未知算法、截断、尾随、长度越界、范围或顺序非法、覆盖不全、摘要宽度
+  不符、证明节点数与所列条目及 `size` 不相称、命中索引重复或乱序或越出记录
+  范围均抛 `ValueError`
 - `encode_batch_inclusion_proof(credential)` / `decode_batch_inclusion_proof(data)` —
   紧凑批量包含证明凭据 `BatchInclusionProof` 的规范二进制编码与解码：魔数
   `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据

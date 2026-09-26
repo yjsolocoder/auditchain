@@ -83,6 +83,63 @@ verify_search_receipt(restored)            # True
 截断、尾随、长度越界、范围或顺序非法、摘要宽度或证明层数不符均抛 `ValueError`。
 空结果与空快照照常往返且核验通过；内容被篡改的回执仍可往返，仅核验判 `False`。
 
+### 按内容查找的完整检索回执（全覆盖）
+
+`search_receipt` 只判定列出的命中属实，不判定结果集是否完整；`full_search_receipt`
+补上这一层：回执携带被搜范围内**每一个**条目（而非仅命中），并附一份覆盖全部
+条目的共享紧凑批量证明。核验方无需持有日志，先认证条目真伪，再自行比对查询值，
+得出的就是范围内全部命中——少列条目在构造与核验两端都是结构错误，无法隐瞒：
+
+```python
+receipt = log.full_search_receipt("agent started")  # 范围默认整个保留段，size 默认当前长度
+receipt.query                                       # b"agent started"：str 按 UTF-8 规范化
+[e.index for e in receipt.items]                    # [0, 1, 2, ...]：范围内逐条列出
+[e.index for e in receipt.items if e.payload == receipt.query]  # 核验方自行得出的完整命中集
+verify_full_search_receipt(receipt)                 # True：无需持有日志即可离线核验
+log.full_search_receipt("agent", 1, 3, size=3)      # 半开范围 [1, 3) + 前 3 条快照
+```
+
+回执为冻结的 `FullSearchReceipt(version=1, hash_name, size, root, query, start,
+stop, items, proof)`，支持位置构造、按全部九个字段相等：记录算法、快照尺寸与
+Merkle 根、规范化查询值、半开范围 `[start, stop)`、该范围内**每一个** `Entry`
+（按绝对索引严格升序，恰为 `start .. stop-1` 逐条各一份）以及一份覆盖它们的共享
+紧凑批量证明（与 `batch_inclusion_proof` 同一布局，不再逐条附包含证明）。查询值
+只收 `bytes` 或 `str`（后者按 UTF-8 规范化）；范围默认 `[retain_from, size)`，
+`size` 默认当前长度且快照须可重建。空范围与空快照照样可以签发和核验，此时条目
+与证明都是空元组。签发为只读、可重复调用，不改变条目、`head`、认证状态、Merkle
+根或证明；查询值、范围或尺寸类型非法抛 `TypeError`，范围或尺寸越界、快照不可
+重建抛 `ValueError`。
+
+离线核验逐条重算 `entry_digest`，再用共享批量证明（`verify_batch_inclusion`）
+核对快照根；由于范围内条目无一缺失，核验方自行比对 `entry.payload == receipt.query`
+即得完整命中集。条目覆盖不全、重复或乱序在构造端即抛 `ValueError`（绕过冻结构造器
+写入的非法字段在核验端同样复验）；结构合法但条目内容、证明或根不符返回 `False`；
+入参不是 `FullSearchReceipt` 抛 `TypeError`，证明节点数与所列索引及 `size` 不符抛
+`ValueError`。
+
+回执可编码为规范字节形式，落盘或传输后恢复并继续离线核验：
+
+```python
+data = encode_full_search_receipt(receipt)      # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_full_search_receipt(data)     # 字段与原回执相等
+encode_full_search_receipt(restored) == data    # True：重复编码字节相同
+verify_full_search_receipt(restored)            # True
+```
+
+编码以魔数 `b"auditchain/full-search/v1\0"`（含 NUL 结尾）开头，后接恒为 1 的
+`version`，随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、`size`、`root`
+blob、`query` blob、`start`、`stop` 与条目计数；每个条目依次写 `Entry.index`、
+`payload` blob、`previous_hash` blob、`entry_hash` blob（与 `encode_audit_receipt`
+的条目写法相同），最后写共享证明的节点计数及各摘要 blob；整数均为 8 字节无符号
+大端，blob 为 u64 字节长度后接原始字节（零长度也是全零 u64），禁止换序与尾随。
+`encode_full_search_receipt` 只接受 `FullSearchReceipt` 并复验全部字段与证明节点
+计数（类型错抛 `TypeError`，结构非法抛 `ValueError`）；
+`decode_full_search_receipt` 只接受精确的 `bytes`（拒绝 `bytearray` /
+`memoryview`），魔数、版本、非法 UTF-8、未知算法、截断、尾随、长度越界、范围、
+顺序或覆盖非法、摘要宽度或证明节点数不符均抛 `ValueError`。空范围与空快照照常
+往返且核验通过；内容被篡改的回执仍可往返，仅核验判 `False`。本层不新增签名
+原文，签名封装不在范围，旧接口与各线格式行为不变。
+
 ### 加密追加（AES-256-GCM）
 
 `encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但
@@ -2782,6 +2839,18 @@ python3 -m auditchain
   完整。类型非法抛 `TypeError`，版本、范围、未知算法、摘要宽度或条目结构
   非法（含索引越出记录范围、非严格升序）抛 `ValueError`；规范二进制编解码由
   `encode_search_receipt` / `decode_search_receipt` 提供
+- `FullSearchReceipt(version, hash_name, size, root, query, start, stop, items,
+  proof)` — 不可变的完整检索回执，把一次按内容查找的**全覆盖**结果（算法、
+  快照尺寸与 Merkle 根、规范化查询值、半开范围 `[start, stop)`、该范围内每一个
+  `Entry` 与一份共享紧凑批量证明）绑成一件可落盘制品，按全部九个字段相等、支持
+  位置构造；`version` 恒为 `1`，`query` 只收 `bytes` 或 `str`（后者按 UTF-8
+  规范化后存储），范围满足 `0 <= start <= stop <= size`，`items` 按绝对索引严格
+  升序且恰为 `start .. stop-1` 逐条各一份（覆盖不全、重复或乱序均非法），
+  `proof` 为覆盖全部所列条目的共享紧凑批量证明（与 `batch_inclusion_proof`
+  同一布局，空范围时与 `items` 同为 `()`）；核验方认证条目后自行比对查询值即得
+  完整命中集。类型非法抛 `TypeError`，版本、范围、未知算法、摘要宽度、条目结构
+  或覆盖非法（含空范围携带非空证明）抛 `ValueError`；规范二进制编解码由
+  `encode_full_search_receipt` / `decode_full_search_receipt` 提供
 - `EncryptedSearchReceipt(version, hash_name, size, root, query, start, stop,
   items)` — 不可变的离线加密检索回执，把一次 `find_encrypted` 的结果（算法、
   快照尺寸与 Merkle 根、规范化查询值、半开范围 `[start, stop)` 与命中条目）绑成
@@ -2964,6 +3033,15 @@ python3 -m auditchain
     空快照为 `()`）。`query` 只收 `bytes` 或 `str`（后者按 UTF-8 规范化）；
     查询值、范围或尺寸类型非法抛 `TypeError`，范围或尺寸越界、快照不可重建抛
     `ValueError`；签发为只读，不改变条目、`head`、认证状态、Merkle 根或证明
+  - `full_search_receipt(query, start=None, stop=None, size=None)` — 把一次按内容
+    查找固化为可离线核验**完整性**的冻结 `FullSearchReceipt`：在与 `find` 相同的
+    半开范围 `[start, stop)`（默认 `[retain_from, size)`）内，`size` 默认当前长度
+    且快照须可重建；回执记录算法、快照尺寸与 Merkle 根、规范化查询值、范围、该
+    范围内**每一个**条目（按绝对索引严格升序逐条各一份）以及一份覆盖全部条目的
+    共享紧凑批量证明（空范围与空快照时条目与证明均为 `()`）。`query` 只收 `bytes`
+    或 `str`（后者按 UTF-8 规范化）；查询值、范围或尺寸类型非法抛 `TypeError`，
+    范围或尺寸越界、快照不可重建抛 `ValueError`；签发为只读、可重复调用，不改变
+    条目、`head`、认证状态、Merkle 根或证明
   - `encrypted_search_receipt(query, key, start=None, stop=None, size=None)` —
     把一次 `find_encrypted` 的结果固化为可离线核验的冻结
     `EncryptedSearchReceipt`：沿用 `find_encrypted` 的口径，在半开范围
@@ -3188,6 +3266,16 @@ python3 -m auditchain
   记录范围等结构非法（含绕过冻结构造器写入的字段）抛 `TypeError` /
   `ValueError`，与构造端一致；结构合法但条目内容、证明、根或命中内容不符返回
   `False`，匹配返回 `True`
+- `verify_full_search_receipt(receipt)` — 无需持有日志即可验证
+  `FullSearchReceipt`：逐条重算每个所列条目的 `entry_digest`，再用那份共享紧凑
+  批量证明（`verify_batch_inclusion`）核对记录的快照根；由于回执携带被搜范围内
+  每一个条目（覆盖不全、重复或乱序在构造端即被拒绝），核验方自行比对
+  `entry.payload == receipt.query` 即得范围内**完整**命中集——少列条目是结构
+  错误而非静默遗漏。空范围（`items == ()`、`proof == ()`）照常核验，空快照
+  （`size == 0`）只接受规范空树根。入参不是 `FullSearchReceipt` 抛 `TypeError`；
+  字段类型、版本、范围、算法、摘要宽度、索引顺序、覆盖或证明节点数等结构非法
+  （含绕过冻结构造器写入的字段）抛 `TypeError` / `ValueError`，与构造端一致；
+  结构合法但条目内容、证明或根不符返回 `False`，匹配返回 `True`
 - `verify_encrypted_search_receipt(receipt, key)` — 无需持有日志即可验证
   `EncryptedSearchReceipt`：逐条重算每个命中条目的 `entry_digest`、核验其包含
   证明是否落在记录的快照根内，再以 `key` 用 `decrypt_entry` 解密密封封装并把
@@ -3834,6 +3922,21 @@ python3 -m auditchain
   字段与证明层数，后者只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；
   类型错抛 `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度越界、范围或
   顺序非法、摘要宽度或证明层数不符抛 `ValueError`
+- `encode_full_search_receipt(receipt)` / `decode_full_search_receipt(data)` —
+  完整检索回执的规范二进制编码与解码，使 `FullSearchReceipt` 可落盘、跨进程恢复
+  后继续由 `verify_full_search_receipt` 离线核验（编解码只读且确定）：魔数
+  `b"auditchain/full-search/v1\0"`（含 NUL 结尾）开头，后接恒为 1 的 `version`，
+  随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、`size`、`root` blob、
+  `query` blob、`start`、`stop` 与条目计数，禁止换序与尾随；整数为 u64 大端，
+  blob 为 u64 长度前缀加原始字节（零长度也是全零 u64），每个条目依次写
+  `Entry.index`、`payload` blob、`previous_hash` blob、`entry_hash` blob（与
+  `encode_audit_receipt` 的条目写法相同），最后写共享证明的节点计数及各摘要
+  blob。解码精确消费全部字节，恢复的回执按全部字段与原件相等、重编码逐字节
+  相同；空范围与空快照照常往返且核验通过，内容被篡改的回执仍可往返、仅核验判
+  `False`。前者只接受 `FullSearchReceipt` 并复验全部字段与证明节点计数，后者
+  只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；类型错抛
+  `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度越界、范围、顺序或
+  覆盖非法、摘要宽度或证明节点数不符抛 `ValueError`
 - `encode_encrypted_search_receipt(receipt)` /
   `decode_encrypted_search_receipt(data)` — 加密检索回执的规范二进制编码与解码，
   使 `EncryptedSearchReceipt` 可落盘、跨进程恢复后继续由

@@ -2108,6 +2108,92 @@ verify_signed_stage_auth_audit_bundle(restored, public_key)  # 恢复前后核�
   来源、不加密），字节流须像材料本体一样保护；两个入口均只读且确定，既有
   各线格式、签名原文、一次性导出与批量签发行为全部不变
 
+#### 演进后阶段认证审计的跨快照续接（Ed25519）
+
+`SignedStageAuthAuditBundle` 证明"演进后交付的选中条目属于某个已签名快照"，
+`SignedConsistency` 证明"新快照由旧快照只追加形成"，但两者仍要分别交付、
+分别核对。冻结的
+`SignedStageAuthAuditContinuation(bundle, consistency)` 是
+`SignedAuthAuditContinuation` 的**阶段对应物**：把
+`SignedStageAuthAuditBundle` 与 `SignedConsistency` 组合成**一个**
+不可变续接凭据，离线方只凭预置信任的 32 字节 Ed25519 公钥，即可在同一凭据上
+既凭已签名的交付阶段材料逐项核验前向安全标签、确认选中条目属于新快照，又确认
+该新快照由一个更早日签名快照只追加续接而来，全程不持有日志、也**不新增任何
+签名原文**——一致性凭据的 `new` 检查点就是审计包检查点本身（全字段相等）：
+
+```python
+from auditchain import verify_signed_stage_auth_audit_continuation
+
+log = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e", "f"):
+    log.append(record)
+log.rotate_key()                          # 至少演进过一次才可签发
+
+# old_size=3 的前缀续接到 size=5 的新快照；size 默认 len(log)
+cont = log.signed_stage_auth_audit_continuation(3, [4, 1], seed, size=5)
+cont.consistency.old == log.sign_root(seed, 3)              # True：旧快照检查点
+cont.consistency.new == cont.bundle.audit.checkpoint          # True：新检查点即审计检查点
+cont.consistency.proof == log.consistency_proof(3, 5)       # True：逐字节相同
+# 首个标签位于交付阶段（这里为 1），随后按所选索引升序连续
+[tag.stage for _, tag in cont.bundle.auth.items]       # [1, 2]
+verify_signed_stage_auth_audit_continuation(cont, public_key)  # True：无需持有日志
+verify_signed_stage_auth_audit_continuation(cont, other_key)   # False：未信任的公钥
+# 空选择照常交付材料且阶段不动；不耗一次性资格，同状态可重复签发
+empty = log.signed_stage_auth_audit_continuation(3, (), seed, size=5)
+verify_signed_stage_auth_audit_continuation(empty, public_key)  # True
+
+# 两半分别等价于同型日志上的既有签发，组合两半不新增签名原文
+twin = AuditLog(key=b"shared-secret")
+for record in ("a", "b", "c", "d", "e", "f"):
+    twin.append(record)
+twin.rotate_key()
+bundle = twin.signed_stage_auth_audit_bundle([4, 1], seed, size=5)
+consistency = twin.signed_consistency(3, seed, new_size=5)
+cont.bundle == bundle and cont.consistency == consistency   # True
+```
+
+- 续接凭据为冻结的
+  `SignedStageAuthAuditContinuation(bundle:SignedStageAuthAuditBundle,
+  consistency:SignedConsistency)`，支持位置构造、按两个字段相等；`bundle`
+  必须是 `SignedStageAuthAuditBundle`、`consistency` 必须是
+  `SignedConsistency`，容器字段类型错抛 `TypeError`；两半是否关联不由构造器
+  判定，两包内部的结构契约沿用各自既有核验，构造器不重复校验
+- `AuditLog.signed_stage_auth_audit_continuation(old_size, indices, private_key,
+  size=None)` 在一次调用内原子组合两半：`size` 默认当前日志长度；尺寸须为非
+  `bool` 整数且满足 `0 <= old_size <= size <= len(log)`，两快照均可重建
+  （已剪枝的前缀抛 `ValueError`）；`indices` 为互异非 `bool` 整数，范围
+  `retain_from <= i < size`，**空选择允许**。审计半与
+  `signed_stage_auth_audit_bundle` 一致——非空快照自动并入末条（索引
+  `size - 1`，即使未选），认证半只对调用方选中索引签标签，首个标签位于
+  交付阶段、按索引升序签发；一致性半只读，其 `new` 检查点即审计检查点，
+  组合两半不新增任何签名原文。所有校验（尺寸链、两快照可重建、索引、
+  重复、种子、stage 容量与演进后阶段）均在签名与提交之前完成，**失败
+  原子**：不演进密钥、不写标签、不改条目与索引等任何日志状态；成功时
+  stage 恰推进所选条数
+- 资格与 `signed_stage_auth_bundle` 一致：只有带认证密钥且**至少演进过一次**
+  （`stage > 0`）的日志可以签发，初始阶段或无密钥模式抛 `ValueError`；
+  签发只读、可重复，**不消耗** stage-0 的一次性导出资格，同状态同种子
+  两次输出逐字节相同（Ed25519 签名确定）
+- 尺寸、容器、索引或种子类型错（非整数、为 `bool`、不可迭代、种子非
+  `bytes`）抛 `TypeError`；索引重复、种子非 32 字节、尺寸越界/快照不可
+  重建、stage 容量不足抛 `ValueError`；索引越出保留快照范围抛
+  `IndexError`
+- `verify_signed_stage_auth_audit_continuation(receipt, public_key) -> bool`
+  完全离线只读：先用 `verify_signed_stage_auth_audit_bundle` 完整核验
+  演进后阶段认证审计包（显式核验签名阶段材料签名，空选择也不因零项空过；
+  逐项标签、批量包含证明、审计检查点签名与同索引 `Entry` 一致），再用
+  `verify_signed_consistency` 完整核验一致性包（两个检查点签名与 Merkle
+  一致性证明），最后要求两包算法一致且一致性凭据的 `new` 检查点与
+  审计检查点**全字段相等**（含签名本身）。公钥不受信任，或任一签名、
+  标签、证明、检查点被改，或两包算法/快照不一致，一律返回 `False`
+  而绝不抛异常；入参不是 `SignedStageAuthAuditContinuation`（含绕过冻结
+  构造器写入的容器字段类型错）抛 `TypeError`，公钥不是 `bytes` 抛
+  `TypeError`，公钥非 32 字节抛 `ValueError`，嵌套结构非法沿用
+  `verify_signed_stage_auth_audit_bundle` / `verify_signed_consistency`
+  的既有异常（`TypeError` / `ValueError`）；调用只读
+- 本凭据本次**不提供编解码**：既有线格式、签名原文、导出与批量签发行为
+  全部不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -3214,6 +3300,16 @@ python3 -m auditchain
   不重复校验；签名只认证来源、不加密其中阶段密钥；规范二进制编解码由
   `encode_signed_stage_auth_audit_bundle` /
   `decode_signed_stage_auth_audit_bundle` 提供
+- `SignedStageAuthAuditContinuation(bundle, consistency)` — 不可变的演进后阶段
+  认证审计跨快照续接凭据（`SignedAuthAuditContinuation` 的阶段对应物），
+  把选中条目的演进后阶段认证审计包与一个跨快照一致性凭据捆为一件，按两个
+  字段相等、支持位置构造；`bundle` 必须是
+  `SignedStageAuthAuditBundle`，`consistency` 必须是
+  `SignedConsistency`；容器字段类型错抛 `TypeError`；两半是否关联（算法一致及
+  一致性 `new` 检查点与审计检查点全字段相等）不由构造器判定，两半内部的
+  结构契约分别沿用 `verify_signed_stage_auth_audit_bundle` 与
+  `verify_signed_consistency`；该凭据本次不提供编解码，线格式、签名原文与
+  既有导出/批量签发行为不变
 - `SignedAuditBatch(batch, checkpoint)` — 不可变的可信紧凑批量审计包，按两个
   字段相等、支持位置构造；`batch` 为 `audit_batch` 的五元组（必须是 `tuple`），
   `checkpoint` 为同一快照的 `SignedRoot`（必须是 `SignedRoot`）；容器字段类型错
@@ -3826,6 +3922,30 @@ python3 -m auditchain
   `bytes` 抛 `TypeError`，公钥非 32 字节抛 `ValueError`，其余嵌套结构非法沿用
   `verify_signed_stage_auth_bundle` / `verify_signed_audit_batch` 的既有异常
   （`TypeError` / `ValueError`）
+- `AuditLog.signed_stage_auth_audit_continuation(old_size, indices, private_key,
+  size=None)` 原子签发与 `verify_signed_stage_auth_audit_continuation(receipt,
+  public_key) -> bool` 离线只读核验 `SignedStageAuthAuditContinuation`
+  演进后阶段认证审计跨快照续接凭据（由该方法原子签发，或用
+  `signed_stage_auth_audit_bundle` 与 `signed_consistency` 的结果手工
+  构造）：`size` 默认当前长度，尺寸须满足非 `bool` 整数
+  `0 <= old_size <= size <= len(log)` 且两快照均可重建（剪枝掉的前缀抛
+  `ValueError`）；`indices` 为互异非 `bool` 整数、范围
+  `retain_from <= i < size`（空选择允许，审计仍自动并入非空快照末条，阶段
+  不推进）；仅带认证密钥且至少演进过一次（`stage > 0`）可签发，初始
+  阶段或无密钥模式抛 `ValueError`；签发只读、可重复、不耗 stage-0 一次性
+  导出资格，同状态同种子输出逐字节相同；全部校验在签名与提交前完成，失败不演进
+  密钥、不写标签、不改条目与索引，成功 stage 恰推进所选条数。索引/尺寸/
+  旧尺寸/种子类型错抛 `TypeError`，重复索引、种子非 32 字节、尺寸越界或
+  快照不可重建、stage 容量不足抛 `ValueError`，越界索引抛 `IndexError`。
+  核验先由 `verify_signed_stage_auth_audit_bundle` 核验认证审计包、再由
+  `verify_signed_consistency` 核验一致性包，并要求两包算法一致且一致性凭据
+  `new` 检查点与审计检查点全六字段相等（含签名）；未受信任公钥或任一
+  签名、标签、证明、检查点被改一律返回 `False` 而不抛异常；入参不是
+  `SignedStageAuthAuditContinuation`（含绕过构造器的容器字段类型错）抛
+  `TypeError`，公钥不是 `bytes` 抛 `TypeError`、非 32 字节抛
+  `ValueError`，嵌套结构非法沿用既有核验入口的 `TypeError` /
+  `ValueError`；该凭据本次不提供编解码，既有线格式、签名原文、导出与批量
+  签发行为不变，调用只读
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的
@@ -4240,6 +4360,42 @@ python3 -m auditchain
   `ValueError`；解码保持 tuple 顺序、字段相等且重编码逐字节相同，不校验
   签名、证明、包间接缝与锚定关系，结构合法而验真不匹配仍可解码；两个
   入口均为只读且确定，旧接口不变
+- `RotatedChain(receipts, rotations, start, end)` — 冻结的轮换感知锚定链包，
+  把跨密钥续接凭据 tuple、逐跳轮换 tuple 与首尾两个 `SignedRoot` 锚点绑为一件
+  可持久化、可跨进程恢复的制品，支持位置/关键字构造、按全部四个字段相等
+  （可哈希）；`receipts` 为非空 `SignedAuthAuditContinuation` tuple（至少两段），
+  `rotations` 为 `rotate_signer` 的 `(old, new_key, new, auth)` 轮换四元组
+  tuple，条数恰为段数减一，`start` / `end` 必须是 `SignedRoot`；两 tuple
+  之一非 tuple、元素类型错或端点非 `SignedRoot` 抛 `TypeError`，少于两段或
+  轮换数不符抛 `ValueError`；轮换真伪、跨钥验真与锚定两端关系不由此
+  构造器判定，留给 `inspect_rotated_anchors`
+- `encode_rotated_anchor(bundle)` / `decode_rotated_anchor(data)` — 单个轮换
+  感知锚定链包的规范二进制编码与解码，使 `RotatedChain` 可落盘、跨进程
+  恢复后继续凭预置信任公钥离线诊断，全程只读、不新增签名域：字节流严格为
+  `D || U(1) || B(C) || B(R) || B(S) || B(E)`，其中
+  `D = b"auditchain/ra/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`，`C` / `R` / `S` / `E` 分别逐字节为既有
+  `encode_continuations(receipts)` / `encode_rotations(rotations)` /
+  `encode_signed_root(start)` / `encode_signed_root(end)` 的完整输出，按序排列且
+  禁止尾随字节；前者只接受 `RotatedChain`（否则抛 `TypeError`），嵌套编码
+  异常原样传播；后者只接受精确 `bytes`（拒绝 `bytearray` / `memoryview`），
+  魔数或版本不符、截断、blob 长度越界或尾随字节抛 `ValueError`，四个
+  blob 分别交给既有解码器、嵌套异常原样传播，恢复对象再经 `RotatedChain`
+  形状校验；解码保序、字段相等且重编码逐字节相同，但不校验签名、授权、
+  证明与锚定关系，结构合法而验真不匹配仍可解码，由
+  `inspect_rotated_anchors` 报告而非抛出
+- `inspect_rotated_anchors(bundle, key)` — 凭预置信任的 32 字节
+  Ed25519 公钥对单个 `RotatedChain` 离线只读诊断（两参均无默认值）：
+  先以制品自身字段调用 `inspect_rotated_chain(bundle.receipts,
+  bundle.rotations, key)`，失败报告原样返回（`"verify"`、`"growth"`、
+  `"duplicate"`、`"rotation_duplicate"`、`"rotation"`、`"rotation_link"`
+  与首错顺序不变）；仅内部诊断成功后才先比起点（首段
+  `consistency.old` 须与 `start` 全六字段相等，不符报 `"start"`、索引 `0`）、
+  后比终点（末段 `consistency.new` 须与 `end` 全等，不符报 `"end"`、
+  索引为末段位置；两端皆不符只报先检查的 `"start"`。`bundle` 非
+  `RotatedChain` 或 `key` 非 `bytes` 抛 `TypeError`，`key`
+  非 32 字节抛 `ValueError`，嵌套异常原样传播；不持有日志、不修改制品
+  或公钥、不新增签名域，旧接口不变
 - `inspect_rotated_anchor_set(items, bridges, key)` — 分批落盘的多个
   `RotatedChain` 与包间轮换的按序只读核验（三参均无默认值）：`items` 为
   非空 `RotatedChain` tuple，`bridges` 为轮换四元组 tuple 且长度恰为
@@ -4254,6 +4410,20 @@ python3 -m auditchain
   非 `bytes` 抛 `TypeError`，空集、桥数不符或 `key` 长度不符抛
   `ValueError`，嵌套异常原样传播；全程离线只读、不新增签名域或线格式，
   旧接口不变
+- `merge_rotated_anchor_set(items, bridges, key)` —
+  `inspect_rotated_anchor_set` 的生产性对应物（三参均无默认值）：完全按
+  该诊断核验各包与包间桥，仅当诊断全部成功——每包在逐跳信任钥下自身成立、
+  每个桥真实且与两端锚点接缝成立——才返回**新冻结**
+  `RotatedChain`，绝不返回半成品：`receipts` 按包序、包内序拼接；
+  `rotations` 按同一全局顺序，每包自身的包内轮换之后插入对应
+  `bridges[i]`（末包后无桥），每个相邻凭据边界恰有一条轮换；`start`
+  取首包 `start`、`end` 取末包 `end`；合并结果沿用既有
+  `encode_rotated_anchor`，不设新格式、不新增签名域。任一诊断失败
+  （包或桥验真不通过、桥重复、增长/重复或接缝不符）抛 `ValueError`，
+  绝不返回半成品；非 tuple、元素类型错或 `key` 非 `bytes` 抛
+  `TypeError`，空集、桥数不符或 `key` 非 32 字节抛 `ValueError`，
+  诊断中的嵌套结构异常原样传播（`TypeError` / `ValueError`）；调用严格离线
+  只读，不修改也不重建任何输入包、桥或公钥
 - `RotatedAnchorSet(items, bridges)` — 冻结的多包轮换锚定链集合，把
   分批落盘的非空 `RotatedChain` 包 tuple 与包间轮换桥 tuple 绑为一件
   可持久化、可跨进程恢复的制品；支持位置/关键字构造、按两字段相等

@@ -8,6 +8,7 @@ SignedStageAuthAuditBundle /
 SignedAuditBatch /
 SignedAuditReceipt /
 EncryptedSearchReceipt /
+FullSearchReceipt /
 SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
@@ -18,7 +19,8 @@ RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
 verify_audit_receipt /
-verify_audit_batch / inspect_continuation_chain / inspect_anchors /
+verify_audit_batch / verify_full_search_receipt /
+inspect_continuation_chain / inspect_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
@@ -33,6 +35,7 @@ verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
+encode_full_search_receipt / decode_full_search_receipt /
 encode_batch_inclusion_proof / decode_batch_inclusion_proof /
 encode_inclusion_proof / decode_inclusion_proof /
 encode_consistency_proof / decode_consistency_proof /
@@ -102,6 +105,7 @@ __all__ = [
     "ContinuationChainReport",
     "EncryptedSearchReceipt",
     "Entry",
+    "FullSearchReceipt",
     "InclusionProof",
     "IntegrityIssue",
     "IntegrityReport",
@@ -137,6 +141,7 @@ __all__ = [
     "decode_continuations",
     "decode_continuation_chain_report",
     "decode_encrypted_search_receipt",
+    "decode_full_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
     "decode_merkle_frontier",
@@ -185,6 +190,7 @@ __all__ = [
     "encode_continuations",
     "encode_continuation_chain_report",
     "encode_encrypted_search_receipt",
+    "encode_full_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
     "encode_merkle_frontier",
@@ -242,6 +248,7 @@ __all__ = [
     "verify_consistency",
     "verify_continuation_chain",
     "verify_encrypted_search_receipt",
+    "verify_full_search_receipt",
     "verify_inclusion",
     "verify_rotated_chain",
     "verify_rotation",
@@ -310,6 +317,13 @@ _SEARCH_RECEIPT_VERSION = 1
 # with the caller-supplied key; no key or plaintext is recorded.
 _ENCRYPTED_SEARCH_MAGIC = b"auditchain/encrypted-search/v1\0"
 _ENCRYPTED_SEARCH_VERSION = 1
+# Binary framing of encode_full_search_receipt / decode_full_search_receipt:
+# same u64/blob rules as the plain search receipt, but the items carry no
+# per-entry proof — every entry of the searched range is listed so the
+# verifier can derive the complete hit set itself, and one shared compact
+# batch inclusion proof at the end covers them all.
+_FULL_SEARCH_MAGIC = b"auditchain/full-search/v1\0"
+_FULL_SEARCH_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -1414,6 +1428,117 @@ class EncryptedSearchReceipt:
                     raise TypeError("proof element must be bytes")
                 if len(sibling) != digest_size:
                     raise ValueError(f"proof element must be {digest_size} bytes")
+
+
+@dataclass(frozen=True)
+class FullSearchReceipt:
+    """Offline receipt attesting the complete hit set of a content search.
+
+    Issued by :meth:`AuditLog.full_search_receipt` and verified entirely
+    offline by :func:`verify_full_search_receipt`:
+
+    - ``version``: receipt format version, always ``1``,
+    - ``hash_name``: hash algorithm of the log that issued the receipt,
+    - ``size``: number of entries in the snapshot the receipt refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``query``: the normalized query value (a ``str`` query is UTF-8
+      encoded at construction; the stored value is always ``bytes``),
+    - ``start`` / ``stop``: the half-open absolute-index range the search
+      covered, satisfying ``0 <= start <= stop <= size``,
+    - ``items``: every :class:`Entry` of the searched range, in strictly
+      ascending absolute index order — unlike :class:`SearchReceipt`, which
+      lists only the hits, this receipt lists the whole range so the
+      verifier can derive the complete hit set itself. Every listed entry
+      must satisfy ``start <= entry.index < stop``. An empty range (and any
+      empty snapshot) carries ``items == ()``,
+    - ``proof``: the single shared compact batch inclusion proof (as minted
+      by :meth:`AuditLog.batch_inclusion_proof`) covering exactly the listed
+      entries within the snapshot, ``()`` when ``items`` is empty.
+
+    Instances are immutable, may be built positionally and compare by all
+    nine fields. The constructor fixes only types, widths, ordering and
+    ranges — whether the items really cover every index of the range, and
+    whether the entries, proof and root agree, is left to
+    :func:`verify_full_search_receipt`, so a tampered receipt is still
+    constructible and round-trips.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    query: bytes
+    start: int
+    stop: int
+    items: tuple
+    proof: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != 1:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        if not isinstance(self.root, (bytes, bytearray)):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        if not isinstance(self.root, bytes):
+            object.__setattr__(self, "root", bytes(self.root))
+        if isinstance(self.query, str):
+            object.__setattr__(self, "query", self.query.encode("utf-8"))
+        elif not isinstance(self.query, bytes):
+            raise TypeError("query must be bytes or str")
+        for name in ("start", "stop"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.start <= self.stop <= self.size:
+            raise ValueError(
+                f"range must satisfy 0 <= start <= stop <= size ({self.size})"
+            )
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of Entry records")
+        previous_index = -1
+        for entry in self.items:
+            if not isinstance(entry, Entry):
+                raise TypeError("each item must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), (bytes, bytearray)):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index <= previous_index:
+                raise ValueError("item indices must be in strictly ascending order")
+            if not self.start <= entry.index < self.stop:
+                raise ValueError(
+                    f"entry.index {entry.index} must satisfy "
+                    f"start ({self.start}) <= index < stop ({self.stop})"
+                )
+            previous_index = entry.index
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, (bytes, bytearray)):
+                raise TypeError("proof element must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+        if not self.items and self.proof:
+            raise ValueError("a receipt with no items must carry no proof")
 
 
 @dataclass(frozen=True)
@@ -3759,6 +3884,81 @@ class AuditLog:
             items=items,
         )
 
+    def full_search_receipt(
+        self,
+        query: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> FullSearchReceipt:
+        """Issue an offline :class:`FullSearchReceipt` for a content search.
+
+        Covers the same half-open range ``[start, stop)`` of the snapshot of
+        the first ``size`` entries as :meth:`search_receipt`, but freezes the
+        whole range into the receipt — every entry of the range, in strictly
+        ascending absolute index order, plus one shared compact
+        :meth:`batch_inclusion_proof` covering them all — so
+        :func:`verify_full_search_receipt` can confirm offline that the hits
+        it derives are the complete hit set, not merely that listed hits are
+        genuine. The receipt records the hash algorithm, the snapshot
+        ``size`` and its Merkle ``root``, the normalized ``query``, the
+        searched range, the entries and the shared proof.
+
+        ``query`` accepts ``bytes`` or ``str`` (UTF-8 encoded); anything
+        else raises TypeError. ``size`` defaults to the current log length
+        and the snapshot must still be rebuildable (a prefix released by
+        :meth:`prune` is not). The range defaults to the retained segment
+        ``[retain_from, size)``; explicit bounds must be non-bool integers
+        satisfying ``retain_from <= start <= stop <= size``. Wrong types
+        raise TypeError, out-of-range values or an unrebuildable snapshot
+        ValueError. An empty range — and any empty snapshot — yields
+        ``items == ()`` and ``proof == ()``. The call is read-only and may
+        be repeated freely: entries, head, authentication state, Merkle
+        roots and proofs are left untouched.
+        """
+        if isinstance(query, str):
+            material = query.encode("utf-8")
+        elif isinstance(query, bytes):
+            material = query
+        else:
+            raise TypeError("query must be bytes or str")
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        first = self._retain_from
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = size
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= size:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({size})"
+            )
+        root = self.merkle_root(size)
+        items = tuple(self.entry(index) for index in range(start, stop))
+        if items:
+            _, proof = self.batch_inclusion_proof(
+                tuple(range(start, stop)), size
+            )
+        else:
+            proof = ()
+        return FullSearchReceipt(
+            version=_FULL_SEARCH_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            query=material,
+            start=start,
+            stop=stop,
+            items=items,
+            proof=proof,
+        )
+
     def encrypted_search_receipt(
         self,
         query: Any,
@@ -5417,6 +5617,77 @@ def verify_encrypted_search_receipt(receipt: Any, key: Any) -> bool:
     return True
 
 
+def verify_full_search_receipt(receipt: Any) -> bool:
+    """Verify a :class:`FullSearchReceipt` without holding the log.
+
+    Recomputes every listed entry's digest from the entry's fields, rebuilds
+    the snapshot root from the shared compact batch proof via
+    :func:`verify_batch_inclusion` and then derives the complete hit set
+    itself by comparing every listed payload against the normalized query
+    value. Because the items must list every entry of the searched range
+    ``[start, stop)`` — a receipt whose items skip an index of the range, or
+    list duplicates or out-of-order indices, raises ValueError — the derived
+    hit set is complete: no hit in the range can be missing and none can be
+    forged. A structurally valid receipt whose entry content, proof or root
+    does not match returns False. An empty range (and any empty snapshot)
+    carries ``items == ()`` and ``proof == ()`` and verifies trivially.
+
+    Malformed input raises TypeError or ValueError exactly as
+    :class:`FullSearchReceipt` construction does (a
+    non-:class:`FullSearchReceipt` argument, or a receipt whose frozen
+    fields were bypassed into an illegal shape, raises the same errors); a
+    proof node count that does not fit the listed indices and snapshot size
+    raises ValueError exactly as :func:`verify_batch_inclusion` does. The
+    call is read-only.
+    """
+    if not isinstance(receipt, FullSearchReceipt):
+        raise TypeError("receipt must be a FullSearchReceipt")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = FullSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    indices = tuple(entry.index for entry in checked.items)
+    if indices != tuple(range(checked.start, checked.stop)):
+        raise ValueError(
+            "items must list every entry of the searched range "
+            "[start, stop) exactly once"
+        )
+    for entry in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+    if not checked.items:
+        return True
+    # With every entry of the range listed and proven against the snapshot
+    # root, the complete hit set is exactly the listed entries whose payload
+    # equals the normalized query; the batch proof is what ties that listing
+    # to the recorded root.
+    entry_hashes = tuple(entry.entry_hash for entry in checked.items)
+    return verify_batch_inclusion(
+        indices,
+        entry_hashes,
+        checked.size,
+        checked.root,
+        checked.proof,
+        hash_name=checked.hash_name,
+    )
+
+
 def _unpack_audit_batch(
     receipt: Any,
 ) -> tuple[str, int, bytes, tuple[Entry, ...], tuple[bytes, ...]]:
@@ -5999,6 +6270,136 @@ def decode_encrypted_search_receipt(data: Any) -> EncryptedSearchReceipt:
     )
     _check_search_receipt_proofs(receipt)
     return receipt
+
+
+def encode_full_search_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`FullSearchReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/full-search/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in the order ``version`` (always 1), ``hash_name`` (UTF-8
+    blob), ``size``, ``root`` blob, ``query`` blob, ``start``, ``stop`` and
+    item count; each item is ``Entry.index``, ``payload`` blob,
+    ``previous_hash`` blob and ``entry_hash`` blob (the items carry no
+    per-entry proof), and the encoding ends with the shared ``proof`` node
+    count and one blob per proof digest, with nothing omitted, reordered or
+    appended. ``receipt`` must be a :class:`FullSearchReceipt` (anything
+    else raises TypeError); every field is re-validated exactly as the
+    constructor would, so a receipt whose frozen fields were bypassed into
+    an illegal shape raises the same TypeError or ValueError. Encoding is
+    read-only and deterministic: re-encoding a decoded receipt reproduces
+    the original bytes exactly.
+    """
+    if not isinstance(receipt, FullSearchReceipt):
+        raise TypeError("receipt must be a FullSearchReceipt")
+    checked = FullSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    parts = [
+        _FULL_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(checked.query),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for node in checked.proof:
+        parts.append(_encode_blob(bytes(node)))
+    return b"".join(parts)
+
+
+def decode_full_search_receipt(data: Any) -> FullSearchReceipt:
+    """Decode bytes produced by :func:`encode_full_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad
+    magic, a version other than 1, invalid UTF-8 in ``hash_name``, an
+    unknown hash algorithm, truncation, trailing bytes, an oversized blob
+    length, digest-width mismatches, an out-of-range or inverted search
+    range, non-ascending or duplicate item indices, an item index outside
+    the recorded range, or a proof carried alongside no items all raise
+    ValueError. The decoded receipt's fields equal the originally encoded
+    ones and satisfy :func:`verify_full_search_receipt` whenever the
+    original did; a structurally valid receipt whose content does not match
+    still decodes and only fails verification. The call is read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_FULL_SEARCH_MAGIC):
+        raise ValueError("not an auditchain full-search-receipt encoding")
+    offset = len(_FULL_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    query = read_blob("query")
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    return FullSearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        query=query,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+        proof=proof,
+    )
 
 
 def encode_prune_receipt(receipt: Any) -> bytes:

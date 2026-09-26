@@ -399,6 +399,46 @@ class FullSearchReceiptClassTest(unittest.TestCase):
             with self.assertRaises(TypeError, msg=key):
                 FullSearchReceipt(**self.base(**{key: bad}))
 
+    def test_constructor_binary_fields_must_be_exact_bytes(self):
+        first = self.receipt.items[0]
+        # root, every Entry binary field and every proof node reject
+        # bytearray / memoryview rather than silently copying them.
+        with self.assertRaises(TypeError):
+            FullSearchReceipt(**self.base(root=bytearray(self.receipt.root)))
+        with self.assertRaises(TypeError):
+            FullSearchReceipt(**self.base(root=memoryview(self.receipt.root)))
+        for name in ("payload", "previous_hash", "entry_hash"):
+            forged = Entry(
+                first.index,
+                **{
+                    field: (
+                        bytearray(getattr(first, field))
+                        if field == name
+                        else getattr(first, field)
+                    )
+                    for field in ("payload", "previous_hash", "entry_hash")
+                },
+            )
+            with self.assertRaises(TypeError, msg=name):
+                FullSearchReceipt(
+                    **self.base(items=(forged,) + self.receipt.items[1:])
+                )
+        if self.receipt.proof:
+            with self.assertRaises(TypeError):
+                FullSearchReceipt(
+                    **self.base(
+                        proof=(bytearray(self.receipt.proof[0]),)
+                        + self.receipt.proof[1:]
+                    )
+                )
+            with self.assertRaises(TypeError):
+                FullSearchReceipt(
+                    **self.base(
+                        proof=(memoryview(self.receipt.proof[0]),)
+                        + self.receipt.proof[1:]
+                    )
+                )
+
     def test_constructor_value_errors(self):
         for key, bad in (
             ("version", 2),

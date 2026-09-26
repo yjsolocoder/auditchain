@@ -64,6 +64,8 @@ encode_signed_full_encrypted_search_receipt /
 decode_signed_full_encrypted_search_receipt /
 encode_signed_auth_audit_continuation /
 decode_signed_auth_audit_continuation /
+encode_signed_stage_auth_audit_continuation /
+decode_signed_stage_auth_audit_continuation /
 encode_continuations / decode_continuations /
 encode_continuation_chain_report / decode_continuation_chain_report /
 encode_integrity_report / decode_integrity_report /
@@ -181,6 +183,7 @@ __all__ = [
     "decode_signed_root",
     "decode_signed_search_receipt",
     "decode_signed_stage_auth_audit_bundle",
+    "decode_signed_stage_auth_audit_continuation",
     "decode_signed_stage_auth_bundle",
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
@@ -233,6 +236,7 @@ __all__ = [
     "encode_signed_root",
     "encode_signed_search_receipt",
     "encode_signed_stage_auth_audit_bundle",
+    "encode_signed_stage_auth_audit_continuation",
     "encode_signed_stage_auth_bundle",
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
@@ -564,6 +568,17 @@ _SIGNED_AUTH_AUDIT_CONTINUATION_MAGIC = (
     b"auditchain/auth-audit-continuation/v1\0"
 )
 _SIGNED_AUTH_AUDIT_CONTINUATION_VERSION = 1
+
+# Binary framing of encode_signed_stage_auth_audit_continuation /
+# decode_signed_stage_auth_audit_continuation: a fixed magic, then the
+# envelope version as a u64 and two u64-length-prefixed blobs holding the
+# complete canonical encode_signed_stage_auth_audit_bundle and
+# encode_signed_consistency bytes, in that order and with nothing else. The
+# stage continuation introduces no framing of its own beyond that envelope.
+_SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_MAGIC = (
+    b"auditchain/stage-auth-audit-continuation/v1\0"
+)
+_SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_VERSION = 1
 
 # Binary framing of encode_continuations / decode_continuations: a fixed
 # magic, then the envelope version as a u64, the receipt count as a u64 and
@@ -11808,6 +11823,132 @@ def decode_signed_auth_audit_continuation(
     bundle = decode_signed_auth_audit_bundle(bundle_blob)
     consistency = decode_signed_consistency(consistency_blob)
     return SignedAuthAuditContinuation(
+        bundle=bundle, consistency=consistency
+    )
+
+
+def encode_signed_stage_auth_audit_continuation(receipt: Any) -> bytes:
+    """Encode a :class:`SignedStageAuthAuditContinuation` into canonical bytes.
+
+    The byte stream is ``D || U(1) || B(A) || B(C)`` with
+    ``D = b"auditchain/stage-auth-audit-continuation/v1\\0"``, ``U`` an
+    unsigned 8-byte big-endian integer and ``B(x) = U(len(x)) || x``: the
+    envelope ``version`` (always 1), then the bundle blob and the
+    consistency blob — nothing may be omitted, reordered or appended. ``A``
+    is byte-for-byte the complete canonical output of
+    :func:`encode_signed_stage_auth_audit_bundle` over ``receipt.bundle``
+    and ``C`` the complete canonical output of
+    :func:`encode_signed_consistency` over ``receipt.consistency``. No new
+    signing message is introduced: encoding is read-only and only re-uses
+    the existing canonical encodings.
+
+    ``receipt`` must be a :class:`SignedStageAuthAuditContinuation` —
+    anything else raises TypeError, including an instance whose fields were
+    set bypassing the frozen constructor; nested structural problems raise
+    exactly the exceptions of
+    :func:`encode_signed_stage_auth_audit_bundle` and
+    :func:`encode_signed_consistency` (TypeError or ValueError). The
+    encoding carries the stage key in the clear — it authenticates
+    provenance only, never encrypts — so the bytes must be protected
+    exactly like a bare :class:`StageVerifier`. Encoding is deterministic:
+    re-encoding a decoded receipt reproduces the original bytes exactly,
+    and a structurally valid receipt whose signatures, tags, proof or
+    checkpoint linkage do not match encodes just as well.
+    """
+    if not isinstance(receipt, SignedStageAuthAuditContinuation):
+        raise TypeError(
+            "receipt must be a SignedStageAuthAuditContinuation"
+        )
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedStageAuthAuditContinuation(
+        receipt.bundle, receipt.consistency
+    )
+    bundle_blob = encode_signed_stage_auth_audit_bundle(checked.bundle)
+    consistency_blob = encode_signed_consistency(checked.consistency)
+    return b"".join((
+        _SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_MAGIC,
+        _encode_u64(
+            _SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_VERSION, "version"
+        ),
+        _encode_blob(bundle_blob),
+        _encode_blob(consistency_blob),
+    ))
+
+
+def decode_signed_stage_auth_audit_continuation(
+    data: Any,
+) -> SignedStageAuthAuditContinuation:
+    """Decode bytes produced by :func:`encode_signed_stage_auth_audit_continuation`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/stage-auth-audit-continuation/v1\\0"`` it must contain,
+    strictly in order, the u64 envelope version (only ``1`` is supported),
+    one length-prefixed bundle blob and one length-prefixed consistency
+    blob, with no trailing bytes. Each blob is handed whole to the existing
+    decoder — :func:`decode_signed_stage_auth_audit_bundle` and
+    :func:`decode_signed_consistency` respectively — so every nested
+    framing and structural rule is theirs (the bundle decoder also pins
+    its nested algorithms). A bad magic or version, truncation, an
+    oversized blob length, trailing bytes or an illegal nested encoding
+    raises ValueError.
+
+    Signatures, tags, proof content and the linkage between the two
+    halves — their algorithms and the consistency's ``new`` checkpoint
+    versus the audit checkpoint — are not checked here. The returned
+    object is a frozen :class:`SignedStageAuthAuditContinuation` whose
+    fields equal the originally encoded ones, and re-encoding reproduces
+    the original bytes exactly. An empty selection and the empty
+    genesis snapshot round-trip with no structure omitted. A structurally
+    sound encoding whose verification simply does not pass still decodes;
+    :func:`verify_signed_stage_auth_audit_continuation` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_MAGIC):
+        raise ValueError(
+            "not an auditchain stage-auth-audit-continuation encoding"
+        )
+    offset = len(_SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_VERSION:
+        raise ValueError(
+            f"unsupported stage-auth-audit-continuation version {version}"
+        )
+    bundle_blob = read_blob("signed stage auth audit bundle")
+    consistency_blob = read_blob("signed consistency")
+    if offset != len(data):
+        raise ValueError(
+            "trailing bytes after the stage auth audit continuation receipt"
+        )
+    # Decode both nested blobs with their existing decoders; their own
+    # magic, version, truncation/trailing-byte and structural checks apply
+    # verbatim (the bundle decoder also pins its nested algorithms).
+    bundle = decode_signed_stage_auth_audit_bundle(bundle_blob)
+    consistency = decode_signed_consistency(consistency_blob)
+    return SignedStageAuthAuditContinuation(
         bundle=bundle, consistency=consistency
     )
 

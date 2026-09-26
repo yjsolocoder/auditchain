@@ -378,11 +378,39 @@ stop, items, proof, hits)`，支持位置构造、按全部十个字段相等：
 规范化查询值者计为命中，普通条目、异钥封装与解密失败都不算命中也不判失败。
 重算出的命中集与回执记录的 `hits` 逐项一致且真实性成立才返回 `True`；记录了
 命中的回执在错误密钥下返回 `False`，零命中回执不考验密钥、只按真实性判定。
-条目覆盖不全、重复、乱序、越出范围或命中索引不合法（含绕过冻结构造器写入的
-非法字段）在构造与核验两端都抛 `ValueError`；篡改的内容、证明或根一律返回
-`False` 不抛异常；入参不是 `FullEncryptedSearchReceipt` 或密钥类型错抛
-`TypeError`，密钥长度、范围与尺寸越界、快照不可重建、未知算法或摘要宽度不符
-抛 `ValueError`。本次不提供该回执的编解码。
+纯空范围（`items == ()`）的回执不携带可核对证据，记录的快照根不参与比对、
+按真实性交待；空快照（`size == 0`）则只接受规范空树根，根被改动时核验返回
+`False` 而不抛异常。条目覆盖不全、重复、乱序、越出范围或命中索引不合法（含
+绕过冻结构造器写入的非法字段）在构造与核验两端都抛 `ValueError`；篡改的
+内容、证明或根一律返回 `False` 不抛异常；入参不是
+`FullEncryptedSearchReceipt` 或密钥类型错抛 `TypeError`，密钥长度、范围与
+尺寸越界、快照不可重建、未知算法或摘要宽度不符抛 `ValueError`。
+
+回执可编码为规范字节形式，落盘或传输后在另一进程恢复并继续持钥核验：
+
+```python
+data = encode_full_encrypted_search_receipt(receipt)      # bytes：魔数 + u64 大端整数 + 长度前缀 blob
+restored = decode_full_encrypted_search_receipt(data)     # 冻结对象，按全部十个字段与原件相等
+encode_full_encrypted_search_receipt(restored) == data    # True：重复/解码后重编码逐字节相同
+verify_full_encrypted_search_receipt(restored, key)       # True：恢复后照常持钥核验
+```
+
+编码以魔数 `b"auditchain/full-encrypted-search/v1\0"`（含 NUL 结尾）开头，后接
+恒为 1 的 `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、
+`size`、`root` blob、`query` blob、`start`、`stop` 与条目计数；每个条目依次写
+`Entry.index`、`payload` blob（密封封装原样写入）、`previous_hash` blob、
+`entry_hash` blob，再写共享证明的节点计数及各摘要 blob（除命中段外布局与
+`encode_full_search_receipt` 一致），最后写命中索引的计数及逐个 8 字节无符号
+大端命中索引；整数均为 8 字节无符号大端，blob 为 u64 字节长度后接原始字节
+（零长度也是全零 u64），禁止换序与尾随。`encode_full_encrypted_search_receipt`
+只接受 `FullEncryptedSearchReceipt` 并复验全部字段与证明节点计数（类型错抛
+`TypeError`，结构非法抛 `ValueError`）；`decode_full_encrypted_search_receipt`
+只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`），魔数或版本不符、非法
+UTF-8、未知算法、截断、尾随、长度越界、范围/顺序/覆盖或命中索引非法、摘要宽度
+或证明节点数不符均抛 `ValueError`。解码精确消费全部字节，空范围与空快照照常
+往返（条目、证明与命中都是空元组，零项不省略任何结构）；内容、证明或根被篡改
+的回执照常往返、仅核验判 `False`。本层不新增任何签名原文，也不改变其他各线
+格式。
 
 ### 可验证前缀裁剪
 
@@ -3004,7 +3032,8 @@ python3 -m auditchain
   `entry_hash` 与每个证明节点）只接受精确的 `bytes`，`bytearray` /
   `memoryview` 抛 `TypeError`。类型非法抛 `TypeError`，版本、范围、未知
   算法、摘要宽度、条目结构、覆盖或命中索引非法（含空范围携带非空证明）抛
-  `ValueError`；本次不提供编解码
+  `ValueError`；规范二进制编解码由 `encode_full_encrypted_search_receipt` /
+  `decode_full_encrypted_search_receipt` 提供
 - `BatchInclusionProof(hash_name, indices, entry_hashes, size, root, proof)` —
   不可变的紧凑批量包含证明凭据，把 `verify_batch_inclusion` 的核验上下文与
   `batch_inclusion_proof` 的共享证明节点绑成一件制品，按全部六个字段相等、支持
@@ -3467,7 +3496,8 @@ python3 -m auditchain
   命中集与回执记录的 `hits` 逐项一致且真实性成立才返回 `True`——与
   `verify_encrypted_search_receipt` 不同，少列或伪造命中是核验失败而非静默
   遗漏。普通条目、异钥封装与解密失败都不算命中也不判失败；记录了命中的回执
-  在错误密钥下返回 `False`，零命中回执不考验密钥、只按真实性判定；篡改的
+  在错误密钥下返回 `False`，零命中回执不考验密钥、只按真实性判定；纯空范围
+  （`items == ()`）的回执不携带可核对证据，记录的快照根不参与比对；篡改的
   内容、证明或根一律返回 `False` 而不抛异常。入参不是
   `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
   版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序或命中索引非法（含绕过
@@ -4151,6 +4181,24 @@ python3 -m auditchain
   只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；类型错抛
   `TypeError`，魔数、版本、UTF-8、算法、截断、尾随、长度越界、范围、顺序或
   覆盖非法、摘要宽度或证明节点数不符抛 `ValueError`
+- `encode_full_encrypted_search_receipt(receipt)` /
+  `decode_full_encrypted_search_receipt(data)` — 完整加密检索回执的规范二进制
+  编码与解码，使 `FullEncryptedSearchReceipt` 可落盘、跨进程恢复后继续由
+  `verify_full_encrypted_search_receipt` 持钥离线核验（编解码只读且确定）：魔数
+  `b"auditchain/full-encrypted-search/v1\0"`（含 NUL 结尾）开头，后接恒为 1 的
+  `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8 blob）、`size`、
+  `root` blob、`query` blob、`start`、`stop` 与条目计数，禁止换序与尾随；整数为
+  u64 大端，blob 为 u64 长度前缀加原始字节（零长度也是全零 u64），每个条目依次写
+  `Entry.index`、`payload` blob（密封封装原样写入）、`previous_hash` blob、
+  `entry_hash` blob，再写共享证明的节点计数及各摘要 blob（除命中段外布局与
+  `encode_full_search_receipt` 一致），最后写命中索引的计数及逐个 u64 命中索引。
+  解码精确消费全部字节，恢复对象冻结、按全部十个字段与原件相等、重编码逐字节
+  相同；空范围与空快照照常往返（条目、证明与命中都是空元组，零项不省略任何
+  结构），内容、证明或根被篡改的回执仍可往返、仅核验判 `False`。前者只接受
+  `FullEncryptedSearchReceipt` 并复验全部字段与证明节点计数，后者只接受精确的
+  `bytes`（拒绝 `bytearray` / `memoryview`）；类型错抛 `TypeError`，魔数或版本
+  不符、UTF-8、算法、截断、尾随、长度越界、范围/顺序/覆盖或命中索引非法、摘要
+  宽度或证明节点数不符抛 `ValueError`
 - `encode_encrypted_search_receipt(receipt)` /
   `decode_encrypted_search_receipt(data)` — 加密检索回执的规范二进制编码与解码，
   使 `EncryptedSearchReceipt` 可落盘、跨进程恢复后继续由

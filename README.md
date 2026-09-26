@@ -2223,6 +2223,50 @@ merged.receipts == tuple(                  # 按包序、包内序拼接全部�
   `bytearray`）抛 `TypeError`，长度不符抛 `ValueError`；诊断中的嵌套
   结构异常按既有规则原样传播（`TypeError` / `ValueError`）
 
+#### 多包锚定续接链集合：分批落盘的包绑成单一制品跨进程恢复
+
+分批落盘的若干 `AnchoredContinuationChain` 包可以再绑成**一件**可持久化、
+可跨进程恢复的冻结制品：`AnchorSet(items:tuple)`。唯一字段是按链序存放的
+`AnchoredContinuationChain` 包**非空 tuple**，不再携带别的字段；支持
+位置/关键字构造、按该字段相等（可哈希）。制品本身只校验容器形状：`items`
+须为非空 tuple 且元素均为 `AnchoredContinuationChain`——非 tuple 或元素
+类型错抛 `TypeError`，空集抛 `ValueError`；各包是否验真、包间锚点接缝是否
+成立不在此处校验，恢复后可在另一进程中把 `items` 直接交给既有的
+`inspect_anchor_set` / `merge_anchor_set` 继续诊断或合并，结论与原件一致。
+
+```python
+from auditchain import (
+    AnchorSet,
+    encode_anchor_set,
+    decode_anchor_set,
+    inspect_anchor_set,
+)
+
+bundle = AnchorSet(packages)
+data = encode_anchor_set(bundle)       # bytes，可写文件/发网络
+restored = decode_anchor_set(data)     # 另一进程中恢复
+restored == bundle                      # True：字段逐字段相等
+encode_anchor_set(restored) == data     # True：重编码逐字节相同
+inspect_anchor_set(restored.items, key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- 字节流严格为 `D || U(1) || U(n) || B(P0)…B(Pn-1)`，其中
+  `D = b"auditchain/anchor-set/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`n` 为包数，`Pi` 逐字节等于既有
+  `encode_anchored_continuations(items[i])` 的完整输出，按 tuple 顺序
+  排列、**禁止省略、换序与尾随字节**；全部 blob 复用既有编码，外层帧
+  不引入新签名域
+- `encode_anchor_set(bundle)` 只接受 `AnchorSet`（否则抛 `TypeError`）；
+  嵌套结构问题的 `TypeError` / `ValueError` 原样传播；编码只读、确定
+- `decode_anchor_set(data) -> AnchorSet` 只接受 `bytes`（拒绝
+  `bytearray` / `memoryview`，抛 `TypeError`）；魔数 / 版本错、空集
+  （包数为零）、截断、blob 长度越界或尾随字节抛 `ValueError`；各包
+  blob 交给 `decode_anchored_continuations`，嵌套异常原样传播。解码
+  保序并返回冻结对象，但不校验签名、证明、包间接缝与锚定关系，结构
+  合法而验真不匹配仍可解码，由 `inspect_anchor_set` 报告而非抛出
+- 全程离线只读，不新增签名域；旧接口与既有各码均不变
+
 #### 轮换感知锚定链：跨密钥续接、逐跳轮换与首尾检查点一并持久化
 
 跨密钥续接（每段可由不同签名钥签发、边界由
@@ -3693,6 +3737,25 @@ python3 -m auditchain
   `encode_anchored_continuations`、不设新格式；诊断失败抛 `ValueError`，
   类型/长度校验与嵌套异常规则同 `inspect_anchor_set`；调用只读，不修改
   任何输入包
+- `AnchorSet(items)` — 冻结的多包锚定续接链集合，把分批落盘的非空
+  `AnchoredContinuationChain` 包 tuple 绑为一件可持久化、可跨进程恢复
+  的制品，不再携带别的字段；支持位置/关键字构造、按该字段相等（可哈希）；
+  `items` 非 tuple 或元素非 `AnchoredContinuationChain` 抛 `TypeError`，
+  空集抛 `ValueError`；制品本身不校验包内验真与包间锚点接缝
+- `encode_anchor_set(bundle)` /
+  `decode_anchor_set(data)` — 多包锚定续接链集合的规范二进制编码与解码，
+  使若干包作为单一制品落盘、跨进程恢复后把 `items` 交给既有
+  `inspect_anchor_set` / `merge_anchor_set` 继续诊断或合并，全程只读、
+  不新增签名域：字节流严格为 `D || U(1) || U(n) || B(P0)…B(Pn-1)`，
+  其中 `D = b"auditchain/anchor-set/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`，`n` 为包数，`Pi` 逐字节为既有
+  `encode_anchored_continuations(items[i])` 输出，按 tuple 顺序排列且
+  禁止尾随字节；前者只接受 `AnchorSet`（否则抛 `TypeError`），嵌套编码
+  异常原样传播；后者只接受 `bytes`（拒绝 `bytearray` / `memoryview`），
+  魔数、版本、零包数、截断、blob 长度、嵌套格式或尾随非法抛
+  `ValueError`；解码保持 tuple 顺序、字段相等且重编码逐字节相同，不校验
+  签名、证明、包间接缝与锚定关系，结构合法而验真不匹配仍可解码；两个
+  入口均为只读且确定，旧接口不变
 - `inspect_rotated_anchor_set(items, bridges, key)` — 分批落盘的多个
   `RotatedChain` 与包间轮换的按序只读核验（三参均无默认值）：`items` 为
   非空 `RotatedChain` tuple，`bridges` 为轮换四元组 tuple 且长度恰为

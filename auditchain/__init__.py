@@ -26,7 +26,8 @@ verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
-inspect_continuation_chain / inspect_anchors /
+inspect_continuation_chain / inspect_stage_continuation_chain /
+inspect_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
@@ -39,6 +40,7 @@ verify_signed_full_search_receipt /
 verify_signed_consistency / verify_signed_prune /
 verify_rotation /
 verify_rotation_chain /
+verify_stage_continuation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_full_encrypted_search_receipt /
 decode_full_encrypted_search_receipt /
@@ -67,6 +69,7 @@ decode_signed_auth_audit_continuation /
 encode_signed_stage_auth_audit_continuation /
 decode_signed_stage_auth_audit_continuation /
 encode_continuations / decode_continuations /
+encode_stage_continuations / decode_stage_continuations /
 encode_continuation_chain_report / decode_continuation_chain_report /
 encode_integrity_report / decode_integrity_report /
 encode_rotation / decode_rotation /
@@ -187,6 +190,7 @@ __all__ = [
     "decode_signed_stage_auth_bundle",
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
+    "decode_stage_continuations",
     "decode_stage_verifier",
     "decode_verifier",
     "decrypt_entry",
@@ -240,6 +244,7 @@ __all__ = [
     "encode_signed_stage_auth_bundle",
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
+    "encode_stage_continuations",
     "encode_stage_verifier",
     "encode_verifier",
     "entry_digest",
@@ -250,6 +255,7 @@ __all__ = [
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
     "inspect_rotated_anchor_set",
+    "inspect_stage_continuation_chain",
     "load_auth",
     "load_hybrid",
     "load_log",
@@ -298,6 +304,7 @@ __all__ = [
     "verify_signed_stage_auth_audit_continuation",
     "verify_signed_stage_verifier",
     "verify_signed_verifier",
+    "verify_stage_continuation_chain",
 ]
 
 GENESIS_HASH = bytes(32)
@@ -587,6 +594,15 @@ _SIGNED_STAGE_AUTH_AUDIT_CONTINUATION_VERSION = 1
 # encode_signed_auth_audit_continuation output, with nothing else.
 _CONTINUATION_CHAIN_MAGIC = b"auditchain/cont-chain/v1\0"
 _CONTINUATION_CHAIN_VERSION = 1
+
+# Binary framing of encode_stage_continuations / decode_stage_continuations:
+# a fixed magic, then the envelope version as a u64, the receipt count as a
+# u64 and one u64-length-prefixed blob per frozen
+# SignedStageAuthAuditContinuation in tuple order, each blob the complete
+# canonical encode_signed_stage_auth_audit_continuation output, with nothing
+# else.
+_STAGE_CONTINUATION_CHAIN_MAGIC = b"auditchain/stage-cont-chain/v1\0"
+_STAGE_CONTINUATION_CHAIN_VERSION = 1
 
 # Binary framing of encode_continuation_chain_report /
 # decode_continuation_chain_report: a fixed magic, then the envelope version
@@ -3147,17 +3163,18 @@ class RotatedAnchorSet:
                 )
 
 
-# Diagnostic codes of inspect_continuation_chain and inspect_anchors, each
-# pinpointing the first segment or boundary at which the receipts fail to
-# describe one chain: "verify" — a segment itself fails
-# verify_signed_auth_audit_continuation; "growth" — a segment's old checkpoint
-# is not strictly smaller than its new; "duplicate" — a segment repeats an
-# earlier receipt; "link" — adjacent segments do not join at equal
-# checkpoints; "start" — the first segment's old checkpoint is not the
-# expected anchor; "end" — the last segment's new checkpoint is not the
-# expected anchor. "link" names only the boundary between segments, it does
-# not blame either one. "start" and "end" are reported by inspect_anchors
-# only, never by inspect_continuation_chain. "anchor_link" is reported by
+# Diagnostic codes of inspect_continuation_chain,
+# inspect_stage_continuation_chain and inspect_anchors, each pinpointing the
+# first segment or boundary at which the receipts fail to describe one
+# chain: "verify" — a segment itself fails its single-segment verification;
+# "growth" — a segment's old checkpoint is not strictly smaller than its
+# new; "duplicate" — a segment repeats an earlier receipt; "link" — adjacent
+# segments do not join at equal checkpoints; "start" — the first segment's
+# old checkpoint is not the expected anchor; "end" — the last segment's new
+# checkpoint is not the expected anchor. "link" names only the boundary
+# between segments, it does not blame either one. "start" and "end" are
+# reported by inspect_anchors only, never by inspect_continuation_chain or
+# inspect_stage_continuation_chain. "anchor_link" is reported by
 # inspect_anchor_set only: the end anchor of one persisted package does not
 # equal the following package's start anchor, so the separately landed
 # packages cannot be spliced into one chain; its index is the global
@@ -3196,10 +3213,13 @@ _CHAIN_CODES = frozenset(
 
 @dataclass(frozen=True)
 class ContinuationChainReport:
-    """Result of :func:`inspect_continuation_chain` and :func:`inspect_anchors`.
+    """Result of :func:`inspect_continuation_chain` and its extensions.
 
-    A read-only diagnosis of a non-empty tuple of chained
-    :class:`SignedAuthAuditContinuation` receipts, locating the **first**
+    A read-only diagnosis of a non-empty tuple of chained continuation
+    receipts (:class:`SignedAuthAuditContinuation` for
+    :func:`inspect_continuation_chain`,
+    :class:`SignedStageAuthAuditContinuation` for
+    :func:`inspect_stage_continuation_chain`), locating the **first**
     failed segment or broken boundary — only the earliest problem is ever
     reported:
 
@@ -12010,6 +12030,66 @@ def verify_continuation_chain(receipts: Any, public_key: Any) -> bool:
     return True
 
 
+def verify_stage_continuation_chain(receipts: Any, public_key: Any) -> bool:
+    """Verify a non-empty tuple of chained stage continuation receipts offline.
+
+    The post-evolution counterpart of :func:`verify_continuation_chain`:
+    ``receipts`` must be a non-empty ``tuple`` whose elements are frozen
+    :class:`SignedStageAuthAuditContinuation` objects, kept in the caller's
+    order; each element is first verified on its own with
+    :func:`verify_signed_stage_auth_audit_continuation` against the
+    pre-trusted 32-byte Ed25519 ``public_key``, and the receipts must then
+    describe one continuous append-only history:
+
+    - every segment must extend a strictly smaller prefix, i.e. its
+      ``consistency.old.size`` must be less than its ``consistency.new.size``
+      (a zero-length segment never describes an append);
+    - adjacent segments must join exactly: the previous segment's
+      ``consistency.new`` checkpoint must equal the following segment's
+      ``consistency.old`` checkpoint on every field — hash name, size, root,
+      head and the Ed25519 signature itself;
+    - no segment may be repeated (the tuple must not contain two equal
+      receipts).
+
+    Verification introduces no signing domain of its own and holds neither
+    the log nor any checkpoint history. A genuine, strictly growing chain
+    returns True; an empty chain, a non-tuple or an element of the wrong
+    type raises TypeError, and any segment that fails
+    :func:`verify_signed_stage_auth_audit_continuation`, any non-growing
+    segment, any repeated segment, any adjacent mismatch or a public key
+    that is not 32 ``bytes`` makes the result False (nested verification
+    exceptions from structurally illegal receipts propagate exactly as
+    :func:`verify_signed_stage_auth_audit_continuation` raises them). The
+    call is read-only and never mutates the receipts.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    for receipt in receipts:
+        if not isinstance(receipt, SignedStageAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedStageAuthAuditContinuation"
+            )
+    seen: set[SignedStageAuthAuditContinuation] = set()
+    previous_new: SignedRoot | None = None
+    for receipt in receipts:
+        if receipt in seen:
+            return False
+        seen.add(receipt)
+        if not verify_signed_stage_auth_audit_continuation(
+            receipt, public_key
+        ):
+            return False
+        consistency = receipt.consistency
+        if not consistency.old.size < consistency.new.size:
+            return False
+        if previous_new is not None and consistency.old != previous_new:
+            return False
+        previous_new = consistency.new
+    return True
+
+
 def verify_rotated_chain(receipts: Any, rotations: Any, key: Any) -> bool:
     """Verify a non-empty tuple of continuation receipts across key rotations.
 
@@ -12337,6 +12417,100 @@ def inspect_continuation_chain(
     # receipts and broken joins are located from the current segment's
     # position; "link" marks the boundary itself rather than either segment.
     seen: set[SignedAuthAuditContinuation] = set()
+    previous_new: SignedRoot | None = None
+    for index, receipt in enumerate(receipts):
+        if receipt in seen:
+            return ContinuationChainReport(
+                False, index, _CHAIN_CODE_DUPLICATE
+            )
+        seen.add(receipt)
+        consistency = receipt.consistency
+        if previous_new is not None and consistency.old != previous_new:
+            return ContinuationChainReport(False, index, _CHAIN_CODE_LINK)
+        previous_new = consistency.new
+    return ContinuationChainReport(True, None, None)
+
+
+def inspect_stage_continuation_chain(
+    receipts: Any, public_key: Any
+) -> ContinuationChainReport:
+    """Diagnose a non-empty tuple of chained stage continuation receipts.
+
+    The read-only diagnostic counterpart of
+    :func:`verify_stage_continuation_chain`, mirroring
+    :func:`inspect_continuation_chain` for the post-evolution
+    :class:`SignedStageAuthAuditContinuation` segment: it holds neither the
+    log nor any checkpoint history, introduces no new Ed25519 or HMAC signing
+    domain and never mutates the receipts or the key, but instead of a bare
+    bool it returns a frozen :class:`ContinuationChainReport` locating the
+    **first** failed segment or broken boundary — a valid chain reports
+    ``ContinuationChainReport(True, None, None)`` and only the earliest
+    problem is ever reported.
+
+    Segments are examined in the caller's tuple order, in two phases:
+
+    1. each segment is verified on its own with
+       :func:`verify_signed_stage_auth_audit_continuation` against the
+       pre-trusted 32-byte Ed25519 ``public_key`` — failure reports
+       ``"verify"`` at that segment's position — and must extend a strictly
+       smaller prefix, i.e. ``consistency.old.size < consistency.new.size``
+       (a zero-length segment never describes an append) —
+       ``old.size >= new.size`` reports ``"growth"``;
+    2. only after every segment is individually sound and strictly growing
+       are the segments compared with one another: a receipt equal to an
+       earlier one reports ``"duplicate"`` at the repeated segment's
+       position, and the previous segment's ``consistency.new`` checkpoint
+       must equal the following segment's ``consistency.old`` checkpoint on
+       every field (hash name, size, root, head and the Ed25519 signature
+       itself) — a mismatch reports ``"link"`` at the following segment's
+       position. The ``"link"`` code identifies the boundary between the two
+       segments and blames neither one.
+
+    ``receipts`` must be a non-empty ``tuple`` of
+    :class:`SignedStageAuthAuditContinuation` objects: a non-tuple
+    (including a list, a generator or ``None``) or an element of another
+    type raises TypeError, and an empty tuple raises ValueError.
+    ``public_key`` must be a 32-byte ``bytes`` Ed25519 key: a non-``bytes``
+    value (including ``bytearray``) raises TypeError and a ``bytes`` value
+    of another length raises ValueError. Nested structural violations raised
+    by :func:`verify_signed_stage_auth_audit_continuation` on a structurally
+    illegal receipt propagate unchanged (TypeError or ValueError) rather
+    than becoming a ``"verify"`` report; signature, tag or proof mismatches
+    on a structurally valid receipt are reported, not raised.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    for receipt in receipts:
+        if not isinstance(receipt, SignedStageAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedStageAuthAuditContinuation"
+            )
+    if not isinstance(public_key, bytes):
+        raise TypeError("public_key must be a 32-byte Ed25519 public key")
+    if len(public_key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"public_key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+    # Phase 1: every segment must independently verify and strictly grow.
+    # Exceptions from nested verification propagate: a structurally illegal
+    # receipt is a caller error, not a failed "verify" diagnosis.
+    for index, receipt in enumerate(receipts):
+        if not verify_signed_stage_auth_audit_continuation(
+            receipt, public_key
+        ):
+            return ContinuationChainReport(False, index, _CHAIN_CODE_VERIFY)
+        consistency = receipt.consistency
+        if consistency.old.size >= consistency.new.size:
+            return ContinuationChainReport(False, index, _CHAIN_CODE_GROWTH)
+
+    # Phase 2: relationships between individually sound segments. Repeated
+    # receipts and broken joins are located from the current segment's
+    # position; "link" marks the boundary itself rather than either segment.
+    seen: set[SignedStageAuthAuditContinuation] = set()
     previous_new: SignedRoot | None = None
     for index, receipt in enumerate(receipts):
         if receipt in seen:
@@ -13251,6 +13425,114 @@ def decode_continuations(data: Any) -> tuple:
         receipts.append(decode_signed_auth_audit_continuation(blob))
     if offset != len(data):
         raise ValueError("trailing bytes after the continuation chain")
+    return tuple(receipts)
+
+
+def encode_stage_continuations(receipts: Any) -> bytes:
+    """Encode a non-empty tuple of stage continuation receipts into bytes.
+
+    The post-evolution counterpart of :func:`encode_continuations`. The byte
+    stream is ``D || U(1) || U(n) || B(R1) … B(Rn)`` with
+    ``D = b"auditchain/stage-cont-chain/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer, ``B(x) = U(len(x)) || x`` and ``n`` the non-zero
+    receipt count: the envelope ``version`` (always 1), then the count, then
+    one length-prefixed blob per :class:`SignedStageAuthAuditContinuation`
+    in the tuple's own order — nothing may be omitted, reordered or
+    appended. Each ``Ri`` is byte-for-byte the complete canonical output of
+    :func:`encode_signed_stage_auth_audit_continuation` over that receipt;
+    the framing introduces no new signing message and is read-only.
+
+    ``receipts`` must be a non-empty ``tuple`` of
+    :class:`SignedStageAuthAuditContinuation` objects — a non-tuple, an
+    empty tuple or an element of another type raises TypeError; nested
+    structural problems raise exactly the exceptions of
+    :func:`encode_signed_stage_auth_audit_continuation` (TypeError or
+    ValueError). Encoding is deterministic: re-encoding a decoded tuple
+    reproduces the original bytes exactly.
+    """
+    if not isinstance(receipts, tuple):
+        raise TypeError("receipts must be a non-empty tuple")
+    if len(receipts) == 0:
+        raise ValueError("receipts must be a non-empty tuple")
+    parts = [
+        _STAGE_CONTINUATION_CHAIN_MAGIC,
+        _encode_u64(_STAGE_CONTINUATION_CHAIN_VERSION, "version"),
+        _encode_u64(len(receipts), "receipt count"),
+    ]
+    for receipt in receipts:
+        if not isinstance(receipt, SignedStageAuthAuditContinuation):
+            raise TypeError(
+                "each receipt must be a SignedStageAuthAuditContinuation"
+            )
+        parts.append(
+            _encode_blob(encode_signed_stage_auth_audit_continuation(receipt))
+        )
+    return b"".join(parts)
+
+
+def decode_stage_continuations(data: Any) -> tuple:
+    """Decode bytes produced by :func:`encode_stage_continuations`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/stage-cont-chain/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the non-zero
+    u64 receipt count ``n`` and exactly ``n`` length-prefixed blobs, each
+    consumed whole with no trailing bytes. Every blob is handed to
+    :func:`decode_signed_stage_auth_audit_continuation`, so its framing and
+    structural rules apply verbatim. A bad magic or version, a zero or
+    oversized count, truncation, an oversized blob length, trailing bytes or
+    an illegal nested encoding raises ValueError.
+
+    Signatures, tags, proofs and the adjacency between receipts are not
+    checked here — only :func:`verify_stage_continuation_chain` confirms the
+    segments join into one append-only history. The returned tuple preserves
+    the encoded order, its elements equal the originally encoded receipts,
+    and re-encoding reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_STAGE_CONTINUATION_CHAIN_MAGIC):
+        raise ValueError(
+            "not an auditchain stage-continuation-chain encoding"
+        )
+    offset = len(_STAGE_CONTINUATION_CHAIN_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _STAGE_CONTINUATION_CHAIN_VERSION:
+        raise ValueError(
+            f"unsupported stage-continuation-chain version {version}"
+        )
+    count = read_u64("receipt count")
+    if count == 0:
+        raise ValueError(
+            "stage continuation chain must contain at least one receipt"
+        )
+    receipts = []
+    for position in range(count):
+        blob = read_blob(f"stage continuation receipt {position}")
+        receipts.append(decode_signed_stage_auth_audit_continuation(blob))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the stage continuation chain")
     return tuple(receipts)
 
 

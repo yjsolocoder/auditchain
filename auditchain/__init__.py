@@ -23,6 +23,7 @@ StageAnchorSet /
 RotatedChain /
 RotatedAnchorSet /
 StageRotatedChain /
+StageRotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
 verify_audit_receipt /
@@ -37,6 +38,7 @@ inspect_stage_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_stage_anchor_set / merge_stage_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
+inspect_stage_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
 verify_signed_audit_batch / verify_signed_audit_receipt /
@@ -86,6 +88,8 @@ encode_stage_anchor_set / decode_stage_anchor_set /
 encode_rotated_anchor / decode_rotated_anchor /
 encode_rotated_anchor_set / decode_rotated_anchor_set /
 encode_stage_rotated_anchor / decode_stage_rotated_anchor /
+encode_stage_rotated_anchor_set /
+decode_stage_rotated_anchor_set /
 encode_signed_consistency / decode_signed_consistency /
 encode_signed_prune / decode_signed_prune /
 dump_log / load_log /
@@ -139,6 +143,7 @@ __all__ = [
     "PruneReceipt",
     "RotatedAnchorSet",
     "RotatedChain",
+    "StageRotatedAnchorSet",
     "StageRotatedChain",
     "SearchReceipt",
     "SignedAuditBatch",
@@ -205,6 +210,7 @@ __all__ = [
     "decode_stage_anchor_set",
     "decode_stage_continuations",
     "decode_stage_rotated_anchor",
+    "decode_stage_rotated_anchor_set",
     "decode_stage_verifier",
     "decode_verifier",
     "decrypt_entry",
@@ -262,6 +268,7 @@ __all__ = [
     "encode_stage_anchor_set",
     "encode_stage_continuations",
     "encode_stage_rotated_anchor",
+    "encode_stage_rotated_anchor_set",
     "encode_stage_verifier",
     "encode_verifier",
     "entry_digest",
@@ -275,6 +282,7 @@ __all__ = [
     "inspect_stage_anchors",
     "inspect_stage_anchor_set",
     "inspect_stage_continuation_chain",
+    "inspect_stage_rotated_anchor_set",
     "inspect_stage_rotated_anchors",
     "inspect_stage_rotated_chain",
     "load_auth",
@@ -709,6 +717,17 @@ _STAGE_ROTATED_ANCHOR_VERSION = 1
 # canonical encode_rotation output), with nothing else.
 _ROTATED_ANCHOR_SET_MAGIC = b"auditchain/rotated-anchor-set/v1\0"
 _ROTATED_ANCHOR_SET_VERSION = 1
+
+# Binary framing of encode_stage_rotated_anchor_set /
+# decode_stage_rotated_anchor_set, the post-evolution counterpart of the
+# rotated-anchor-set framing: a fixed magic, then the envelope version as a
+# u64, the package count as a u64 and one u64-length-prefixed blob per
+# StageRotatedChain package in tuple order (each the complete canonical
+# encode_stage_rotated_anchor output), then the bridge count as a u64 and one
+# blob per cross-package rotation bridge in tuple order (each the complete
+# canonical encode_rotation output), with nothing else.
+_STAGE_ROTATED_ANCHOR_SET_MAGIC = b"auditchain/stage-ra-set/v1\0"
+_STAGE_ROTATED_ANCHOR_SET_VERSION = 1
 
 # Binary framing of dump_log / load_log: a fixed magic, then the envelope
 # version as a u64, one u64-length-prefixed blob holding the complete
@@ -3374,6 +3393,66 @@ class StageRotatedChain:
             raise TypeError("start must be a SignedRoot")
         if not isinstance(self.end, SignedRoot):
             raise TypeError("end must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class StageRotatedAnchorSet:
+    """Several :class:`StageRotatedChain` packages and their bridges as one artifact.
+
+    The post-evolution counterpart of :class:`RotatedAnchorSet`. Bundles a
+    non-empty tuple of :class:`StageRotatedChain` packages with the
+    cross-package rotation bridges that hop between them, so the packages
+    and bridges can be saved, transferred and restored across processes as a
+    single self-contained artifact and later diagnosed with
+    :func:`inspect_stage_rotated_anchor_set`:
+
+    - ``items``: the non-empty tuple of :class:`StageRotatedChain` packages,
+      in traversal order;
+    - ``bridges``: the tuple of ``(old, new_key, new, auth)`` rotation
+      four-tuples, exactly one fewer than the packages — ``bridges[i]``
+      connects package ``i`` to package ``i + 1``.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields (and are hashable). Only the container shape is validated here:
+    both fields must be tuples, ``items`` must be non-empty and hold only
+    :class:`StageRotatedChain` objects, ``bridges`` must hold only tuples,
+    and the bridge count must be exactly ``len(items) - 1`` — a non-tuple
+    field, a wrongly typed item or a non-tuple bridge raises TypeError,
+    while an empty ``items`` tuple or a bridge count other than one per
+    package boundary raises ValueError. Whether the bridges are genuine,
+    join the package anchors and authorize one cross-signer stage chain is
+    left to :func:`inspect_stage_rotated_anchor_set`.
+    """
+
+    items: tuple
+    bridges: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a non-empty tuple")
+        if len(self.items) == 0:
+            raise ValueError("items must be a non-empty tuple")
+        for item in self.items:
+            if not isinstance(item, StageRotatedChain):
+                raise TypeError("each item must be a StageRotatedChain")
+        if not isinstance(self.bridges, tuple):
+            raise TypeError("bridges must be a tuple of rotation records")
+        if len(self.bridges) != len(self.items) - 1:
+            raise ValueError(
+                "bridges must contain exactly one record per package "
+                "boundary "
+                f"({len(self.bridges)} given for {len(self.items)} "
+                "packages)"
+            )
+        # The raw four-tuples returned by rotate_signer have no dedicated
+        # class; check only their container type here, leaving length and
+        # element validation to encode_rotation / verify_rotation, exactly
+        # as inspect_stage_rotated_anchor_set does.
+        for bridge in self.bridges:
+            if not isinstance(bridge, tuple):
+                raise TypeError(
+                    "each bridge must be a (old, new_key, new, auth) tuple"
+                )
 
 
 # Diagnostic codes of inspect_continuation_chain and inspect_anchors, each
@@ -13752,6 +13831,154 @@ def inspect_rotated_anchor_set(
     return ContinuationChainReport(True, None, None)
 
 
+def inspect_stage_rotated_anchor_set(
+    items: Any, bridges: Any, key: Any
+) -> ContinuationChainReport:
+    """Diagnose persisted stage cross-key packages and the bridges hopping between.
+
+    The post-evolution counterpart of :func:`inspect_rotated_anchor_set`:
+    when a cross-signer stage continuation chain — one whose post-evolution
+    segments may be signed by different keys, each boundary authorized by an
+    :meth:`AuditLog.rotate_signer` rotation — has been landed in several
+    separate batches, each batch persisted on its own as a
+    :class:`StageRotatedChain` with its own intra-package rotations and its
+    own two anchors, this is the offline, read-only diagnosis that the
+    packages and the cross-package rotations, taken in the caller's tuple
+    order, verify as one genuine cross-signer stage chain. It holds neither
+    the log nor any checkpoint history, introduces no new signing domain or
+    wire format and never mutates the packages, the bridges or the key.
+
+    ``items`` is a non-empty ``tuple`` of :class:`StageRotatedChain`
+    packages and ``bridges`` a ``tuple`` whose length is exactly
+    ``len(items) - 1``, with ``bridges[i]`` the
+    ``(old, new_key, new, auth)`` four-tuple connecting package ``i`` to
+    package ``i + 1``. Trust hops at most once per boundary and packages
+    and bridges are examined strictly in traversal order, reporting only
+    the first failure:
+
+    - package 0 is diagnosed with :func:`inspect_stage_rotated_anchors`
+      against the pre-trusted 32-byte Ed25519 ``key``; once it passes, the
+      key trusted onwards is its last intra-package rotation's verified
+      ``new_key``;
+    - at every later package ``i`` the bridge is diagnosed before the
+      package it leads into, in this order: ``bridges[i - 1]`` equal to an
+      earlier cross-package bridge reports ``"rotation_duplicate"``;
+      failure of :func:`verify_rotation` against the currently trusted key
+      reports ``"rotation"``; and a bridge whose ``old`` checkpoint does
+      not equal the previous package's ``end`` or whose ``new`` checkpoint
+      does not equal this package's ``start`` on all six
+      :class:`SignedRoot` fields (``version``, ``hash_name``, ``size``,
+      ``root``, ``head`` and the Ed25519 ``signature``) reports
+      ``"rotation_link"``. Only a bridge that passes all three checks hops
+      trust: its verified ``new_key`` is then the only key trusted while
+      package ``i`` is diagnosed, again with
+      :func:`inspect_stage_rotated_anchors`;
+    - every package-level failure keeps its code unchanged — ``"verify"``,
+      ``"growth"``, ``"duplicate"``, ``"rotation_duplicate"``,
+      ``"rotation"``, ``"rotation_link"``, ``"start"`` or ``"end"`` — and
+      its package-local ``index`` is shifted onto the global credential
+      position by adding the receipt count of every earlier package. The
+      three bridge codes are indexed at the global position of the
+      following package's first receipt. An internally broken package is
+      never re-diagnosed across its boundary: the bridge is examined only
+      after every earlier package has passed.
+
+    A set whose packages are sound one by one under the hopped keys and
+    whose bridges are genuine and join at every boundary reports
+    ``ContinuationChainReport(True, None, None)``.
+
+    A non-tuple ``items`` or ``bridges`` (including a list, a generator or
+    ``None``), an element of ``items`` that is not a
+    :class:`StageRotatedChain`, a bridge element that is not a tuple, or a
+    ``key`` that is not ``bytes`` raises TypeError; an empty ``items``
+    tuple, a ``bridges`` tuple whose length is not exactly
+    ``len(items) - 1`` or a key that is not 32 bytes raises ValueError.
+    Every other nested structural violation — a bridge four-tuple of the
+    wrong length, a wrongly typed or sized bridge field, or any structural
+    exception raised while a package is diagnosed — propagates unchanged
+    (TypeError or ValueError) from :func:`verify_rotation` /
+    :func:`inspect_stage_rotated_anchors`. Types and shapes being legal,
+    any signature, authorization, proof, growth, repetition or
+    boundary-link mismatch is reported, not raised.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple")
+    for item in items:
+        if not isinstance(item, StageRotatedChain):
+            raise TypeError("each item must be a StageRotatedChain")
+    if not isinstance(bridges, tuple):
+        raise TypeError("bridges must be a tuple of rotation records")
+    if len(bridges) != len(items) - 1:
+        raise ValueError(
+            "bridges must contain exactly one record per package boundary "
+            f"({len(bridges)} given for {len(items)} packages)"
+        )
+    # The raw four-tuples returned by rotate_signer have no dedicated class;
+    # check only their container type here, leaving length and element
+    # validation to verify_rotation, exactly as inspect_stage_rotated_chain
+    # does.
+    for bridge in bridges:
+        if not isinstance(bridge, tuple):
+            raise TypeError(
+                "each bridge must be a (old, new_key, new, auth) tuple"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be a 32-byte Ed25519 public key")
+    if len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+    # Traversal order: diagnose package 0 with the pre-trusted key, then at
+    # each boundary diagnose the bridge (repetition, verify_rotation against
+    # the key currently trusted, all-field join of the two anchors) before
+    # hopping to its verified new_key and diagnosing the following package.
+    # Package-local report indices are re-based onto the global credential
+    # position by adding the receipt count of all earlier packages; the
+    # bridge codes are indexed at the following package's first receipt.
+    seen_bridges: set[tuple] = set()
+    current_key = key
+    offset = 0
+    for index, item in enumerate(items):
+        if index > 0:
+            bridge = bridges[index - 1]
+            if bridge in seen_bridges:
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION_DUPLICATE
+                )
+            seen_bridges.add(bridge)
+            if not verify_rotation(bridge, current_key):
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION
+                )
+            # verify_rotation succeeded and pinned new_key to 32 bytes; only
+            # then are the two sides of the seam compared on all six
+            # SignedRoot fields.
+            if bridge[0] != items[index - 1].end or bridge[2] != item.start:
+                return ContinuationChainReport(
+                    False, offset, _CHAIN_CODE_ROTATION_LINK
+                )
+            current_key = bridge[1]
+        # Exceptions from the nested diagnosis propagate: a structurally
+        # illegal package or bridge is a caller error, not a failed report.
+        report = inspect_stage_rotated_anchors(item, current_key)
+        if not report.ok:
+            return ContinuationChainReport(
+                False, offset + report.index, report.code
+            )
+        offset += len(item.receipts)
+        # The package passed, so every one of its rotations passed
+        # verify_rotation under the hopped keys; trust now rests on its
+        # last rotation's verified new_key, against which the next bridge
+        # must be authorized. A StageRotatedChain always carries at least
+        # one rotation (it requires at least two receipts).
+        current_key = item.rotations[-1][1]
+    return ContinuationChainReport(True, None, None)
+
+
 def merge_rotated_anchor_set(
     items: Any, bridges: Any, key: Any
 ) -> RotatedChain:
@@ -15024,6 +15251,133 @@ def decode_rotated_anchor_set(data: Any) -> RotatedAnchorSet:
     if offset != len(data):
         raise ValueError("trailing bytes after the rotated anchor set")
     return RotatedAnchorSet(tuple(items), tuple(bridges))
+
+
+def encode_stage_rotated_anchor_set(bundle: Any) -> bytes:
+    """Encode a :class:`StageRotatedAnchorSet` into canonical bytes.
+
+    The post-evolution counterpart of :func:`encode_rotated_anchor_set`.
+    The byte stream is
+    ``D || U(1) || U(n) || B(P0) … B(Pn-1) || U(m) || B(R0) … B(Rm-1)``
+    with ``D = b"auditchain/stage-ra-set/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the package count ``n`` and one
+    length-prefixed blob per package in ``bundle.items`` order — each
+    ``Pi`` byte-for-byte the complete canonical output of
+    :func:`encode_stage_rotated_anchor` over ``items[i]`` — then the bridge
+    count ``m = n - 1`` and one length-prefixed blob per bridge in
+    ``bundle.bridges`` order, each ``Ri`` byte-for-byte the complete
+    canonical output of :func:`encode_rotation` over ``bridges[i]``.
+    Nothing may be omitted, reordered or appended. The framing re-uses the
+    existing encodings only, introduces no new signing message and is
+    read-only: it never mutates the bundle.
+
+    ``bundle`` must be a :class:`StageRotatedAnchorSet` — anything else
+    raises TypeError; nested structural problems raise exactly the
+    exceptions of :func:`encode_stage_rotated_anchor` and
+    :func:`encode_rotation` (TypeError or ValueError), propagated
+    unchanged. Encoding is deterministic: re-encoding a decoded bundle
+    reproduces the original bytes exactly.
+    """
+    if not isinstance(bundle, StageRotatedAnchorSet):
+        raise TypeError("bundle must be a StageRotatedAnchorSet")
+    parts = [
+        _STAGE_ROTATED_ANCHOR_SET_MAGIC,
+        _encode_u64(_STAGE_ROTATED_ANCHOR_SET_VERSION, "version"),
+        _encode_u64(len(bundle.items), "package count"),
+    ]
+    for item in bundle.items:
+        parts.append(_encode_blob(encode_stage_rotated_anchor(item)))
+    parts.append(_encode_u64(len(bundle.bridges), "bridge count"))
+    for bridge in bundle.bridges:
+        parts.append(_encode_blob(encode_rotation(bridge)))
+    return b"".join(parts)
+
+
+def decode_stage_rotated_anchor_set(data: Any) -> StageRotatedAnchorSet:
+    """Decode bytes produced by :func:`encode_stage_rotated_anchor_set`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/stage-ra-set/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the
+    non-zero u64 package count ``n`` followed by exactly ``n``
+    length-prefixed package blobs, and then the u64 bridge count ``m`` —
+    which must equal ``n - 1`` — followed by exactly ``m``
+    length-prefixed bridge blobs, all consumed whole with no trailing
+    bytes. Every package blob is handed whole to
+    :func:`decode_stage_rotated_anchor` and every bridge blob to
+    :func:`decode_rotation`, so their framing and structural rules apply
+    verbatim and their exceptions propagate unchanged. A bad magic or
+    version, truncation, an oversized blob length, trailing bytes, a zero
+    package count or a bridge count other than ``n - 1`` raises
+    ValueError, as does an illegal nested encoding.
+
+    Signatures, authorizations, proofs, the cryptographic hops and the
+    anchoring itself are not checked here — only
+    :func:`inspect_stage_rotated_anchor_set` confirms the decoded stage
+    packages verify across their bridges as one chain; a structurally
+    well-formed set whose credentials fail to verify still decodes. The
+    returned bundle is a frozen :class:`StageRotatedAnchorSet` whose
+    fields equal the originally encoded ones, both tuples preserve the
+    encoded order, and re-encoding reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_STAGE_ROTATED_ANCHOR_SET_MAGIC):
+        raise ValueError("not an auditchain stage-rotated-anchor-set encoding")
+    offset = len(_STAGE_ROTATED_ANCHOR_SET_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _STAGE_ROTATED_ANCHOR_SET_VERSION:
+        raise ValueError(
+            f"unsupported stage-rotated-anchor-set version {version}"
+        )
+    package_count = read_u64("package count")
+    if package_count == 0:
+        raise ValueError(
+            "stage rotated anchor set must contain at least one package"
+        )
+    items = []
+    for position in range(package_count):
+        items.append(
+            decode_stage_rotated_anchor(
+                read_blob(f"stage rotated package {position}")
+            )
+        )
+    bridge_count = read_u64("bridge count")
+    if bridge_count != package_count - 1:
+        raise ValueError(
+            "bridge count must be exactly one fewer than the package count "
+            f"({bridge_count} bridges for {package_count} packages)"
+        )
+    bridges = []
+    for position in range(bridge_count):
+        bridges.append(
+            decode_rotation(read_blob(f"rotation bridge {position}"))
+        )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the stage rotated anchor set")
+    return StageRotatedAnchorSet(tuple(items), tuple(bridges))
 
 
 def dump_log(log: Any, private_key: Any) -> bytes:

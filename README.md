@@ -2606,6 +2606,82 @@ inspect_stage_rotated_chain(receipts, (other_rotation, r1), public_a)
   合法但任一验真、增长或接缝不匹配只生成失败报告、不抛异常。调用只读、
   确定，既有核验与编解码入口、签名原文及各线格式均不变
 
+#### 演进后轮换感知锚定链持久化：跨签名者阶段续接、逐跳轮换与首尾检查点一并保存
+
+演进后的跨签名者续接（每段
+`SignedStageAuthAuditContinuation` 可由不同签名钥签发、边界由
+`rotate_signer` 轮换授权）同样可以与逐跳轮换和首尾两个端点检查点绑成
+**一件**可持久化、可跨进程恢复的制品。冻结包
+`StageRotatedChain(receipts:tuple, rotations:tuple,
+start:SignedRoot, end:SignedRoot)` 四字段分别为阶段续接收据 tuple、
+逐跳轮换 tuple（`rotate_signer` 的 `(old, new_key, new, auth)`
+四元组）、首段 `consistency.old` 应对的 `start` 与末段
+`consistency.new` 应对的 `end`；支持位置/关键字构造、按全部四个字段
+相等（可哈希）。包本身只校验容器形状：两个 tuple、**至少两段**续接且
+轮换数恰为段数减一、收据元素均为
+`SignedStageAuthAuditContinuation`、轮换元素均为 tuple、两端为
+`SignedRoot`——容器或元素类型错抛 `TypeError`，少于两段或轮换数不符
+抛 `ValueError`；轮换是否真实、跨钥是否验真、是否锚定两端则留给顶层
+`inspect_stage_rotated_anchors(bundle, key) ->
+ContinuationChainReport`。
+
+```python
+from auditchain import (
+    StageRotatedChain,
+    encode_stage_rotated_anchor,
+    decode_stage_rotated_anchor,
+    inspect_stage_rotated_anchors,
+)
+
+bundle = StageRotatedChain(receipts, rotations, start, end)
+data = encode_stage_rotated_anchor(bundle)     # bytes，可写文件/发网络
+restored = decode_stage_rotated_anchor(data)   # 另一进程中恢复
+restored == bundle                              # True：四字段逐字段相等
+encode_stage_rotated_anchor(restored) == data   # True：重编码逐字节相同
+inspect_stage_rotated_anchors(restored, key_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- `inspect_stage_rotated_anchors` 全程**离线只读**：不持有日志、不
+  持有检查点历史、不新增任何 Ed25519/HMAC 签名域，且不修改制品或
+  公钥。它先以制品自身字段调用
+  `inspect_stage_rotated_chain(bundle.receipts, bundle.rotations,
+  key)`，失败报告**原样返回**（`"verify"`、`"growth"`、
+  `"duplicate"`、`"rotation_duplicate"`、`"rotation"`、
+  `"rotation_link"` 的首错顺序、报告码与索引口径完全不变），内部
+  断裂绝不改判为锚点不符
+- 仅当内部诊断全部成立后才先首后尾比对锚点：首段
+  `consistency.old` 须与 `start` 按 `SignedRoot` 全六字段（
+  `version`、`hash_name`、`size`、`root`、`head` 及 Ed25519
+  `signature`）全等，首段旧检查点不符报 `"start"`、索引 `0`；末段
+  `consistency.new` 须与 `end` 全等，不符报 `"end"`、索引为末段
+  位置；尺寸相同但签名者不同的检查点不算匹配，两端皆不符时只报
+  `"start"`（起点优先）
+- 字节流严格为 `D || U(1) || B(C) || B(R) || B(S) || B(E)`，其中
+  `D = b"auditchain/stage-ra/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`C` 逐字节等于既有
+  `encode_stage_continuations(receipts)` 的完整输出，`R` 逐字节
+  等于既有 `encode_rotations(rotations)` 的完整输出，`S`/`E`
+  分别逐字节等于 `encode_signed_root(start)` /
+  `encode_signed_root(end)`，四段顺序固定、**禁止换序与尾随字节**；
+  四个 blob 全部复用既有编码，外层帧不引入新签名域
+- `encode_stage_rotated_anchor(x)` 只收 `StageRotatedChain` 这一种
+  制品（否则抛 `TypeError`）；嵌套结构问题的 `TypeError` /
+  `ValueError` 原样传播；编码只读、确定，同一制品重复编码逐字节
+  相同
+- `decode_stage_rotated_anchor(data) -> StageRotatedChain` 只接受
+  精确 `bytes`（拒绝 `bytearray` / `memoryview`，抛
+  `TypeError`）；魔数、版本、截断、尾随、blob 长度或任一嵌套格式
+  非法抛 `ValueError`，四个 blob 分别交给
+  `decode_stage_continuations` / `decode_rotations` /
+  `decode_signed_root`，嵌套异常原样传播；恢复出的对象再经
+  `StageRotatedChain` 形状校验（少于两段或轮换数不符同样抛
+  `ValueError`）。解码保序、字段相等且重编码逐字节相同，但不校验
+  签名、标签、证明与接缝，结构合法而验真不匹配照常往返，由
+  `inspect_stage_rotated_anchors` 只生成失败报告而非抛出
+- 本次不新增签名原文与签名域；既有各线格式、核验诊断行为与已公开的
+  `python3 -m auditchain` 演示入口均不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -4530,6 +4606,52 @@ python3 -m auditchain
   顺序、字段相等且重编码逐字节相同，不校验签名、证明、包间接缝与
   锚定关系，结构合法而验真不匹配仍可解码；两个入口均为只读且确定，
   旧接口不变
+- `StageRotatedChain(receipts, rotations, start, end)` — 冻结的
+  演进后轮换感知锚定链包，把跨签名者阶段续接凭据 tuple、逐跳轮换
+  tuple 与首尾两个 `SignedRoot` 锚点绑为一件可持久化、可跨进程
+  恢复的制品，支持位置/关键字构造、按全部四个字段相等（可哈希）；
+  `receipts` 为至少两段的 `SignedStageAuthAuditContinuation` tuple，
+  `rotations` 为 `rotate_signer` 的 `(old, new_key, new, auth)`
+  轮换四元组 tuple，条数恰为段数减一，`start` / `end` 必须是
+  `SignedRoot`；两 tuple 之一非 tuple、收据元素非阶段续接凭据、
+  轮换元素非 tuple 或端点非 `SignedRoot` 抛 `TypeError`，少于两段
+  或轮换数不符抛 `ValueError`；轮换真伪、跨钥验真与锚定两端关系
+  不由此构造器判定，留给 `inspect_stage_rotated_anchors`
+- `encode_stage_rotated_anchor(bundle)` /
+  `decode_stage_rotated_anchor(data)` — 单个演进后轮换感知锚定链
+  包的规范二进制编码与解码，使 `StageRotatedChain` 可落盘、跨进程
+  恢复后继续凭预置信任公钥离线诊断，全程只读、不新增签名域：字节
+  流严格为 `D || U(1) || B(C) || B(R) || B(S) || B(E)`，其中
+  `D = b"auditchain/stage-ra/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`，`C` / `R` / `S` / `E` 分别逐字节为
+  既有 `encode_stage_continuations(receipts)` /
+  `encode_rotations(rotations)` / `encode_signed_root(start)` /
+  `encode_signed_root(end)` 的完整输出，四段按序排列且禁止尾随
+  字节；前者只接受 `StageRotatedChain` 这一种制品（否则抛
+  `TypeError`），嵌套编码异常原样传播；后者只接受精确 `bytes`
+  （拒绝 `bytearray` / `memoryview`），魔数、版本、截断、尾随、
+  blob 长度或任一嵌套格式非法抛 `ValueError`，四个 blob 分别交给
+  `decode_stage_continuations` / `decode_rotations` /
+  `decode_signed_root`、嵌套异常原样传播，恢复对象再经
+  `StageRotatedChain` 形状校验；解码保序、字段相等且重编码逐字节
+  相同，但不校验签名、标签、证明与接缝，结构合法而验真不匹配照常
+  往返，由 `inspect_stage_rotated_anchors` 报告而非抛出
+- `inspect_stage_rotated_anchors(bundle, key)` — 凭预置信任的 32
+  字节 Ed25519 公钥对单个 `StageRotatedChain` 离线只读诊断（两参
+  均无默认值）：先以制品自身字段调用
+  `inspect_stage_rotated_chain(bundle.receipts, bundle.rotations,
+  key)`，失败报告原样返回（`"verify"`、`"growth"`、
+  `"duplicate"`、`"rotation_duplicate"`、`"rotation"`、
+  `"rotation_link"` 的首错顺序、报告码与索引口径均不变），内部
+  断裂绝不改判为锚点不符；仅内部诊断全部成立后才先比起点（首段
+  `consistency.old` 须与 `start` 全六字段相等，首段旧检查点不符
+  报 `"start"`、索引 `0`）、后比终点（末段 `consistency.new` 须与
+  `end` 全等，不符报 `"end"`、索引为末段位置），尺寸相同但签名者
+  不同的检查点不算匹配，两端皆不符只报先检查的 `"start"`。
+  `bundle` 非 `StageRotatedChain` 或 `key` 非 `bytes` 抛
+  `TypeError`，`key` 非 32 字节抛 `ValueError`，嵌套异常原样
+  传播；不持有日志、不修改制品或公钥、不新增签名原文与签名域，
+  既有接口不变
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的

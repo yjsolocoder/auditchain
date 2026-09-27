@@ -19,6 +19,7 @@ SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
 ContinuationChainReport / AnchoredContinuationChain /
 StageAnchoredContinuationChain /
 AnchorSet /
+StageAnchorSet /
 RotatedChain /
 RotatedAnchorSet /
 entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
@@ -32,6 +33,7 @@ inspect_anchors / inspect_stage_anchors /
 inspect_rotated_chain /
 inspect_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
+inspect_stage_anchor_set / merge_stage_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
@@ -78,6 +80,7 @@ encode_rotation / decode_rotation /
 encode_rotations / decode_rotations /
 encode_anchored_continuations / decode_anchored_continuations /
 encode_anchor_set / decode_anchor_set /
+encode_stage_anchor_set / decode_stage_anchor_set /
 encode_rotated_anchor / decode_rotated_anchor /
 encode_rotated_anchor_set / decode_rotated_anchor_set /
 encode_signed_consistency / decode_signed_consistency /
@@ -152,6 +155,7 @@ __all__ = [
     "SignedStageVerifier",
     "SignedVerifier",
     "StageAnchoredContinuationChain",
+    "StageAnchorSet",
     "StageVerifier",
     "Verifier",
     "GENESIS_HASH",
@@ -194,6 +198,7 @@ __all__ = [
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
     "decode_stage_anchored_continuations",
+    "decode_stage_anchor_set",
     "decode_stage_continuations",
     "decode_stage_verifier",
     "decode_verifier",
@@ -249,6 +254,7 @@ __all__ = [
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
     "encode_stage_anchored_continuations",
+    "encode_stage_anchor_set",
     "encode_stage_continuations",
     "encode_stage_verifier",
     "encode_verifier",
@@ -261,6 +267,7 @@ __all__ = [
     "inspect_rotated_chain",
     "inspect_rotated_anchor_set",
     "inspect_stage_anchors",
+    "inspect_stage_anchor_set",
     "inspect_stage_continuation_chain",
     "load_auth",
     "load_hybrid",
@@ -276,6 +283,7 @@ __all__ = [
     "load_signed_pruned_hybrid",
     "merge_anchor_set",
     "merge_rotated_anchor_set",
+    "merge_stage_anchor_set",
     "rebuild_merkle_root",
     "verify_audit_receipt",
     "verify_audit_batch",
@@ -655,6 +663,15 @@ _STAGE_ANCHORED_CONTINUATION_VERSION = 1
 # output), in that order and with nothing else.
 _ANCHOR_SET_MAGIC = b"auditchain/anchor-set/v1\0"
 _ANCHOR_SET_VERSION = 1
+
+# Binary framing of encode_stage_anchor_set / decode_stage_anchor_set: a
+# fixed magic, then the envelope version as a u64 (always 1), the package
+# count as a u64 and one u64-length-prefixed blob per
+# StageAnchoredContinuationChain package in tuple order (each the complete
+# canonical encode_stage_anchored_continuations output), in that order and
+# with nothing else.
+_STAGE_ANCHOR_SET_MAGIC = b"auditchain/stage-anchor-set/v1\0"
+_STAGE_ANCHOR_SET_VERSION = 1
 
 # Binary framing of encode_rotated_anchor / decode_rotated_anchor: a fixed
 # magic, then the envelope version as a u64 and four u64-length-prefixed
@@ -3094,6 +3111,44 @@ class AnchorSet:
 
 
 @dataclass(frozen=True)
+class StageAnchorSet:
+    """Several :class:`StageAnchoredContinuationChain` packages as one artifact.
+
+    The post-evolution counterpart of :class:`AnchorSet`. Bundles the
+    non-empty tuple of :class:`StageAnchoredContinuationChain` packages —
+    one stage continuation chain landed in several separate batches, each
+    batch persisted on its own — so the whole set can be saved, transferred
+    and restored across processes as a single self-contained artifact and
+    later diagnosed with :func:`inspect_stage_anchor_set` or merged with
+    :func:`merge_stage_anchor_set`:
+
+    - ``items``: the non-empty tuple of
+      :class:`StageAnchoredContinuationChain` packages, in chain order.
+
+    Instances are immutable, may be built positionally and compare by the
+    field (and are hashable). Only the container shape is validated here:
+    ``items`` must be a non-empty ``tuple`` holding only
+    :class:`StageAnchoredContinuationChain` objects — a non-tuple or a
+    wrongly typed element raises TypeError, an empty tuple raises
+    ValueError. Whether the packages verify, join at equal anchors and
+    splice into one chain is left to :func:`inspect_stage_anchor_set`.
+    """
+
+    items: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a non-empty tuple")
+        if len(self.items) == 0:
+            raise ValueError("items must be a non-empty tuple")
+        for item in self.items:
+            if not isinstance(item, StageAnchoredContinuationChain):
+                raise TypeError(
+                    "each item must be a StageAnchoredContinuationChain"
+                )
+
+
+@dataclass(frozen=True)
 class RotatedChain:
     """A cross-key continuation chain persisted with its rotations and anchors.
 
@@ -3238,10 +3293,11 @@ class RotatedAnchorSet:
 # expected anchor. "link" names only the boundary between segments, it does
 # not blame either one. "start" and "end" are reported by inspect_anchors
 # only, never by inspect_continuation_chain. "anchor_link" is reported by
-# inspect_anchor_set only: the end anchor of one persisted package does not
-# equal the following package's start anchor, so the separately landed
-# packages cannot be spliced into one chain; its index is the global
-# position, across every package, of the later package's first receipt.
+# inspect_anchor_set and inspect_stage_anchor_set only: the end anchor of
+# one persisted package does not equal the following package's start anchor,
+# so the separately landed packages cannot be spliced into one chain; its
+# index is the global position, across every package, of the later
+# package's first receipt.
 # "rotation_duplicate", "rotation" and "rotation_link" are reported by
 # inspect_rotated_chain and inspect_rotated_anchor_set: a rotation equal to
 # an earlier one, a rotation that fails verify_rotation, and a rotation whose
@@ -3304,7 +3360,7 @@ class ContinuationChainReport:
       :func:`inspect_anchors` only, and ``"anchor_link"`` — a boundary at
       which two separately persisted packages fail to join, its ``index``
       the global receipt position of the later package's first receipt — by
-      :func:`inspect_anchor_set` only. ``"rotation_duplicate"``,
+      :func:`inspect_anchor_set` and :func:`inspect_stage_anchor_set` only. ``"rotation_duplicate"``,
       ``"rotation"`` and ``"rotation_link"`` — a repeated rotation, a
       rotation that fails :func:`verify_rotation`, and a rotation whose two
       checkpoints fail to join the surrounding segments — are reported by
@@ -13470,6 +13526,151 @@ def merge_anchor_set(items: Any, key: Any) -> AnchoredContinuationChain:
     return AnchoredContinuationChain(receipts, items[0].start, items[-1].end)
 
 
+def _stage_anchor_set_packages(items: Any, key: Any) -> None:
+    """Validate the arguments of the stage-anchor-set entry points."""
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple")
+    for item in items:
+        if not isinstance(item, StageAnchoredContinuationChain):
+            raise TypeError(
+                "each item must be a StageAnchoredContinuationChain"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be a 32-byte Ed25519 public key")
+    if len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"key must be {_ED25519_KEY_BYTES} bytes "
+            "(an Ed25519 public key)"
+        )
+
+
+def inspect_stage_anchor_set(items: Any, key: Any) -> ContinuationChainReport:
+    """Diagnose a set of persisted stage anchor packages for in-order splicing.
+
+    The post-evolution counterpart of :func:`inspect_anchor_set`. When one
+    stage continuation chain has been landed in several separate batches —
+    each batch persisted on its own as a
+    :class:`StageAnchoredContinuationChain` — this is the offline, read-only
+    diagnosis that the packages, taken in the caller's tuple order, verify
+    as one chain and can be merged into a single persistable artifact. It
+    holds neither the log nor any checkpoint history and introduces no new
+    Ed25519 or HMAC signing domain; the inputs are never mutated.
+
+    The packages are examined in two phases, reporting only the first
+    failure:
+
+    1. each package is diagnosed in tuple order with
+       :func:`inspect_stage_anchors` over its own fields —
+       ``inspect_stage_anchors(item.receipts, key, item.start, item.end)``
+       — against the pre-trusted 32-byte Ed25519 ``key``. A failing report
+       is returned with its code unchanged (``"verify"``, ``"growth"``,
+       ``"duplicate"``, ``"link"``, ``"start"`` or ``"end"``) and its
+       ``index`` shifted onto the global receipt position — the
+       package-local index plus the number of receipts in all earlier
+       packages — so every index addresses a receipt in the would-be
+       concatenation, never merely a position inside one package;
+    2. only after every package is individually sound are adjacent packages
+       compared in package order: the previous package's ``end`` anchor
+       must equal the following package's ``start`` anchor on all six
+       :class:`SignedRoot` fields (``version``, ``hash_name``, ``size``,
+       ``root``, ``head`` and the Ed25519 ``signature``). A mismatch
+       reports ``"anchor_link"`` at the global position of the later
+       package's first receipt. The code identifies the boundary between
+       the two packages and blames neither one; equality of the anchor
+       checkpoints (not just their sizes) is what lets the receipts splice
+       without a gap, overlap or change of history.
+
+    A set that is sound package by package and joins at every boundary
+    reports ``ContinuationChainReport(True, None, None)``.
+
+    ``items`` must be a non-empty ``tuple`` of
+    :class:`StageAnchoredContinuationChain` objects: a non-tuple (including
+    a list, a generator or ``None``) or an element of another type raises
+    TypeError, and an empty tuple raises ValueError. ``key`` must be a
+    32-byte ``bytes`` Ed25519 key: a non-``bytes`` value (including
+    ``bytearray``) raises TypeError and a ``bytes`` value of another length
+    raises ValueError. Nested structural violations raised while a package
+    is diagnosed propagate unchanged (TypeError or ValueError) rather than
+    becoming a failed report.
+    """
+    _stage_anchor_set_packages(items, key)
+
+    # Phase 1: every package must be sound on its own. Package-local report
+    # indices are re-based onto the global receipt position by adding the
+    # receipt count of all earlier packages; exceptions from the nested
+    # diagnosis propagate unchanged.
+    offset = 0
+    for item in items:
+        report = inspect_stage_anchors(
+            item.receipts, key, item.start, item.end
+        )
+        if not report.ok:
+            return ContinuationChainReport(
+                False, offset + report.index, report.code
+            )
+        offset += len(item.receipts)
+
+    # Phase 2: adjacent packages must join at equal anchors. The index marks
+    # the global position of the later package's first receipt.
+    offset = 0
+    previous = None
+    for item in items:
+        if previous is not None and previous.end != item.start:
+            return ContinuationChainReport(
+                False, offset, _CHAIN_CODE_ANCHOR_LINK
+            )
+        previous = item
+        offset += len(item.receipts)
+    return ContinuationChainReport(True, None, None)
+
+
+def merge_stage_anchor_set(
+    items: Any, key: Any
+) -> StageAnchoredContinuationChain:
+    """Merge in-order persisted stage anchor packages into one frozen chain.
+
+    The productive counterpart of :func:`inspect_stage_anchor_set` and the
+    post-evolution counterpart of :func:`merge_anchor_set`: it diagnoses
+    the packages exactly as that function does and, only when the diagnosis
+    succeeds — every package sound on its own and every adjacent pair
+    joining at equal :class:`SignedRoot` anchors — returns a **new** frozen
+    :class:`StageAnchoredContinuationChain` whose receipts are the
+    packages' receipts concatenated in package order and in within-package
+    order, whose ``start`` is the first package's ``start`` and whose
+    ``end`` is the last package's ``end``. The merged artifact encodes
+    through the existing :func:`encode_stage_anchored_continuations` with
+    no new format or signing domain.
+
+    The call is strictly read-only: none of the input packages is mutated
+    or rebuilt, and the receipts themselves are reused rather than recopied
+    (tuples are immutable), so the inputs still encode exactly as before.
+
+    ``items`` and ``key`` follow :func:`inspect_stage_anchor_set`: a
+    non-tuple ``items`` (including a list, a generator or ``None``) or an
+    element that is not a :class:`StageAnchoredContinuationChain` raises
+    TypeError, while an empty tuple or a non-32-byte ``key`` raises
+    ValueError. A set that fails the diagnosis — a package that does not
+    verify or anchor internally, or two packages whose adjacent anchors
+    differ — raises ValueError, never a silently partial merge. Nested
+    structural violations raised during the diagnosis propagate unchanged
+    (TypeError or ValueError).
+    """
+    report = inspect_stage_anchor_set(items, key)
+    if not report.ok:
+        raise ValueError(
+            f"stage anchor set cannot be merged: {report.code!r} at "
+            f"receipt index {report.index}"
+        )
+    receipts = tuple(
+        receipt for item in items for receipt in item.receipts
+    )
+    return StageAnchoredContinuationChain(
+        receipts, items[0].start, items[-1].end
+    )
+
+
 def encode_continuations(receipts: Any) -> bytes:
     """Encode a non-empty tuple of continuation receipts into canonical bytes.
 
@@ -13977,6 +14178,108 @@ def decode_anchor_set(data: Any) -> AnchorSet:
     if offset != len(data):
         raise ValueError("trailing bytes after the anchor set")
     return AnchorSet(tuple(items))
+
+
+def encode_stage_anchor_set(bundle: Any) -> bytes:
+    """Encode a :class:`StageAnchorSet` into canonical bytes.
+
+    The post-evolution counterpart of :func:`encode_anchor_set`. The byte
+    stream is ``D || U(1) || U(n) || B(P0) … B(Pn-1)`` with
+    ``D = b"auditchain/stage-anchor-set/v1\\0"``, ``U`` an unsigned 8-byte
+    big-endian integer and ``B(x) = U(len(x)) || x``: the envelope
+    ``version`` (always 1), then the package count ``n`` and one
+    length-prefixed blob per package in ``bundle.items`` order — each
+    ``Pi`` byte-for-byte the complete canonical output of
+    :func:`encode_stage_anchored_continuations` over ``items[i]``. Nothing
+    may be omitted, reordered or appended. The framing re-uses the existing
+    encoding only, introduces no new signing message and is read-only: it
+    never mutates the bundle.
+
+    ``bundle`` must be a :class:`StageAnchorSet` — anything else raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_stage_anchored_continuations` (TypeError or ValueError),
+    propagated unchanged. Encoding is deterministic: re-encoding a decoded
+    bundle reproduces the original bytes exactly.
+    """
+    if not isinstance(bundle, StageAnchorSet):
+        raise TypeError("bundle must be a StageAnchorSet")
+    parts = [
+        _STAGE_ANCHOR_SET_MAGIC,
+        _encode_u64(_STAGE_ANCHOR_SET_VERSION, "version"),
+        _encode_u64(len(bundle.items), "package count"),
+    ]
+    for item in bundle.items:
+        parts.append(_encode_blob(encode_stage_anchored_continuations(item)))
+    return b"".join(parts)
+
+
+def decode_stage_anchor_set(data: Any) -> StageAnchorSet:
+    """Decode bytes produced by :func:`encode_stage_anchor_set`.
+
+    The post-evolution counterpart of :func:`decode_anchor_set`. ``data``
+    must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/stage-anchor-set/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), the
+    non-zero u64 package count ``n`` and exactly ``n`` length-prefixed
+    package blobs, each consumed whole with no trailing bytes. Every
+    package blob is handed whole to
+    :func:`decode_stage_anchored_continuations`, so its framing and
+    structural rules apply verbatim and its exceptions propagate unchanged.
+    A bad magic or version, a zero package count, truncation, an oversized
+    blob length, trailing bytes or an illegal nested encoding raises
+    ValueError.
+
+    Signatures, tags, proofs, the adjacency between receipts and the
+    anchoring within or across packages are not checked here — only
+    :func:`inspect_stage_anchor_set` confirms the decoded packages verify
+    and splice into one chain; a structurally well-formed set whose
+    credentials fail to verify still decodes. The returned bundle is a
+    frozen :class:`StageAnchorSet` whose field equals the originally
+    encoded one, the tuple preserves the encoded order, and re-encoding
+    reproduces the original bytes exactly.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_STAGE_ANCHOR_SET_MAGIC):
+        raise ValueError("not an auditchain stage-anchor-set encoding")
+    offset = len(_STAGE_ANCHOR_SET_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _STAGE_ANCHOR_SET_VERSION:
+        raise ValueError(f"unsupported stage-anchor-set version {version}")
+    package_count = read_u64("package count")
+    if package_count == 0:
+        raise ValueError("stage anchor set must contain at least one package")
+    items = []
+    for position in range(package_count):
+        items.append(
+            decode_stage_anchored_continuations(
+                read_blob(f"stage anchor package {position}")
+            )
+        )
+    if offset != len(data):
+        raise ValueError("trailing bytes after the stage anchor set")
+    return StageAnchorSet(tuple(items))
 
 
 def encode_rotated_anchor(x: Any) -> bytes:

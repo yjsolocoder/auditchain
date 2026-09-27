@@ -2405,6 +2405,107 @@ inspect_stage_anchors(restored.receipts, public_key, restored.start, restored.en
   解码后重编码逐字节相同。本次不新增任何签名原文，既有单段核验、整链
   核验诊断、编解码与各线格式全部不变
 
+#### 演进后多包锚定续接链的按序核验与合并：阶段链分批落盘后拼回单一制品
+
+同一条演进后阶段续接链若分多批落盘、每批各自保存为一个
+`StageAnchoredContinuationChain`，离线方可仅凭预置信任公钥，在**不持有
+日志、不新增任何签名域**的前提下，按 tuple 顺序把这些包核验为一条链并
+合并回单一可持久化制品。顶层
+`inspect_stage_anchor_set(items, key) -> ContinuationChainReport`
+负责按序诊断，只报最早问题，全部成立返回 `(True, None, None)`：
+
+- **逐包诊断**：按包序对每个包以其自身字段调用
+  `inspect_stage_anchors(item.receipts, key, item.start, item.end)`；
+  失败报告码不变（`"verify"`、`"growth"`、`"duplicate"`、`"link"`、
+  `"start"`、`"end"`），其 `index` 为**包内位置加此前各包凭据总数**，
+  即该凭据在拼接待建链中的全局位置，而非包内位置
+- **跨包相邻检查**：仅当每个包自身都成立后，才按包序比较相邻两包——
+  前包 `end` 与后包 `start` 须按 `SignedRoot` 全六字段（`version`、
+  `hash_name`、`size`、`root`、`head` 及 Ed25519 `signature`）全等；
+  不符报既有合法码 `"anchor_link"`，`index` 取**后包首凭据的全局
+  位置**。该码同样只标识包间边界、不归责任何一包；仅当每处边界都锚点
+  全等时拼接才无缺口、无重叠、无历史切换
+
+```python
+from auditchain import inspect_stage_anchor_set, merge_stage_anchor_set
+
+inspect_stage_anchor_set(packages, public_key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+merged = merge_stage_anchor_set(packages, public_key)
+# 新的冻结 StageAnchoredContinuationChain
+merged.start == packages[0].start          # 端点取首包 start
+merged.end   == packages[-1].end           # 与末包 end
+merged.receipts == tuple(                  # 按包序、包内序拼接全部凭据
+    r for item in packages for r in item.receipts
+)
+```
+
+- 顶层 `merge_stage_anchor_set(items, key)
+  -> StageAnchoredContinuationChain` 仅在上述诊断**成功**时返回一个
+  **新冻结对象**：receipts 按包序、包内序拼接，端点取首包 `start` 与
+  末包 `end`；合并结果沿用既有的 `encode_stage_anchored_continuations`，
+  **不设新格式、不新增签名域**。诊断失败（包内不成立或跨包锚点不符）
+  抛 `ValueError`，绝不返回半成品；调用只读，不修改也不重建任何输入包
+  与公钥
+- 报告仍为冻结三字段 `ContinuationChainReport(ok, index, code)`，构造与
+  相等规则不变，合法码集合不新增（`"anchor_link"` 为既有合法码）；
+  旧接口与既有各码均不变
+- 调用前校验：`items` 须为 `StageAnchoredContinuationChain` 的非空
+  tuple，非 tuple（含 list、生成器、`None`）或元素类型错抛
+  `TypeError`，空集抛 `ValueError`；`key` 须为恰好 32 字节 `bytes`，
+  非 `bytes`（含 `bytearray`）抛 `TypeError`，长度不符抛
+  `ValueError`；诊断中的嵌套结构异常按既有规则原样传播
+  （`TypeError` / `ValueError`）
+
+#### 演进后多包锚定续接链集合：阶段锚定包绑成单一制品跨进程恢复
+
+分批落盘的若干 `StageAnchoredContinuationChain` 包可以再绑成**一件**
+可持久化、可跨进程恢复的冻结制品：`StageAnchorSet(items:tuple)`。唯一
+字段是按链序存放的 `StageAnchoredContinuationChain` 包**非空 tuple**，
+不再携带别的字段；支持位置/关键字构造、按该字段相等（可哈希）。制品
+本身只校验容器形状：`items` 须为非空 tuple 且元素均为
+`StageAnchoredContinuationChain`——非 tuple 或元素类型错抛
+`TypeError`，空集抛 `ValueError`；各包是否验真、包间锚点接缝是否成立
+不在此处校验，恢复后可在另一进程中把 `items` 直接交给
+`inspect_stage_anchor_set` / `merge_stage_anchor_set` 继续诊断或合并，
+结论与原件一致。
+
+```python
+from auditchain import (
+    StageAnchorSet,
+    encode_stage_anchor_set,
+    decode_stage_anchor_set,
+    inspect_stage_anchor_set,
+)
+
+bundle = StageAnchorSet(packages)
+data = encode_stage_anchor_set(bundle)       # bytes，可写文件/发网络
+restored = decode_stage_anchor_set(data)     # 另一进程中恢复
+restored == bundle                            # True：字段逐字段相等
+encode_stage_anchor_set(restored) == data     # True：重编码逐字节相同
+inspect_stage_anchor_set(restored.items, public_key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- 字节流严格为 `D || U(1) || U(n) || B(P0)…B(Pn-1)`，其中
+  `D = b"auditchain/stage-anchor-set/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`；`n` 为包数，`Pi` 逐字节等于既有
+  `encode_stage_anchored_continuations(items[i])` 的完整输出，按 tuple
+  顺序排列、**禁止省略、换序与尾随字节**；全部 blob 复用既有编码，
+  外层帧不引入新签名原文
+- `encode_stage_anchor_set(bundle)` 只接受 `StageAnchorSet`（否则抛
+  `TypeError`）；嵌套结构问题的 `TypeError` / `ValueError` 原样传播；
+  编码只读、确定，重复编码逐字节相同
+- `decode_stage_anchor_set(data) -> StageAnchorSet` 只接受精确的
+  `bytes`（拒绝 `bytearray` / `memoryview`，抛 `TypeError`）；魔数 /
+  版本错、空集（包数为零）、截断、blob 长度越界、尾随字节或嵌套格式
+  非法抛 `ValueError`；各包 blob 交给
+  `decode_stage_anchored_continuations`，嵌套异常原样传播。解码保序并
+  返回冻结对象，但不校验签名、证明、包间接缝与锚定关系，结构合法而
+  验真不匹配仍可解码往返，由 `inspect_stage_anchor_set` 报告而非抛出
+- 全程离线只读，不新增签名原文；既有单段核验、整链诊断与各线格式不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -4258,6 +4359,47 @@ python3 -m auditchain
   结构合法而验真不匹配仍可往返，由 `inspect_stage_anchors` 报告；
   两个入口均只读且确定，不新增签名原文，既有单段核验、整链核验
   诊断、编解码与各线格式不变
+- `inspect_stage_anchor_set(items, key)` — 分批落盘的多个
+  `StageAnchoredContinuationChain` 的按序只读核验，
+  `inspect_anchor_set` 的演进后对应物，两阶段只报最早问题：先按包序
+  逐包以 `inspect_stage_anchors(item.receipts, key, item.start,
+  item.end)` 诊断，失败码不变且 `index` 取包内位置加此前各包凭据总数
+  的**全局位置**；仅当各包均成立才比较相邻两包，前包 `end` 与后包
+  `start` 须按 `SignedRoot` 全六字段全等，不符报既有合法码
+  `"anchor_link"`，`index` 取后包首凭据的全局位置；全部成立返回
+  `(True, None, None)`。`items` 非 tuple 或元素非
+  `StageAnchoredContinuationChain` 抛 `TypeError`，空集或 32 字节
+  `key` 长度不符抛 `ValueError`，嵌套结构异常原样传播；离线、只读、
+  不持有日志、不新增签名域，旧接口与既有码不变
+- `merge_stage_anchor_set(items, key)` — 仅当
+  `inspect_stage_anchor_set` 诊断成功时返回**新冻结**
+  `StageAnchoredContinuationChain`：receipts 按包序、包内序拼接，
+  端点取首包 `start` 与末包 `end`，沿用既有
+  `encode_stage_anchored_continuations`、不设新格式；诊断失败抛
+  `ValueError`，类型/长度校验与嵌套异常规则同
+  `inspect_stage_anchor_set`；调用只读，不修改任何输入包与公钥
+- `StageAnchorSet(items)` — 冻结的演进后多包锚定续接链集合，把分批
+  落盘的非空 `StageAnchoredContinuationChain` 包 tuple 绑为一件可
+  持久化、可跨进程恢复的制品，不再携带别的字段；支持位置/关键字
+  构造、按该字段相等（可哈希）；`items` 非 tuple 或元素非
+  `StageAnchoredContinuationChain` 抛 `TypeError`，空集抛
+  `ValueError`；制品本身不校验包内验真与包间锚点接缝
+- `encode_stage_anchor_set(bundle)` /
+  `decode_stage_anchor_set(data)` — 演进后多包锚定续接链集合的规范
+  二进制编码与解码，使若干阶段锚定包作为单一制品落盘、跨进程恢复后
+  把 `items` 交给 `inspect_stage_anchor_set` /
+  `merge_stage_anchor_set` 继续诊断或合并，全程只读、不新增签名
+  原文：字节流严格为 `D || U(1) || U(n) || B(P0)…B(Pn-1)`，其中
+  `D = b"auditchain/stage-anchor-set/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`，`n` 为包数，`Pi` 逐字节为既有
+  `encode_stage_anchored_continuations(items[i])` 输出，按 tuple
+  顺序排列且禁止尾随字节；前者只接受 `StageAnchorSet`（否则抛
+  `TypeError`），嵌套编码异常原样传播；后者只接受精确 `bytes`
+  （拒绝 `bytearray` / `memoryview`），魔数、版本、零包数、截断、
+  blob 长度、嵌套格式或尾随非法抛 `ValueError`；解码保持 tuple
+  顺序、字段相等且重编码逐字节相同，不校验签名、证明、包间接缝与
+  锚定关系，结构合法而验真不匹配仍可解码；两个入口均为只读且确定，
+  旧接口不变
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的

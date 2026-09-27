@@ -2234,6 +2234,87 @@ verify_signed_stage_auth_audit_continuation(restored, public_key)  # True：无�
   材料一样保护；两个入口均只读且确定，既有各线格式、签名原文、导出与
   批量签发行为全部不变，续接凭据族的其他编解码入口不动
 
+#### 演进后阶段续接链的离线核验、诊断与持久化（Ed25519）
+
+单个 `SignedStageAuthAuditContinuation` 只证明"一个旧快照只追加续接到一个
+新快照"。顶层 `verify_stage_continuation_chain(receipts, public_key) -> bool`
+是 `verify_continuation_chain` 的**阶段对应物**：接收一个**非空 tuple** 的
+既有冻结演进后续接凭据（保持调用方给定顺序），离线核验它们描述的是同一条
+连续只追加历史，全程只读、不持有日志，也**不新增任何签名域**：
+
+```python
+from auditchain import verify_stage_continuation_chain
+
+# 三段：size 0 → 2 → 5 → 8；每段由同一日志内容在同一预置密钥下签发
+chain = (
+    log0.signed_stage_auth_audit_continuation(0, (), seed, size=2),
+    log1.signed_stage_auth_audit_continuation(2, (), seed, size=5),
+    log2.signed_stage_auth_audit_continuation(5, (), seed, size=8),
+)
+verify_stage_continuation_chain(chain, public_key)       # True
+verify_stage_continuation_chain(chain, other_public_key) # False：未信任的公钥
+```
+
+- 首参只收非空 `tuple`：非 `tuple`（含 list、生成器、`None`）抛
+  `TypeError`，空 tuple 抛 `ValueError`；元素必须均为
+  `SignedStageAuthAuditContinuation`，否则抛 `TypeError`。逐项调用
+  `verify_signed_stage_auth_audit_continuation`，任一项返回 `False`（或
+  嵌套结构非法按既有规则抛 `TypeError` / `ValueError`，公钥长度错抛
+  `ValueError`、非 `bytes` 抛 `TypeError`）整体即不成立
+- 每段还须满足 `consistency.old.size < consistency.new.size`（等长段不描述
+  任何追加）；相邻两段要求前段 `consistency.new` 与后段 `consistency.old`
+  **全字段相等**（`version`、`hash_name`、`size`、`root`、`head` 及
+  Ed25519 签名本身）；tuple 中出现重复段（含非相邻的重复凭据）返回
+  `False`。任一关系不符返回 `False`，调用只读，旧接口不变
+- `inspect_stage_continuation_chain(receipts, public_key)` 是其只读诊断
+  对应物，返回既有冻结 `ContinuationChainReport(ok, index, code)`，按输入
+  顺序只定位**最早**一处问题：逐段验真失败报 `"verify"`，
+  `old.size >= new.size` 报 `"growth"`；各段单独成立后才查段间关系——
+  重复凭据报 `"duplicate"`、相邻检查点非全字段相等报 `"link"`（`index`
+  取后段位置，`"link"` 只标识边界不归责单段）；有效链为
+  `(True, None, None)`。类型/长度校验与嵌套异常传播规则与
+  `verify_stage_continuation_chain` 一致；不持有日志、不改凭据、不新增
+  签名域：
+
+```python
+from auditchain import ContinuationChainReport, inspect_stage_continuation_chain
+
+inspect_stage_continuation_chain(chain, public_key)
+# ContinuationChainReport(ok=True, index=None, code=None)
+inspect_stage_continuation_chain(chain, other_public_key)
+# ContinuationChainReport(ok=False, index=0, code='verify')
+```
+
+- `encode_stage_continuations(receipts) -> bytes` /
+  `decode_stage_continuations(data) -> tuple` 把整条演进后续接链序列化为
+  只读、确定的规范二进制并按凭据 tuple 的原有顺序原样还原：
+
+```python
+from auditchain import decode_stage_continuations, encode_stage_continuations
+
+data = encode_stage_continuations(chain)      # bytes，可写文件/发网络
+restored = decode_stage_continuations(data)   # tuple，顺序与逐字段均不变
+restored == chain                             # True
+encode_stage_continuations(restored) == data  # True：重编码逐字节相同
+verify_stage_continuation_chain(restored, public_key)  # True：无需持有日志
+```
+
+  字节流严格为 `D || U(1) || U(n) || B(R1) … B(Rn)`，其中
+  `D = b"auditchain/stage-cont-chain/v1\0"`，`U` 为 8 字节无符号大端
+  整数，`B(x) = U(len(x)) || x`，`n` 为非零凭据计数；每个 `Ri` 须逐字节
+  等于既有 `encode_signed_stage_auth_audit_continuation(receipt_i)` 的
+  完整输出，按 tuple 顺序排列。解码精确消费全部 `Ri` 与所有外层字节、
+  **禁止尾随字节**，每个 blob 原样交给
+  `decode_signed_stage_auth_audit_continuation`，嵌套异常沿用既有解码器。
+  `encode_stage_continuations` 只收非空
+  `SignedStageAuthAuditContinuation` tuple（非 tuple 或元素类型错抛
+  `TypeError`，空 tuple 抛 `ValueError`），`decode_stage_continuations`
+  只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、
+  零计数、截断、长度、嵌套格式或尾随非法均抛 `ValueError`；编解码不校验
+  签名、标签、证明及相邻段关联，结构合法但验真不匹配仍可解码，由
+  `verify_stage_continuation_chain` 返回 `False`；两个入口均只读且确定，
+  既有单段核验、编解码与各线格式全部不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -4011,6 +4092,46 @@ python3 -m auditchain
   编码携带明文阶段密钥（只认证来源、不加密），字节流须像验证材料一样
   保护；两个入口均只读且确定，既有各线格式、签名原文、导出与批量签发
   行为不变，续接凭据族的其他编解码入口不动
+- `verify_stage_continuation_chain(receipts, public_key)` —
+  `verify_continuation_chain` 的阶段对应物：离线核验一个非空
+  `SignedStageAuthAuditContinuation` tuple 描述同一条连续只追加历史，
+  只读且不新增签名域。首参只收非空 `tuple`（非 tuple 抛 `TypeError`，
+  空 tuple 抛 `ValueError`），元素均须为既有冻结
+  `SignedStageAuthAuditContinuation`（否则抛 `TypeError`）并保持输入
+  顺序；逐项调用 `verify_signed_stage_auth_audit_continuation`，任一返回
+  `False` 整体即 `False`（嵌套验真异常与公钥长度/类型错沿用既有规则
+  传播）。每段还须满足 `consistency.old.size < consistency.new.size`，
+  相邻段要求前段 `consistency.new` 与后段 `consistency.old` 全字段相等
+  （含签名本身）；重复段或任一关系不符返回 `False`
+- `inspect_stage_continuation_chain(receipts, public_key)` —
+  `verify_stage_continuation_chain` 的只读诊断对应物，返回既有冻结
+  `ContinuationChainReport(ok, index, code)`，按输入顺序只定位**最早**
+  一处问题：逐段 `verify_signed_stage_auth_audit_continuation` 失败报
+  `"verify"`，`old.size >= new.size` 报 `"growth"`；各段单独成立后查
+  段间关系，重复凭据报 `"duplicate"`、相邻检查点非全字段相等报
+  `"link"`（`index` 取后段位置，`"link"` 只标识边界不归责单段）；
+  有效链为 `(True, None, None)`。类型/长度校验与嵌套异常传播规则与
+  `verify_stage_continuation_chain` 一致；不持有日志、不改凭据、不新增
+  签名域，旧接口不变
+- `encode_stage_continuations(receipts)` / `decode_stage_continuations(data)`
+  — 演进后阶段续接链的规范二进制编码与解码，使非空
+  `SignedStageAuthAuditContinuation` tuple 可落盘、跨进程恢复后继续凭
+  预置信任的 Ed25519 公钥由 `verify_stage_continuation_chain` 离线验真，
+  且不新增签名域：字节流严格为 `D || U(1) || U(n) || B(R1) … B(Rn)`，
+  其中 `D = b"auditchain/stage-cont-chain/v1\0"`，`U` 为 8 字节无符号
+  大端整数，`B(x) = U(len(x)) || x`（沿用 u64 大端与既有 blob 规则），
+  `n` 为非零计数，`Ri` 为既有
+  `encode_signed_stage_auth_audit_continuation` 的完整规范输出并按 tuple
+  顺序排列；解码精确消费各 `Ri` 及全部外层字节、禁止尾随字节，分别交给
+  既有 `decode_signed_stage_auth_audit_continuation`，嵌套异常沿用该
+  解码器。前者只收非空 `SignedStageAuthAuditContinuation` tuple（非
+  tuple 或元素类型错抛 `TypeError`，空 tuple 抛 `ValueError`），后者只
+  接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、
+  零计数、截断、blob 长度、嵌套格式或尾随非法抛 `ValueError`；解码保持
+  凭据 tuple 的原有顺序、字段相等且重编码逐字节相同；编解码不校验签名、
+  标签、证明及相邻段关联，结构合法但验真不匹配仍可解码
+  （`verify_stage_continuation_chain` 返回 `False`）；两个入口均为只读
+  且确定，既有单段核验、编解码与各线格式不变
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的

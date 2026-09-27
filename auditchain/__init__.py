@@ -39,6 +39,7 @@ inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
 inspect_stage_anchor_set / merge_stage_anchor_set /
 inspect_rotated_anchor_set / merge_rotated_anchor_set /
 inspect_stage_rotated_anchor_set /
+merge_stage_rotated_anchor_set /
 verify_signed_verifier / verify_signed_root /
 verify_signed_stage_verifier / verify_signed_stage_auth_bundle /
 verify_signed_audit_batch / verify_signed_audit_receipt /
@@ -300,6 +301,7 @@ __all__ = [
     "merge_anchor_set",
     "merge_rotated_anchor_set",
     "merge_stage_anchor_set",
+    "merge_stage_rotated_anchor_set",
     "rebuild_merkle_root",
     "verify_audit_receipt",
     "verify_audit_batch",
@@ -14041,6 +14043,79 @@ def merge_rotated_anchor_set(
         )
     )
     return RotatedChain(receipts, rotations, items[0].start, items[-1].end)
+
+
+def merge_stage_rotated_anchor_set(
+    items: Any, bridges: Any, key: Any
+) -> StageRotatedChain:
+    """Merge in-order persisted stage rotated packages into one frozen chain.
+
+    The productive counterpart of
+    :func:`inspect_stage_rotated_anchor_set` and the post-evolution
+    counterpart of :func:`merge_rotated_anchor_set`: it diagnoses the stage
+    packages and bridges exactly as that function does and, only when the
+    diagnosis succeeds — every package sound on its own under the hopped
+    keys and every bridge genuine and joining at both anchors — returns a
+    **new** frozen :class:`StageRotatedChain` spanning the whole
+    cross-signer stage chain:
+
+    - ``receipts`` are the packages' receipts concatenated in package order
+      and in within-package order;
+    - ``rotations`` walk the same global credential order: after each
+      package's own intra-package rotations the corresponding
+      ``bridges[i]`` four-tuple is inserted, followed by the following
+      package's own rotations — so one rotation sits at every adjacent
+      credential boundary, intra-package and cross-package alike;
+    - ``start`` is the first package's ``start`` and ``end`` the last
+      package's ``end``.
+
+    The merged artifact encodes through the existing
+    :func:`encode_stage_rotated_anchor` with no new signing domain or wire
+    format. The call is strictly offline and read-only: none of the input
+    packages, bridges or the key is mutated or rebuilt, and the receipts,
+    rotations and anchors are reused rather than recopied (tuples and
+    frozen dataclasses are immutable), so the inputs still encode exactly
+    as before. A single package with empty bridges returns that package
+    itself, with no rewriting of its credentials or endpoints.
+
+    ``items``, ``bridges`` and ``key`` follow
+    :func:`inspect_stage_rotated_anchor_set` and have no defaults: a
+    non-tuple ``items`` or ``bridges`` (including a list, a generator or
+    ``None``), an element of ``items`` that is not a
+    :class:`StageRotatedChain`, a bridge element that is not a tuple, or a
+    ``key`` that is not ``bytes`` raises TypeError, while an empty
+    ``items`` tuple, a ``bridges`` tuple whose length is not exactly
+    ``len(items) - 1`` or a key that is not 32 bytes raises ValueError.
+    Any failure report — a package or bridge that does not verify, a
+    repeated bridge, a growth or repetition failure, or a seam that does
+    not join — raises ValueError, never a silently partial merge. Nested
+    structural violations raised during the diagnosis propagate unchanged
+    (TypeError or ValueError).
+    """
+    report = inspect_stage_rotated_anchor_set(items, bridges, key)
+    if not report.ok:
+        raise ValueError(
+            "stage rotated anchor set cannot be merged: "
+            f"{report.code!r} at receipt index {report.index}"
+        )
+    if len(items) == 1:
+        # One package with no bridges is already the merged artifact;
+        # return it itself rather than rebuilding an equal-but-distinct
+        # chain, so neither its credentials nor its endpoints are rewritten.
+        return items[0]
+    receipts = tuple(
+        receipt for item in items for receipt in item.receipts
+    )
+    rotations = tuple(
+        rotation
+        for index, item in enumerate(items)
+        for rotation in (
+            item.rotations + (bridges[index],)
+            if index < len(bridges)
+            else item.rotations
+        )
+    )
+    return StageRotatedChain(receipts, rotations, items[0].start, items[-1].end)
 
 
 def _anchor_set_packages(items: Any, key: Any) -> None:

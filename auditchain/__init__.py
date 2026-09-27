@@ -1,6 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
-Public API: Entry / AuditLog / PruneReceipt / AuditReceipt / AuthTag /
+Public API: Entry / AuditLog / PruneReceipt / AuditReceipt /
+AuditReceiptReport / AuthTag /
 BatchInclusionProof / InclusionProof / ConsistencyProof / MerkleFrontier /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
 SignedStageAuthBundle /
@@ -30,6 +31,7 @@ verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
+inspect_audit_receipt / inspect_audit_batch /
 inspect_continuation_chain / inspect_stage_continuation_chain /
 inspect_anchors / inspect_stage_anchors /
 inspect_rotated_chain / inspect_stage_rotated_chain /
@@ -128,6 +130,7 @@ __all__ = [
     "AnchorSet",
     "AuditLog",
     "AuditReceipt",
+    "AuditReceiptReport",
     "AuthTag",
     "BatchInclusionProof",
     "ConsistencyProof",
@@ -275,6 +278,8 @@ __all__ = [
     "inspect_anchor_set",
     "inspect_anchored_continuations",
     "inspect_anchors",
+    "inspect_audit_batch",
+    "inspect_audit_receipt",
     "inspect_continuation_chain",
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
@@ -6933,6 +6938,273 @@ def verify_audit_batch(receipt: Any) -> bool:
         nodes,
         hash_name=hash_name,
     )
+
+
+# Issue codes reported by AuditReceiptReport. "entry" pinpoints the entry
+# whose recomputed digest does not equal its recorded entry_hash; "proof"
+# pinpoints a proof that fails to rebuild the recorded snapshot root (the
+# item's own index for an AuditReceipt, no position for the batch's shared
+# proof); "root" is used only for a non-canonical empty-snapshot root, and
+# "last" only for a non-empty snapshot that omits its last entry.
+_AUDIT_RECEIPT_CODE_ENTRY = "entry"
+_AUDIT_RECEIPT_CODE_PROOF = "proof"
+_AUDIT_RECEIPT_CODE_ROOT = "root"
+_AUDIT_RECEIPT_CODE_LAST = "last"
+_AUDIT_RECEIPT_CODES = frozenset(
+    {
+        _AUDIT_RECEIPT_CODE_ENTRY,
+        _AUDIT_RECEIPT_CODE_PROOF,
+        _AUDIT_RECEIPT_CODE_ROOT,
+        _AUDIT_RECEIPT_CODE_LAST,
+    }
+)
+
+
+@dataclass(frozen=True)
+class AuditReceiptReport:
+    """Result of :func:`inspect_audit_receipt` and :func:`inspect_audit_batch`.
+
+    A read-only diagnosis of an offline audit receipt, locating the **first**
+    point at which it fails to verify — only the earliest problem is ever
+    reported:
+
+    - ``ok``: the single source of truth, ``True`` exactly when the matching
+      offline verifier (:func:`verify_audit_receipt` or
+      :func:`verify_audit_batch`) returns ``True`` for the same receipt;
+    - ``index``: the absolute entry index of the first mismatch for an
+      ``"entry"`` code and for an itemized receipt's ``"proof"`` code;
+      ``None`` for ``"root"`` and ``"last"`` and for a batch receipt's shared
+      ``"proof"``, which pinpoints no single entry; ``None`` exactly when
+      ``ok`` is ``True``;
+    - ``code``: one of ``"entry"``, ``"proof"``, ``"root"`` or ``"last"``
+      describing that first failure — ``"entry"`` says the entry's digest
+      recomputed from its fields does not equal the recorded
+      ``entry_hash``, ``"proof"`` says the proof does not connect the entry
+      (or, for a batch, the selected entries) to the recorded snapshot root,
+      ``"root"`` says an empty snapshot carries a non-canonical empty-tree
+      root, and ``"last"`` says a non-empty snapshot omits its last entry;
+      ``None`` exactly when ``ok`` is ``True``.
+
+    Reports are immutable, may be built positionally and compare by all three
+    fields. The success report is ``AuditReceiptReport(True, None, None)``.
+    A non-bool ``ok``, a non-string ``code`` or a non-integer, bool or
+    non-``None`` ``index`` raises TypeError; an unknown code string, a
+    successful report carrying a code or index, a failed report missing its
+    code, or a negative index raises ValueError.
+    """
+
+    ok: bool
+    index: int | None
+    code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if self.ok:
+            if self.index is not None or self.code is not None:
+                raise ValueError(
+                    "a successful report must carry index None and code None"
+                )
+            return
+        if self.code is None:
+            raise ValueError("a failed report must carry a code")
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _AUDIT_RECEIPT_CODES:
+            raise ValueError(
+                f"unknown audit receipt code {self.code!r}; expected one of "
+                "'entry', 'proof', 'root', 'last'"
+            )
+        if self.index is not None:
+            if not isinstance(self.index, int) or isinstance(self.index, bool):
+                raise TypeError("index must be an integer or None")
+            if self.index < 0:
+                raise ValueError("index must be non-negative")
+
+
+def inspect_audit_receipt(receipt: Any) -> AuditReceiptReport:
+    """Diagnose an :class:`AuditReceipt` offline, without holding the log.
+
+    The read-only diagnostic counterpart of :func:`verify_audit_receipt`:
+    it introduces no new signing or wire domain, never mutates the receipt
+    and, instead of a bare bool, returns a frozen
+    :class:`AuditReceiptReport` locating the **first** mismatch — a genuine
+    receipt reports ``AuditReceiptReport(True, None, None)`` and only the
+    earliest problem is ever reported. The fixed examination order is:
+
+    1. the empty-snapshot root and the last-entry requirement: an empty
+       snapshot (``size == 0``) whose root is not the canonical empty-tree
+       root reports ``"root"`` with no position; for an empty snapshot
+       whose root is canonical but which nonetheless carries items, the
+       carried items cannot connect to the empty snapshot root, so the
+       first item's proof reports ``"proof"`` at that item's index; a
+       non-empty snapshot whose items do not carry the entry at
+       ``size - 1`` — the one structural rule :func:`verify_audit_receipt`
+       rejects with a bare ``False`` — reports ``"last"`` with no
+       position;
+    2. the items in ascending absolute index order: for each item the entry
+       digest is recomputed from the entry's fields via
+       :func:`entry_digest` and compared with the recorded
+       ``entry_hash`` — a mismatch reports ``"entry"`` at that entry's
+       absolute index — and only then is its inclusion proof re-verified
+       against the snapshot root — a mismatch reports ``"proof"`` at that
+       same index.
+
+    The diagnosis performs exactly the same checks as
+    :func:`verify_audit_receipt` in the same order, so ``report.ok`` is
+    ``True`` exactly when that verifier returns ``True`` for the same
+    receipt, and anything the verifier raises (a non-:class:`AuditReceipt`
+    argument raises TypeError; an unknown hash algorithm, a digest of the
+    wrong width, a structurally wrong proof length and similar structural
+    violations raise TypeError or ValueError exactly as for
+    :class:`AuditReceipt` construction) propagates unchanged. The one
+    asymmetry with :func:`inspect_audit_batch` is a non-empty snapshot
+    missing its last entry, which the batch verifier treats as a structural
+    ValueError but this verifier — and therefore this diagnosis — reports
+    as ``"last"``.
+    """
+    if not isinstance(receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt")
+
+    if receipt.size == 0:
+        # Empty snapshot first: the root must be the canonical empty-tree
+        # root. These are the same operations verify_audit_receipt
+        # performs, so an unknown hash_name or a non-bytes root raises
+        # identically.
+        if not hmac.compare_digest(
+            receipt.root, _hash_parts(receipt.hash_name, _EMPTY_DOMAIN)
+        ):
+            return AuditReceiptReport(False, None, _AUDIT_RECEIPT_CODE_ROOT)
+        if receipt.items:
+            # The root is the genuine empty root yet items are carried
+            # (only reachable bypassing the frozen constructor): no item
+            # can be included in an empty tree, so verify_audit_receipt
+            # stops here and returns False without reading the items.
+            # Mirror that stop point: the carried proof cannot connect,
+            # located at the first item's absolute index, or at no
+            # position when the bypassed item does not carry a readable
+            # non-bool non-negative index.
+            index: int | None = None
+            first_item = receipt.items[0]
+            if isinstance(first_item, tuple) and first_item:
+                first_entry = first_item[0]
+                if isinstance(first_entry, Entry):
+                    raw_index = getattr(first_entry, "index", None)
+                    if (
+                        isinstance(raw_index, int)
+                        and not isinstance(raw_index, bool)
+                        and raw_index >= 0
+                    ):
+                        index = raw_index
+            return AuditReceiptReport(False, index, _AUDIT_RECEIPT_CODE_PROOF)
+        return AuditReceiptReport(True, None, None)
+
+    if not receipt.items or receipt.items[-1][0].index != receipt.size - 1:
+        # Mirrors verify_audit_receipt's zero-evidence / missing-last
+        # rejection; unlike the batch verifier this is a diagnosed
+        # failure, not a ValueError.
+        return AuditReceiptReport(False, None, _AUDIT_RECEIPT_CODE_LAST)
+
+    for entry, proof in receipt.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=receipt.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return AuditReceiptReport(
+                False, entry.index, _AUDIT_RECEIPT_CODE_ENTRY
+            )
+        if not verify_inclusion(
+            entry.entry_hash,
+            entry.index,
+            receipt.size,
+            receipt.root,
+            proof,
+            hash_name=receipt.hash_name,
+        ):
+            return AuditReceiptReport(
+                False, entry.index, _AUDIT_RECEIPT_CODE_PROOF
+            )
+    return AuditReceiptReport(True, None, None)
+
+
+def inspect_audit_batch(receipt: Any) -> AuditReceiptReport:
+    """Diagnose a compact batch audit receipt offline, without the log.
+
+    The read-only diagnostic counterpart of :func:`verify_audit_batch`: it
+    takes the same five-tuple
+    ``(hash_name, size, root, entries, proof)`` returned by
+    :meth:`AuditLog.audit_batch`, introduces no new signing or wire domain
+    and never mutates the receipt, returning a frozen
+    :class:`AuditReceiptReport` locating the **first** mismatch — a genuine
+    receipt reports ``AuditReceiptReport(True, None, None)`` and only the
+    earliest problem is ever reported. The fixed examination order is:
+
+    1. the empty-snapshot root and the last-entry requirement: an empty
+       snapshot (``size == 0``) whose root is not the canonical empty-tree
+       root reports ``"root"`` with no position; a non-empty snapshot
+       missing its last entry — like every other structural violation —
+       raises ValueError, as it does for :func:`verify_audit_batch`;
+    2. the entries in ascending absolute index order, recomputing each
+       :func:`entry_digest` from the entry fields: the first entry whose
+       recomputed digest differs from its recorded ``entry_hash`` reports
+       ``"entry"`` at that entry's absolute index;
+    3. last of all the single shared proof, which must rebuild the
+       snapshot root from all the recomputed leaf digests via
+       :func:`verify_batch_inclusion` — a mismatch reports ``"proof"`` with
+       no position, since the shared proof pinpoints no single entry.
+
+    ``report.ok`` is ``True`` exactly when :func:`verify_audit_batch`
+    returns ``True`` for the same five-tuple. Structural validation is left
+    entirely to the same unpacking :func:`verify_audit_batch` uses: anything
+    that is not a five-tuple, or whose element types are wrong, raises
+    TypeError, while an unknown hash algorithm, a negative size, an entry
+    index out of range, a digest of the wrong width, entries that are not
+    strictly ascending, a non-empty snapshot missing its last entry
+    (including zero evidence for ``size > 0``), an empty snapshot carrying
+    entries, or a proof node count that does not fit the indices and size
+    raises ValueError; any exception the verifier raises propagates
+    unchanged.
+    """
+    hash_name, size, root, entries, nodes = _unpack_audit_batch(receipt)
+
+    if size == 0:
+        if not hmac.compare_digest(root, _hash_parts(hash_name, _EMPTY_DOMAIN)):
+            return AuditReceiptReport(
+                False, None, _AUDIT_RECEIPT_CODE_ROOT
+            )
+        return AuditReceiptReport(True, None, None)
+
+    # _unpack_audit_batch guarantees strictly ascending entries ending at
+    # size - 1 and a proof with the canonical node count, so the remaining
+    # checks are content only, in the fixed entry-pass-then-shared-proof
+    # order.
+    entry_hashes: list[bytes] = []
+    for entry in entries:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return AuditReceiptReport(
+                False, entry.index, _AUDIT_RECEIPT_CODE_ENTRY
+            )
+        entry_hashes.append(entry.entry_hash)
+
+    if not verify_batch_inclusion(
+        tuple(entry.index for entry in entries),
+        tuple(entry_hashes),
+        size,
+        root,
+        nodes,
+        hash_name=hash_name,
+    ):
+        return AuditReceiptReport(False, None, _AUDIT_RECEIPT_CODE_PROOF)
+    return AuditReceiptReport(True, None, None)
 
 
 def _encode_u64(value: int, name: str) -> bytes:

@@ -654,6 +654,49 @@ blob 均为 u64 字节长度后接原始字节（零长度也是全零 u64）。
 证明不匹配的结构合法回执仍可正常编解码，仅 `verify_audit_batch` 返回 `False`。
 编解码均为只读，不改变五元组与日志的任何状态。
 
+### 离线审计回执的只读诊断
+
+`verify_audit_receipt` / `verify_audit_batch` 只回答真假；诊断入口
+`inspect_audit_receipt` 与 `inspect_audit_batch` 是它们的只读对应物，在同一份
+回执判假时定位**首个**不符之处。两者都无需持有日志、只读且确定，不新增签名原文与
+线格式，也不做报告编解码；回执族检索与既有核验/编解码行为全部不变。
+
+```python
+report = inspect_audit_receipt(receipt)   # 收一份 AuditReceipt
+report = inspect_audit_batch(batch)       # 收 audit_batch 的既有五元组
+# AuditReceiptReport(ok=True, index=None, code=None)：成功恒为真加两个空位置
+```
+
+返回新的冻结报告 `AuditReceiptReport(ok, index, code)`，支持位置构造、按三个字段
+相等；成功恒为 `AuditReceiptReport(True, None, None)`，失败只记最早一处。码只取
+四个值：
+
+- `"entry"`：该条目重算出的内容摘要（`entry_digest`）与记录的 `entry_hash`
+  不符，`index` 记这条记录的绝对索引；
+- `"proof"`：证明连不到记录的快照根。逐条回执的 `index` 记该条目索引；批量
+  回执是一份覆盖全部条目的共享证明，不指向单条，`index` 为 `None`；
+- `"root"`：仅在空快照根不规范（不是规范空树根）时出现，`index` 为 `None`；
+- `"last"`：仅用于非空快照缺末条（`index == size - 1` 未携带，含
+  `size>0 且 items==()` 的零证据情形），`index` 为 `None`。
+
+检查顺序固定：**先**查空快照根与末条，**再**按索引升序逐条重算摘要、看证明；批量
+回执在全部条目摘要通过后，最后看共享证明（故共享证明不匹配统一报
+`("proof", None)`，条目摘要不符优先报该条 `"entry"`）。因此报告成功当且仅当既有
+核验入口对同一回执返回真；核验抛异常时诊断原样抛出——入参错型抛 `TypeError`，
+结构非法抛 `ValueError`，具体分工沿用既有核验入口（逐条入口沿用
+`verify_audit_receipt`，批量入口沿用 `verify_audit_batch` 的同一套结构契约）。
+唯一的例外是缺末条：**批量**回执视为
+结构非法抛 `ValueError`（与 `verify_audit_batch` 一致），**逐条**回执则判假并由
+`("last", None)` 定位（与 `verify_audit_receipt` 对绕过构造器回执的处理一致）。
+空快照根不规范而又携带条目的逐条回执（只能绕过冻结构造器得到）先报
+`("root", None)`；根规范却携带条目时，条目证明连不到空树根，报该条
+`("proof", index)`。
+
+报告自身的构造规则：`ok` 必须为 `bool`，否则抛 `TypeError`；成功却带 `code` 或
+`index`、失败却缺 `code`、`code` 为未知取值均抛 `ValueError`；`code` 类型错抛
+`TypeError`。`index` 只能是条目绝对索引或 `None`：非整数、`bool` 抛 `TypeError`，
+负值抛 `ValueError`。
+
 ### 紧凑批量包含证明凭据（可持久化）
 
 `batch_inclusion_proof` 生成的共享节点元组本身只是内存对象；冻结凭据
@@ -3750,6 +3793,16 @@ python3 -m auditchain
   必含 `index == size - 1` 的末条（在 items 末尾）及其包含证明**，`size == 0` 时
   `items` 必须为 `()`；类型非法抛 `TypeError`，版本、范围、未知算法、摘要长度或
   条目结构非法（含非空回执缺失末条、空回执携带条目）抛 `ValueError`
+- `AuditReceiptReport(ok, index, code)` — `inspect_audit_receipt` /
+  `inspect_audit_batch` 返回的不可变离线审计回执诊断报告，定位**首个**
+  不符之处，按全部三个字段相等、支持位置构造；成功恒为
+  `(True, None, None)`，失败只记最早一处。`code` 只取 `"entry"`（条目重算
+  摘要与记录 `entry_hash` 不符，`index` 为该条绝对索引）、`"proof"`
+  （证明连不到记录的快照根；逐条回执 `index` 为该条索引，批量共享证明
+  `index` 为 `None`）、`"root"`（仅空快照根不规范，`index=None`）或
+  `"last"`（仅非空快照缺末条，`index=None`）。`ok` 非 `bool`、`code`
+  类型错、`index` 非整数/`None` 或为 `bool` 抛 `TypeError`；未知码、成功却带
+  `code` 或 `index`、失败却缺 `code`、`index` 为负抛 `ValueError`
 - `SearchReceipt(version, hash_name, size, root, query, start, stop, items)` —
   不可变的离线检索回执，把一次按内容查找的结果（算法、快照尺寸与 Merkle 根、
   规范化查询值、半开范围 `[start, stop)` 与命中条目）绑成一件可落盘制品，
@@ -4272,6 +4325,28 @@ python3 -m auditchain
   顺序/重复、缺末条（含 `size>0 且 entries==()`）、空快照携带条目或证明节点数与
   `(indices, size)` 不符抛 `ValueError`；结构合法但条目内容、证明或根不匹配返回
   `False`，匹配返回 `True`
+- `inspect_audit_receipt(receipt)` — `verify_audit_receipt` 的只读诊断对应物，
+  无需持有日志、只读且确定，不新增签名原文与线格式、不做报告编解码；收一份
+  `AuditReceipt`，返回冻结 `AuditReceiptReport(ok, index, code)` 定位**首个**
+  不符之处，成功恒为 `(True, None, None)`。固定顺序为先查空快照根与末条，再按
+  绝对索引升序逐条重算摘要（`"entry"` 在该条索引）、核验该条包含证明
+  （`"proof"` 在该条索引）；空快照根不规范报 `("root", None)`，非空快照缺
+  末条（含零证据）报 `("last", None)`；空快照根规范却携带条目时该条证明连不到
+  空树根，报该条 `("proof", index)`。`report.ok` 当且仅当
+  `verify_audit_receipt(receipt)` 为真；核验抛异常时诊断原样抛出（入参错型
+  抛 `TypeError`，结构非法抛 `ValueError`，分工与异常类型与该核验入口一致）
+- `inspect_audit_batch(receipt)` — `verify_audit_batch` 的只读诊断对应物，收
+  `audit_batch` 的既有五元组 `(hash_name, size, root, entries, proof)`，无需
+  持有日志、只读且确定，不新增签名原文与线格式、不做报告编解码；返回冻结
+  `AuditReceiptReport(ok, index, code)` 定位**首个**不符之处，成功恒为
+  `(True, None, None)`。固定顺序为先查空快照根（不规范报
+  `("root", None)`）与末条，再按绝对索引升序逐条重算摘要（首个不符报
+  `("entry", index)`），全部通过后最后用 `verify_batch_inclusion` 看共享证明
+  （不匹配统一报 `("proof", None)`）。`report.ok` 当且仅当
+  `verify_audit_batch(receipt)` 为真；非五元组或字段/条目类型错抛 `TypeError`，
+  算法、范围、宽度、顺序、缺末条、空快照携带条目或节点数不符等结构问题抛
+  `ValueError`，与该核验入口完全一致——故批量回执缺末条抛 `ValueError`，而不
+  生成 `("last", None)` 报告
 - `verify_search_receipt(receipt)` — 无需持有日志即可验证 `SearchReceipt`：逐条
   重算每个命中条目的 `entry_digest`、核验其包含证明是否落在记录的快照根内，并
   比对命中内容与规范化查询值；只判定列出的命中是否属实，不判定结果集是否完整

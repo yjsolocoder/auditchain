@@ -2315,6 +2315,91 @@ verify_stage_continuation_chain(restored, public_key)  # True：无需持有日�
   `verify_stage_continuation_chain` 返回 `False`；两个入口均只读且确定，
   既有单段核验、编解码与各线格式全部不变
 
+#### 演进后阶段续接链的端点锚定诊断与锚定包持久化（Ed25519）
+
+`inspect_stage_continuation_chain` 只回答“链内部是否连续”。顶层
+`inspect_stage_anchors(receipts, public_key, start, end) -> ContinuationChainReport`
+是其**端点锚定扩展**（`inspect_anchors` 的阶段对应物）：离线方仅凭预置信任
+公钥与两个期望 `SignedRoot` 检查点，即可确认这条演进后续接链不仅内部连续，
+而且**恰好**从期望旧快照延伸到期望新快照——被截去前缀、截去后缀或整体替换的
+**有效子链**都会被定位而非被接受。四个参数均无默认值；调用同样全程离线、
+只读、不新增任何签名域：
+
+```python
+from auditchain import ContinuationChainReport, inspect_stage_anchors
+
+start, end = chain[0].consistency.old, chain[-1].consistency.new
+
+inspect_stage_anchors(chain, public_key, start, end)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+inspect_stage_anchors(chain[1:], public_key, start, end)
+# ContinuationChainReport(ok=False, index=0, code='start')   # 截去前缀
+
+inspect_stage_anchors(chain[:-1], public_key, start, end)
+# ContinuationChainReport(ok=False, index=len(chain)-2, code='end')  # 截去后缀
+```
+
+- 先委托 `inspect_stage_continuation_chain(receipts, public_key)` 做内部
+  诊断，失败报告**原样返回**——`"verify"`、`"growth"`、`"duplicate"`、
+  `"link"` 四类首错顺序不变，内部不成立的链绝不会被改报为锚点不符
+- 仅当内部报告成功才比较锚点，且**起点优先于终点**：首段
+  `consistency.old` 不等于 `start` 报 `"start"`（`index` 取 `0`）；末段
+  `consistency.new` 不等于 `end` 报 `"end"`（`index` 取末段位置）
+- 端点按 `SignedRoot` 全六字段（`version`、`hash_name`、`size`、`root`、
+  `head` 及 Ed25519 `signature`）全等比较：尺寸相同但历史或签名者不同的
+  检查点不算匹配。两端均锚定的内部连续链返回 `(True, None, None)`
+- 报告仍为冻结三字段 `ContinuationChainReport(ok, index, code)`，构造与
+  相等规则不变，码集合沿用既有 `"start"`、`"end"`，不新增任何诊断码
+- 调用前校验：非 `tuple` 链、非 `SignedStageAuthAuditContinuation` 元素、
+  非 `bytes` 公钥或非 `SignedRoot` 锚点抛 `TypeError`；空链或公钥非 32
+  字节抛 `ValueError`；结构非法凭据的嵌套异常沿用既有规则原样传播
+
+冻结包 `StageAnchoredContinuationChain(receipts:tuple, start:SignedRoot,
+end:SignedRoot)` 把非空演进后续接凭据 tuple 与其两个端点 `SignedRoot`
+（首段 `consistency.old` 应对的 `start`、末段 `consistency.new` 应对的
+`end`）绑为一件可持久化制品，支持位置/关键字构造、按全部三个字段相等
+（可哈希）；容器或字段类型错抛 `TypeError`，空链抛 `ValueError`，但包
+本身不校验链是否内部连续、是否真锚定于两端——结论由
+`inspect_stage_anchors(restored.receipts, public_key, restored.start,
+restored.end)` 报告。
+
+```python
+from auditchain import (
+    StageAnchoredContinuationChain,
+    encode_stage_anchored_continuations,
+    decode_stage_anchored_continuations,
+)
+
+bundle = StageAnchoredContinuationChain(chain, start, end)
+data = encode_stage_anchored_continuations(bundle)   # bytes，可写文件/发网络
+restored = decode_stage_anchored_continuations(data)  # 另一进程中恢复
+restored == bundle                                    # True：三字段逐字段相等
+encode_stage_anchored_continuations(restored) == data # True：重编码逐字节相同
+inspect_stage_anchors(restored.receipts, public_key, restored.start, restored.end)
+# ContinuationChainReport(ok=True, index=None, code=None)
+```
+
+- 字节流严格为 `D || U(1) || B(C) || B(S) || B(E)`，其中
+  `D = b"auditchain/stage-anchor/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；`C` 逐字节等于既有
+  `encode_stage_continuations(receipts)` 的完整输出，`S`/`E` 分别逐字节
+  等于 `encode_signed_root(start)` / `encode_signed_root(end)` 的完整
+  输出，顺序固定为链、起点、终点，**禁止换序与尾随字节**。外层帧不引入
+  任何新签名域
+- `encode_stage_anchored_continuations(bundle)` 只接受
+  `StageAnchoredContinuationChain`（否则抛 `TypeError`）；`C`/`S`/`E`
+  均由既有编码器原样产出，嵌套结构问题的 `TypeError` / `ValueError`
+  原样传播；编码只读、确定
+- `decode_stage_anchored_continuations(data) -> StageAnchoredContinuationChain`
+  只接受精确的 `bytes`（拒绝 `bytearray` / `memoryview`，抛
+  `TypeError`）；魔数、版本错、截断、blob 长度越界或尾随字节抛
+  `ValueError`，链 blob 与两个锚点 blob 分别交给
+  `decode_stage_continuations` / `decode_signed_root`，嵌套格式非法抛
+  `ValueError`。解码不校验签名、证明、段间相邻与锚定关系，结构合法但
+  验真不匹配的包照常往返，由 `inspect_stage_anchors` 报告而非抛出；
+  既有单段核验、整链核验诊断、编解码与各线格式全部不变
+
 #### 跨快照认证审计续接（Ed25519）
 
 `SignedAuthAuditBundle` 证明"选中条目属于某个已签名快照"，
@@ -4132,6 +4217,38 @@ python3 -m auditchain
   标签、证明及相邻段关联，结构合法但验真不匹配仍可解码
   （`verify_stage_continuation_chain` 返回 `False`）；两个入口均为只读
   且确定，既有单段核验、编解码与各线格式不变
+- `inspect_stage_anchors(receipts, public_key, start, end)` —
+  `inspect_stage_continuation_chain` 的端点锚定扩展（`inspect_anchors`
+  的阶段对应物，四参均无默认值）：先委托内部诊断，失败报告原样返回
+  （四类首错顺序不变）；仅当链内部成立才比较锚点，首段
+  `consistency.old` 不等于期望 `start` 报 `"start"`（`index` 取 `0`），
+  末段 `consistency.new` 不等于期望 `end` 报 `"end"`（`index` 取末段
+  位置），起点不符优先于终点不符；端点按 `SignedRoot` 全六字段全等，故
+  被截去前缀、后缀或整体替换的有效子链都会被定位。报告仍为冻结三字段
+  `ContinuationChainReport`，码集合沿用既有 `"start"` / `"end"`，不新增
+  诊断码；非 `SignedRoot` 锚点抛 `TypeError`，其余校验与异常传播规则同
+  `inspect_stage_continuation_chain`；只读、不新增签名域，旧接口不变
+- `StageAnchoredContinuationChain(receipts, start, end)` — 冻结的演进后
+  锚定续接链包，把非空 `SignedStageAuthAuditContinuation` tuple 与首尾
+  两个 `SignedRoot` 锚点绑为一件可持久化制品；支持位置/关键字构造、按
+  全部三字段相等（可哈希）；非 tuple 容器、非续接凭据元素或非
+  `SignedRoot` 锚点抛 `TypeError`，空 tuple 抛 `ValueError`；包本身不
+  校验链的连续性与锚定关系，结论由 `inspect_stage_anchors` 报告
+- `encode_stage_anchored_continuations(bundle)` /
+  `decode_stage_anchored_continuations(data)` — 演进后锚定续接链的规范
+  二进制编码与解码，使阶段续接凭据与首尾锚点可一并落盘、跨进程恢复：
+  字节流严格为 `D || U(1) || B(C) || B(S) || B(E)`，其中
+  `D = b"auditchain/stage-anchor/v1\0"`，`U`/`B` 沿用 u64 大端与长度
+  前缀规则，`C` 逐字节为既有 `encode_stage_continuations` 输出，
+  `S`/`E` 分别为既有 `encode_signed_root` 输出，顺序固定为链、起点、
+  终点，禁止换序与尾随字节；前者只接受
+  `StageAnchoredContinuationChain`（否则抛 `TypeError`），后者只接受
+  精确的 `bytes`（拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、
+  blob 长度、嵌套格式或尾随非法抛 `ValueError`，嵌套编码器异常原样
+  传播；解码保持三字段相等且重编码逐字节相同，不校验签名、证明、段间
+  相邻与锚定关系，结构合法但验真不匹配的包照常往返，由
+  `inspect_stage_anchors` 报告结论；两个入口均为只读且确定，既有单段
+  核验、整链核验诊断、编解码与各线格式不变
 - `encode_signed_verifier(receipt)` / `decode_signed_verifier(data)` — 可信交付
   stage-0 验证材料的规范二进制编码与解码：魔数
   `b"auditchain/signed-verifier/v1\0"` 开头，后接 version=1（u64）、hash_name 的

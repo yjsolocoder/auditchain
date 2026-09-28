@@ -1175,6 +1175,50 @@ verify_rotation_chain(restored, public_a)  # True：无需持有日志
   相等且重编码逐字节相同，结构合法但跳间接驳失败、记录重复或验真不匹配仍可解码
   （`verify_rotation_chain` 返回 `False`）
 
+### 多跳签名者信任链只读诊断：定位首个出问题的轮换记录（Ed25519）
+
+`verify_rotation_chain` 只回答“整条轮换链是否成立”。顶层
+`inspect_rotation_chain(items, key) -> ContinuationChainReport`
+是它的**只读诊断对应物**：同样全程离线、不持有日志、**不新增签名原文或线格式**
+（只复用既有 `verify_rotation`）、不修改任何记录与密钥，但返回冻结报告以**定位
+首个出问题的那条轮换记录**——全部成立返回
+`ContinuationChainReport(True, None, None)`，且永远只报告最早出现的那一个问题。
+两参均无默认值，输入形状与 `verify_rotation_chain` 完全相同：`items` 为按链序
+排列的非空 `tuple`，每项都是 `rotate_signer` 返回的
+`(old, new_key, new, auth)` 四元组，`key` 为首个签名者的预置信任 32 字节
+Ed25519 公钥：
+
+```python
+from auditchain import ContinuationChainReport, inspect_rotation_chain
+
+inspect_rotation_chain(items, public_a)
+# ContinuationChainReport(ok=True, index=None, code=None)
+
+inspect_rotation_chain((r1, forged, r3), public_a)
+# ContinuationChainReport(ok=False, index=1, code='rotation')
+
+inspect_rotation_chain((r1, r2, r1), public_a)
+# ContinuationChainReport(ok=False, index=2, code='rotation_duplicate')
+```
+
+- 诊断严格按输入顺序逐条推进。每条先与更早出现的记录比对，四元组完全相等报
+  `"rotation_duplicate"`；没有重复再以**当前信任公钥**调用既有
+  `verify_rotation` 核验本条（首条凭预置 `key`，其后各条凭上一条验真后学到的
+  `new_key`），验真不通过报 `"rotation"`。两种失败的 `index` 都记本条记录在
+  元组中的序号（首条即 `0`）；问题码沿用既有合法集合（`"rotation_duplicate"`、
+  `"rotation"`），不新增码
+- 信任严格逐跳转移：只有核验通过的记录，其背书的 `new_key` 才用来核验下一条；
+  前面某条不成立时立即返回，后面各条一律不再检查。结构合法但签名或授权不匹配
+  只产生失败报告、绝不抛异常。全部成立返回成功报告，且成功**当且仅当**
+  `verify_rotation_chain` 对同一输入返回真；同一输入两次诊断结果完全相等，
+  单条记录组成的链也照常逐条诊断
+- `items` 非 `tuple`（含 list、生成器、`None`）、元素不是 `tuple`、或 `key`
+  非 `bytes` 一律先抛 `TypeError`；类型正确而元素长度不是 4、空链或 `key` 非
+  32 字节一律抛 `ValueError`（其中元素长度与字段异常由 `verify_rotation`
+  原样抛出，嵌套检查点结构非法沿用 `verify_signed_root` 的既有异常），不会
+  改判成失败报告。调用只读、确定，既有轮换记录与轮换链的编解码字节、
+  `verify_rotation_chain` 的返回与异常行为均不变
+
 ### 可信紧凑批量审计包（Ed25519）
 
 `signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
@@ -4664,6 +4708,22 @@ python3 -m auditchain
   截断、blob 长度、嵌套记录格式或尾随非法抛 `ValueError`；解码保序、字段相等且
   重编码逐字节相同；编解码不校验签名与跳间接驳，结构合法但验真不匹配、断链或
   重复仍可解码（`verify_rotation_chain` 返回 `False`）；两个入口均为只读且确定
+- `inspect_rotation_chain(items, key)` — `verify_rotation_chain` 的只读诊断
+  对应物（两参均无默认值，输入形状完全相同），全程离线、不持有日志、不新增签名
+  原文或线格式、不改任何记录与密钥，只复用既有 `verify_rotation`，返回冻结
+  `ContinuationChainReport(ok, index, code)` 定位**首个**出问题的轮换记录，
+  有效链为 `(True, None, None)`，任何情况下只报最早问题：逐条先与更早记录全等
+  比对（重复报 `"rotation_duplicate"`），无重复再以当前信任钥
+  `verify_rotation` 核验（首条凭预置 `key`、其后凭上一条验真学到的 `new_key`，
+  失败报 `"rotation"`），`index` 记本条在元组中的序号；信任严格逐跳转移，
+  前条不成立即返回、后条不再检查，结构合法但签名或授权不匹配仅生成报告绝不抛
+  异常；成功当且仅当 `verify_rotation_chain` 对同一输入为真，同一输入两次诊断
+  完全相等，单记录链照常逐条诊断。问题码沿用既有合法集合、不新增码。`items`
+  非 `tuple`（含 list、生成器、`None`）、元素不是 `tuple` 或 `key` 非
+  `bytes` 抛 `TypeError`；空链、元素长度不是 4 或 `key` 非 32 字节抛
+  `ValueError`，嵌套检查点结构非法由 `verify_rotation` /
+  `verify_signed_root` 原样传播；既有轮换与轮换链编解码字节及
+  `verify_rotation_chain` 的返回与异常行为不变
 - `verify_signed_audit_batch(receipt, public_key)` — 凭预先信任的 32 字节
   Ed25519 公钥离线验证 `AuditLog.signed_audit_batch` 签发的 `SignedAuditBatch`，
   无需持有日志：依次调用 `verify_audit_batch`（核验所选条目与共享证明对快照根）

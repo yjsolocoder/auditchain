@@ -39,6 +39,7 @@ inspect_audit_receipt / inspect_audit_batch /
 inspect_continuation_chain / inspect_stage_continuation_chain /
 inspect_anchors / inspect_stage_anchors /
 inspect_rotated_chain / inspect_stage_rotated_chain /
+inspect_rotation_chain /
 inspect_rotated_anchors /
 inspect_stage_rotated_anchors /
 inspect_anchored_continuations / inspect_anchor_set / merge_anchor_set /
@@ -292,6 +293,7 @@ __all__ = [
     "inspect_full_search_receipt",
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
+    "inspect_rotation_chain",
     "inspect_rotated_anchor_set",
     "inspect_search_receipt",
     "inspect_stage_anchors",
@@ -3493,6 +3495,9 @@ class StageRotatedAnchorSet:
 # checkpoints do not join the two segments on every field; within a single
 # chain each is indexed at the later segment, and across separately landed
 # packages at the global position of the later package's first segment.
+# inspect_rotation_chain reports only "rotation_duplicate" and "rotation"
+# for a bare rotation chain, each indexed at the repeated or failing
+# record's own tuple position.
 _CHAIN_CODE_VERIFY = "verify"
 _CHAIN_CODE_GROWTH = "growth"
 _CHAIN_CODE_DUPLICATE = "duplicate"
@@ -3558,7 +3563,9 @@ class ContinuationChainReport:
       position, and by :func:`inspect_rotated_anchor_set`, where a repeated
       rotation means a bridge equal to an earlier cross-package bridge and
       every such code is indexed at the global position of the later
-      package's first segment.
+      package's first segment. :func:`inspect_rotation_chain` reports only
+      ``"rotation_duplicate"`` and ``"rotation"`` for a bare chain of
+      rotation records, each at that record's own tuple position.
 
     Reports are immutable, may be built positionally and compare by all three
     fields. The success report is ``ContinuationChainReport(True, None, None)``.
@@ -10876,6 +10883,93 @@ def verify_rotation_chain(items: Any, key: Any) -> bool:
         # trusted to authorize the following record.
         current_key = item[1]
     return True
+
+
+def inspect_rotation_chain(items: Any, key: Any) -> ContinuationChainReport:
+    """Diagnose an ordered, non-empty tuple of signer rotations offline.
+
+    The read-only diagnostic counterpart of :func:`verify_rotation_chain`:
+    it holds neither the log nor any checkpoint history, introduces no new
+    signing message or wire format and never mutates the items or the key,
+    but instead of a bare bool it returns a frozen
+    :class:`ContinuationChainReport` locating the **first** record that
+    fails to continue the chain — a genuine chain reports
+    ``ContinuationChainReport(True, None, None)`` and only the earliest
+    problem is ever reported.
+
+    The inputs have exactly the shape of :func:`verify_rotation_chain`:
+    ``items`` is a non-empty ``tuple`` of the
+    :meth:`AuditLog.rotate_signer` ``(old, new_key, new, auth)``
+    four-tuples, kept in the caller's order, and ``key`` is the pre-trusted
+    32-byte Ed25519 public key of the very first signer. The records are
+    examined strictly in tuple order, one record at a time:
+
+    - a record equal to an earlier record reports ``"rotation_duplicate"``
+      at that record's tuple position;
+    - otherwise the record is checked with :func:`verify_rotation` against
+      the currently trusted key — the pre-trusted ``key`` for the first
+      record, the preceding record's ``new_key`` for every later one — and
+      failure reports ``"rotation"`` at that record's position.
+
+    Trust hops strictly per record: only a verified record's vouched-for
+    ``new_key`` is used to examine the next record, so once a record fails
+    nothing after it is examined. Signature or authorization mismatches on
+    a structurally legal record are reported, never raised. Every record
+    passing yields the success report, which is returned exactly when
+    :func:`verify_rotation_chain` returns True for the same inputs; the
+    diagnosis is deterministic, so two calls on the same inputs return
+    equal reports, and a one-record chain is diagnosed just like any other.
+
+    A non-tuple ``items`` (including a list, a generator or ``None``), an
+    element of the wrong type, or a ``key`` that is not ``bytes`` raises
+    TypeError; an empty tuple, a tuple element whose length is not 4 or a
+    key that is not 32 bytes raises ValueError. Every other nested
+    structural violation — a wrongly typed or sized rotation field, or any
+    structural exception raised by :func:`verify_signed_root` — propagates
+    unchanged from :func:`verify_rotation` (TypeError or ValueError)
+    rather than becoming a ``"rotation"`` report.
+    """
+    if not isinstance(items, tuple):
+        raise TypeError("items must be a non-empty tuple of rotation records")
+    if len(items) == 0:
+        raise ValueError("items must be a non-empty tuple of rotation records")
+    # The raw four-tuples returned by rotate_signer have no dedicated class;
+    # check only each element's container type here, leaving its length and
+    # field validation to verify_rotation during the ordered walk, exactly
+    # as inspect_rotated_chain does.
+    for item in items:
+        if not isinstance(item, tuple):
+            raise TypeError(
+                "each item must be a (old, new_key, new, auth) tuple"
+            )
+    if not isinstance(key, bytes):
+        raise TypeError("key must be a 32-byte Ed25519 public key")
+    if len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(
+            f"key must be {_ED25519_KEY_BYTES} bytes (an Ed25519 public key)"
+        )
+
+    current_key = key
+    seen: set[tuple] = set()
+    for index, item in enumerate(items):
+        # Repetition is diagnosed before verification, exactly as
+        # verify_rotation_chain returns False on a repeated record before
+        # calling verify_rotation.
+        if item in seen:
+            return ContinuationChainReport(
+                False, index, _CHAIN_CODE_ROTATION_DUPLICATE
+            )
+        # A record of the wrong length, a wrongly typed or sized field, or
+        # any structurally illegal nested checkpoint raises here, unchanged
+        # from verify_rotation: caller errors never become failure reports.
+        # Only a verified record hops trust: its vouched-for new_key is the
+        # sole key used to examine the following record, so once this fails
+        # nothing later is examined.
+        if not verify_rotation(item, current_key):
+            return ContinuationChainReport(False, index, _CHAIN_CODE_ROTATION)
+        seen.add(item)
+        current_key = item[1]
+    return ContinuationChainReport(True, None, None)
 
 
 def encode_rotations(items: Any) -> bytes:

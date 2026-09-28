@@ -9,6 +9,7 @@ SignedStageAuthAuditBundle /
 SignedStageAuthAuditContinuation /
 SignedAuditBatch /
 SignedAuditReceipt /
+SignedAuditReport /
 EncryptedSearchReceipt /
 FullEncryptedSearchReceipt /
 SignedFullEncryptedSearchReceipt /
@@ -36,6 +37,7 @@ inspect_full_encrypted_search_receipt /
 inspect_search_receipt /
 inspect_encrypted_search_receipt /
 inspect_audit_receipt / inspect_audit_batch /
+inspect_signed_audit_receipt / inspect_signed_audit_batch /
 inspect_continuation_chain / inspect_stage_continuation_chain /
 inspect_anchors / inspect_stage_anchors /
 inspect_rotated_chain / inspect_stage_rotated_chain /
@@ -158,6 +160,7 @@ __all__ = [
     "SearchReceiptReport",
     "SignedAuditBatch",
     "SignedAuditReceipt",
+    "SignedAuditReport",
     "SignedAuthAuditBundle",
     "SignedAuthAuditContinuation",
     "SignedAuthBundle",
@@ -296,6 +299,8 @@ __all__ = [
     "inspect_rotation_chain",
     "inspect_rotated_anchor_set",
     "inspect_search_receipt",
+    "inspect_signed_audit_batch",
+    "inspect_signed_audit_receipt",
     "inspect_stage_anchors",
     "inspect_stage_anchor_set",
     "inspect_stage_continuation_chain",
@@ -7225,6 +7230,110 @@ def inspect_audit_batch(receipt: Any) -> AuditReceiptReport:
     return AuditReceiptReport(True, None, None)
 
 
+# Issue codes reported by SignedAuditReport. The first four reuse the
+# AuditReceiptReport meanings exactly for the sealed receipt body: "entry"
+# pinpoints the carried entry whose recomputed digest differs from its
+# recorded entry_hash (its absolute index), "proof" a proof that fails to
+# rebuild the snapshot root, "root" a non-canonical empty-snapshot root and
+# "last" a non-empty snapshot omitting its last entry, all four located as the
+# matching AuditReceiptReport would be. "checkpoint" says the SignedRoot
+# checkpoint signature does not verify under the pre-trusted public key (a
+# well-formed but untrusted key, an altered signature, root or chain head).
+# "binding" says the receipt body and the checkpoint each verify on their own
+# but do not describe the same sealed snapshot (or, for a batch, the signed
+# chain head does not match the batch's last entry).
+_SIGNED_AUDIT_CODE_ENTRY = "entry"
+_SIGNED_AUDIT_CODE_PROOF = "proof"
+_SIGNED_AUDIT_CODE_ROOT = "root"
+_SIGNED_AUDIT_CODE_LAST = "last"
+_SIGNED_AUDIT_CODE_CHECKPOINT = "checkpoint"
+_SIGNED_AUDIT_CODE_BINDING = "binding"
+_SIGNED_AUDIT_CODES = frozenset(
+    {
+        _SIGNED_AUDIT_CODE_ENTRY,
+        _SIGNED_AUDIT_CODE_PROOF,
+        _SIGNED_AUDIT_CODE_ROOT,
+        _SIGNED_AUDIT_CODE_LAST,
+        _SIGNED_AUDIT_CODE_CHECKPOINT,
+        _SIGNED_AUDIT_CODE_BINDING,
+    }
+)
+
+
+@dataclass(frozen=True)
+class SignedAuditReport:
+    """Result of :func:`inspect_signed_audit_receipt` and
+    :func:`inspect_signed_audit_batch`.
+
+    A read-only diagnosis of a sealed audit delivery package, locating the
+    **first** point at which it fails to verify — only the earliest problem is
+    ever reported:
+
+    - ``ok``: the single source of truth, ``True`` exactly when the matching
+      offline verifier (:func:`verify_signed_audit_receipt` or
+      :func:`verify_signed_audit_batch`) returns ``True`` for the same package
+      and public key;
+    - ``index``: the absolute entry index of the first mismatch for an
+      ``"entry"`` code; ``None`` for every other code, including an
+      itemized receipt's per-item ``"proof"`` — this report pins only
+      ``"entry"``; ``None`` exactly when ``ok`` is ``True``;
+    - ``code``: one of ``"entry"``, ``"proof"``, ``"root"`` or ``"last"``
+      (the :class:`AuditReceiptReport` meanings for the sealed receipt body,
+      though only ``"entry"`` carries a position), ``"checkpoint"`` (the
+      checkpoint signature does not verify under the pre-trusted key,
+      including a well-formed but untrusted key) or ``"binding"`` (the
+      receipt body and checkpoint each verify on their own but do not attest
+      the same sealed snapshot — for a batch this also covers a signed chain
+      head that does not equal the last carried ``entry_hash``, or the
+      digest-width zero value for an empty snapshot);
+      ``None`` exactly when ``ok`` is ``True``.
+
+    Reports are immutable, may be built positionally and compare by all three
+    fields. The success report is ``SignedAuditReport(True, None, None)``. A
+    non-bool ``ok``, a non-string ``code`` or a non-integer, bool or
+    non-``None`` ``index`` raises TypeError; an unknown code string, a
+    successful report carrying a code or index, a failed report missing its
+    code, or a negative index raises ValueError. Only an ``"entry"`` code may
+    carry a position, which must be a non-negative absolute index; every other
+    code must carry ``None``.
+    """
+
+    ok: bool
+    index: int | None
+    code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if self.ok:
+            if self.index is not None or self.code is not None:
+                raise ValueError(
+                    "a successful report must carry index None and code None"
+                )
+            return
+        if self.code is None:
+            raise ValueError("a failed report must carry a code")
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _SIGNED_AUDIT_CODES:
+            raise ValueError(
+                f"unknown signed audit code {self.code!r}; expected one of "
+                "'entry', 'proof', 'root', 'last', 'checkpoint', 'binding'"
+            )
+        if self.index is not None:
+            if not isinstance(self.index, int) or isinstance(self.index, bool):
+                raise TypeError("index must be an integer or None")
+            if self.index < 0:
+                raise ValueError("index must be non-negative")
+        if self.code == _SIGNED_AUDIT_CODE_ENTRY:
+            if self.index is None:
+                raise ValueError(
+                    "an 'entry' report must carry the entry's absolute index"
+                )
+        elif self.index is not None:
+            raise ValueError("only an 'entry' code may carry an index")
+
+
 # Issue codes reported by SearchReceiptReport. "root" is used only when a
 # zero-size snapshot records a root other than the canonical empty-tree root
 # (no position); "entry" pinpoints the listed entry whose digest recomputed
@@ -10021,6 +10130,195 @@ def verify_signed_audit_receipt(bundle: Any, public_key: Any) -> bool:
     if not verify_audit_receipt(receipt):
         return False
     return verify_signed_root(checkpoint, public_key)
+
+
+def inspect_signed_audit_receipt(
+    bundle: Any, public_key: Any
+) -> SignedAuditReport:
+    """Diagnose a :class:`SignedAuditReceipt` offline, without holding the log.
+
+    The read-only diagnostic counterpart of
+    :func:`verify_signed_audit_receipt`: it introduces no new signing or wire
+    domain, never mutates the bundle and, instead of a bare bool, returns a
+    frozen :class:`SignedAuditReport` locating the **first** mismatch — a
+    genuine bundle reports ``SignedAuditReport(True, None, None)`` and only
+    the earliest problem is ever reported. The fixed examination order is:
+
+    1. the sealed receipt body, diagnosed exactly as
+       :func:`inspect_audit_receipt` diagnoses the nested
+       :class:`AuditReceipt`: the empty-snapshot root (``"root"``), the
+       non-empty snapshot's last-entry requirement (``"last"``) and then the
+       items in ascending absolute index order (``"entry"`` at the entry's
+       absolute index, then ``"proof"`` with no position — only an
+       ``"entry"`` code pins an entry);
+    2. the checkpoint signature, verified with the pre-trusted 32-byte
+       ``public_key`` via :func:`verify_signed_root`: a structurally valid
+       checkpoint whose signature does not verify — including a well-formed
+       32-byte key that is simply not the signer's, or an altered root, chain
+       head or signature — reports ``"checkpoint"`` with no position;
+    3. last of all the binding between the two halves, exactly the comparison
+       :func:`verify_signed_audit_receipt` makes: the receipt and checkpoint
+       must describe the same snapshot (equal ``hash_name``, ``size`` and
+       ``root``) — two halves that each verify on their own but disagree
+       report ``"binding"`` with no position.
+
+    ``report.ok`` is ``True`` exactly when
+    :func:`verify_signed_audit_receipt` returns ``True`` for the same bundle
+    and key. A bundle that is not a :class:`SignedAuditReceipt`, or whose
+    container fields have been bypassed to wrong types, raises TypeError; a
+    public key that is not ``bytes`` raises TypeError and one that is not 32
+    bytes raises ValueError; nested structural violations (an
+    :class:`AuditReceipt` or :class:`SignedRoot` that could not be
+    constructed) raise exactly the TypeError or ValueError
+    :func:`verify_signed_audit_receipt` raises, rather than becoming a
+    report. The call is read-only.
+    """
+    if not isinstance(bundle, SignedAuditReceipt):
+        raise TypeError("bundle must be a SignedAuditReceipt")
+    # Re-validate the container fields and nested structures exactly as
+    # verify_signed_audit_receipt does, so bypassed fields and structurally
+    # illegal nested receipts or checkpoints raise, not False. The public key
+    # is pinned only inside verify_signed_root at stage 2, so a non-bytes or
+    # wrong-length key raises at exactly the same point as for the verifier.
+    if not isinstance(bundle.receipt, AuditReceipt):
+        raise TypeError("receipt must be an AuditReceipt")
+    if not isinstance(bundle.checkpoint, SignedRoot):
+        raise TypeError("checkpoint must be a SignedRoot")
+    receipt = AuditReceipt(
+        version=bundle.receipt.version,
+        hash_name=bundle.receipt.hash_name,
+        size=bundle.receipt.size,
+        root=bundle.receipt.root,
+        items=bundle.receipt.items,
+    )
+    checkpoint = SignedRoot(
+        bundle.checkpoint.version,
+        bundle.checkpoint.hash_name,
+        bundle.checkpoint.size,
+        bundle.checkpoint.root,
+        bundle.checkpoint.head,
+        bundle.checkpoint.signature,
+    )
+
+    # Stage 1: the receipt body, via the existing receipt diagnosis. The
+    # SignedAuditReceipt constructor binds hash_name/size/root, but a bypassed
+    # container can still carry two disagreeing halves; that is a stage-3
+    # "binding" failure, while the body is diagnosed against its own fields.
+    # Only "entry" carries a position in this report: the itemized receipt
+    # diagnosis locates its per-item "proof" at that item's index, but this
+    # report pins only "entry" and leaves every other code's position empty.
+    body = inspect_audit_receipt(receipt)
+    if not body.ok:
+        position = body.index if body.code == _SIGNED_AUDIT_CODE_ENTRY else None
+        return SignedAuditReport(False, position, body.code)
+
+    # Stage 2: the checkpoint signature with the pre-trusted key. A wrong key
+    # and a forged signature are indistinguishable failures, so both report
+    # "checkpoint".
+    if not verify_signed_root(checkpoint, public_key):
+        return SignedAuditReport(False, None, _SIGNED_AUDIT_CODE_CHECKPOINT)
+
+    # Stage 3: the two halves must attest the same snapshot. Both halves are
+    # individually genuine at this point, so a disagreement is a binding
+    # failure rather than a body or signature failure.
+    if (
+        receipt.hash_name != checkpoint.hash_name
+        or receipt.size != checkpoint.size
+        or receipt.root != checkpoint.root
+    ):
+        return SignedAuditReport(False, None, _SIGNED_AUDIT_CODE_BINDING)
+    return SignedAuditReport(True, None, None)
+
+
+def inspect_signed_audit_batch(
+    receipt: Any, public_key: Any
+) -> SignedAuditReport:
+    """Diagnose a :class:`SignedAuditBatch` offline, without holding the log.
+
+    The read-only diagnostic counterpart of
+    :func:`verify_signed_audit_batch`: it introduces no new signing or wire
+    domain, never mutates the receipt and, instead of a bare bool, returns a
+    frozen :class:`SignedAuditReport` locating the **first** mismatch — a
+    genuine receipt reports ``SignedAuditReport(True, None, None)`` and only
+    the earliest problem is ever reported. The fixed examination order is:
+
+    1. the sealed compact batch body, diagnosed exactly as
+       :func:`inspect_audit_batch` diagnoses the nested five-tuple: the
+       empty-snapshot root (``"root"``), then the entries in ascending
+       absolute index order with an entry-digest mismatch reported as
+       ``"entry"`` at that entry's absolute index, and last of all the single
+       shared proof (``"proof"`` with no position);
+    2. the checkpoint signature, verified with the pre-trusted 32-byte
+       ``public_key`` via :func:`verify_signed_root`: a structurally valid
+       checkpoint whose signature does not verify — including a well-formed
+       32-byte key that is simply not the signer's, or an altered root, chain
+       head or signature — reports ``"checkpoint"`` with no position;
+    3. last of all the binding between the two halves, exactly the comparison
+       :func:`verify_signed_audit_batch` makes: the batch and checkpoint must
+       describe the same snapshot (equal ``hash_name``, ``size`` and
+       ``root``), and the signed chain head must equal the last carried
+       entry's ``entry_hash`` (the digest-width zero value for an empty
+       snapshot) — two halves that each verify on their own but disagree on
+       the snapshot or the head report ``"binding"`` with no position.
+
+    ``report.ok`` is ``True`` exactly when
+    :func:`verify_signed_audit_batch` returns ``True`` for the same receipt
+    and key. A receipt that is not a :class:`SignedAuditBatch`, or whose
+    container fields have been bypassed to wrong types, raises TypeError; a
+    public key that is not ``bytes`` raises TypeError and one that is not 32
+    bytes raises ValueError; nested structural violations — the batch
+    five-tuple contract enforced by :func:`verify_audit_batch`, or a
+    :class:`SignedRoot` that could not be constructed when its signature is
+    examined — propagate exactly as :func:`verify_signed_audit_batch` raises
+    them (TypeError or ValueError), rather than becoming a report. The call
+    is read-only.
+    """
+    if not isinstance(receipt, SignedAuditBatch):
+        raise TypeError("receipt must be a SignedAuditBatch")
+    # Re-validate the container fields exactly as verify_signed_audit_batch
+    # does, so a bypassed batch or checkpoint field raises TypeError rather
+    # than False. The batch tuple's own contract raises inside
+    # inspect_audit_batch below; the checkpoint's own contract and the
+    # 32-byte public-key pin both happen inside verify_signed_root at stage
+    # 2, so each raises at exactly the same point as for the verifier.
+    checked = SignedAuditBatch(receipt.batch, receipt.checkpoint)
+
+    # Stage 1: the batch body, via the existing batch diagnosis. It unpacks
+    # the five-tuple exactly as verify_audit_batch would, so every nested
+    # structural violation propagates unchanged.
+    body = inspect_audit_batch(checked.batch)
+    if not body.ok:
+        position = body.index if body.code == _SIGNED_AUDIT_CODE_ENTRY else None
+        return SignedAuditReport(False, position, body.code)
+
+    # Stage 2: the checkpoint signature with the pre-trusted key. A wrong key
+    # and a forged signature are indistinguishable failures, so both report
+    # "checkpoint". verify_signed_root re-validates the checkpoint fields, so
+    # a structurally illegal checkpoint raises here exactly as for the
+    # verifier.
+    if not verify_signed_root(checked.checkpoint, public_key):
+        return SignedAuditReport(False, None, _SIGNED_AUDIT_CODE_CHECKPOINT)
+
+    # Stage 3: the signed checkpoint must attest exactly the batch's snapshot
+    # and the chain head must match the batch's last entry (the zero digest
+    # for an empty snapshot). Both halves verify individually by now, so a
+    # disagreement is a binding failure.
+    hash_name, size, root, entries, _proof = _unpack_audit_batch(checked.batch)
+    checkpoint = checked.checkpoint
+    if (
+        checkpoint.hash_name != hash_name
+        or checkpoint.size != size
+        or checkpoint.root != root
+    ):
+        return SignedAuditReport(False, None, _SIGNED_AUDIT_CODE_BINDING)
+    digest_size = _digest_size(hash_name)
+    if size == 0:
+        expected_head = bytes(digest_size)
+    else:
+        expected_head = entries[-1].entry_hash
+    if not hmac.compare_digest(checkpoint.head, expected_head):
+        return SignedAuditReport(False, None, _SIGNED_AUDIT_CODE_BINDING)
+    return SignedAuditReport(True, None, None)
 
 
 def verify_signed_search_receipt(bundle: Any, public_key: Any) -> bool:

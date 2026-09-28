@@ -504,6 +504,51 @@ verify_signed_full_encrypted_search_receipt(restored, key, public_key)  # True�
   空树根）；两个入口均为只读且确定。本层不新增签名原文，签名仍是检查点那一
   份，既有线格式与旧接口不变
 
+### 全覆盖检索回执的只读诊断
+
+`verify_full_search_receipt` / `verify_full_encrypted_search_receipt` 只回答
+真假；诊断入口 `inspect_full_search_receipt` 与
+`inspect_full_encrypted_search_receipt` 是它们的只读对应物，在同一份全覆盖
+回执判假时定位**首个**不符之处。两者都无需持有日志、只读且确定，不新增签名
+原文与线格式，也不做报告编解码；既有审计回执诊断、命中型检索回执与各线格式
+全部不变。
+
+```python
+report = inspect_full_search_receipt(receipt)            # 只收回执本身
+report = inspect_full_encrypted_search_receipt(receipt, key)  # 另收一把追加密钥
+# SearchReceiptReport(ok=True, index=None, code=None)：成功恒为真加两个空位置
+```
+
+返回冻结报告 `SearchReceiptReport(ok, index, code)`，支持位置构造、按三个
+字段相等；成功恒为 `SearchReceiptReport(True, None, None)`，失败只记最早
+一处。码只取四个值：
+
+- `"root"`：仅在快照尺寸为零（即空快照）而记录的根不是规范空树根时出现，
+  `index` 为 `None`；
+- `"entry"`：该条目按字段重算出的内容摘要（`entry_digest`）与记录的
+  `entry_hash` 不符，`index` 记这条记录的绝对索引；
+- `"proof"`：那份覆盖全部条目的共享紧凑批量证明连不到记录的快照根。两类
+  入口的共享证明都不指向单条，`index` 为 `None`；
+- `"hits"`：只出现在加密层，两份命中集按升序逐项比较时首个不一致的绝对
+  索引，`index` 记该索引（漏记的命中、多记的伪造命中或尾部不一致都如此
+  定位）。
+
+检查顺序固定：**先**查空快照根，**再**按绝对索引升序逐条重算摘要，**最后**
+才看共享证明；加密层在共享证明之后再比命中集。故条目摘要不符优先报该条
+`("entry", index)`，共享证明不匹配统一报 `("proof", None)`，加密层证明通过
+后命中集不一致才报 `("hits", index)`。**纯空范围（`items == proof == ()`，
+加密层另含 `hits == ()`，而 `size > 0`）的回执不携带任何可核对证据，记录的
+快照根不参与比对**，只凭结构判成功，与两个既有核验入口的口径一致。因此报告
+成功当且仅当对应核验入口对同一回执（加密层连同同一把密钥）返回真；核验抛
+异常时诊断原样抛出——入参不是对应冻结回执、或追加密钥不是 `bytes` 抛
+`TypeError`；密钥不是 32 字节、覆盖不全、乱序（含命中乱序）或证明结构非法
+（证明节点数与所列索引及 `size` 不相称等）抛 `ValueError`；被篡改只产生定位
+报告。
+
+报告自身的构造规则：`ok`、`code`、`index` 类型不对一律抛 `TypeError`
+（`index` 为 `bool` 或非整数也在此列）；未知码、成功却带码或位置、失败却缺码
+或位置为负一律抛 `ValueError`。
+
 ### 可验证前缀裁剪
 
 ```python
@@ -3803,6 +3848,17 @@ python3 -m auditchain
   `"last"`（仅非空快照缺末条，`index=None`）。`ok` 非 `bool`、`code`
   类型错、`index` 非整数/`None` 或为 `bool` 抛 `TypeError`；未知码、成功却带
   `code` 或 `index`、失败却缺 `code`、`index` 为负抛 `ValueError`
+- `SearchReceiptReport(ok, index, code)` — `inspect_full_search_receipt` /
+  `inspect_full_encrypted_search_receipt` 返回的不可变全覆盖检索回执诊断
+  报告，定位**首个**不符之处，按全部三个字段相等、支持位置构造；成功恒为
+  `(True, None, None)`，失败只记最早一处。`code` 只取 `"root"`（仅快照
+  尺寸为零而根不是规范空树根，`index=None`）、`"entry"`（条目重算摘要与
+  记录 `entry_hash` 不符，`index` 为该条绝对索引）、`"proof"`（共享紧凑
+  批量证明连不到记录的快照根，两类入口均 `index=None`）或 `"hits"`（仅
+  加密层：重算命中集与记录 `hits` 按升序逐项比较时首个不一致的绝对索引）。
+  `ok`、`code`、`index` 类型错（含 `index` 为 `bool` 或非整数）抛
+  `TypeError`；未知码、成功却带 `code` 或 `index`、失败却缺 `code` 或
+  `index` 为负抛 `ValueError`
 - `SearchReceipt(version, hash_name, size, root, query, start, stop, items)` —
   不可变的离线检索回执，把一次按内容查找的结果（算法、快照尺寸与 Merkle 根、
   规范化查询值、半开范围 `[start, stop)` 与命中条目）绑成一件可落盘制品，
@@ -4388,6 +4444,34 @@ python3 -m auditchain
   `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
   版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序或命中索引非法（含绕过
   冻结构造器写入的字段）抛 `ValueError`；调用只读
+- `inspect_full_search_receipt(receipt)` — `verify_full_search_receipt` 的
+  只读诊断对应物，无需持有日志、只读且确定，不新增签名原文与线格式、不做
+  报告编解码；只收回执本身，返回冻结 `SearchReceiptReport(ok, index, code)`
+  定位**首个**不符之处，成功恒为 `(True, None, None)`。固定顺序为先查空快照
+  根（`size == 0` 而根不是规范空树根报 `("root", None)`），再按绝对索引升序
+  逐条重算摘要（首个不符报 `("entry", index)`），最后用
+  `verify_batch_inclusion` 看那份共享证明（不匹配统一报 `("proof", None)`）。
+  纯空范围（`size > 0` 而 `items == proof == ()`）不携带可核对证据、记录的
+  根不参与比对。`report.ok` 当且仅当 `verify_full_search_receipt(receipt)`
+  为真；入参不是 `FullSearchReceipt` 抛 `TypeError`，覆盖不全、乱序、未知
+  算法、摘要宽度或证明节点数等结构非法（含绕过冻结构造器写入的字段）抛
+  `ValueError`，与该核验入口完全一致
+- `inspect_full_encrypted_search_receipt(receipt, key)` —
+  `verify_full_encrypted_search_receipt` 的只读诊断对应物，除回执外另收一把
+  32 字节追加密钥，无需持有日志、只读且确定，不新增签名原文与线格式、不做
+  报告编解码；返回冻结 `SearchReceiptReport(ok, index, code)` 定位**首个**
+  不符之处，成功恒为 `(True, None, None)`。固定顺序为先查空快照根（报
+  `("root", None)`），再按绝对索引升序逐条重算摘要（报 `("entry", index)`），
+  之后用 `verify_batch_inclusion` 看共享证明（不匹配统一报
+  `("proof", None)`），**最后**以 `key` 逐条解封（普通条目、异钥封装与解密
+  失败都不算命中），重算命中集与记录 `hits` 按升序逐项比较，首个不一致的
+  绝对索引报 `("hits", index)`。纯空范围（`size > 0` 而 `items == proof ==
+  hits == ()`）不携带可核对证据、记录的根不参与比对，零命中回执不考验密钥。
+  `report.ok` 当且仅当 `verify_full_encrypted_search_receipt(receipt, key)`
+  为真；入参不是 `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛
+  `TypeError`，密钥不是 32 字节、覆盖不全、乱序（含命中乱序）、未知算法、
+  摘要宽度或证明结构非法（含绕过冻结构造器写入的字段）抛 `ValueError`，与该
+  核验入口完全一致
 - `verify_signed_verifier(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519
   公钥离线验证 `AuditLog.export_signed_verifier` 签发的 `SignedVerifier`：从嵌套
   `Verifier` 重建同一签名原文

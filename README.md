@@ -1347,6 +1347,66 @@ verify_signed_audit_receipt(restored, public_key)   # True：无需持有日志
   任一嵌套格式非法抛 `ValueError`；结构合法但验真不匹配仍可解码，
   `verify_signed_audit_receipt` 返回 `False`。两个入口均为只读且确定
 
+### 可信审计交付包的只读诊断
+
+`verify_signed_audit_receipt` / `verify_signed_audit_batch` 只回答整包真假；
+诊断入口 `inspect_signed_audit_receipt` 与 `inspect_signed_audit_batch` 是它们
+的只读对应物，在同一份可信交付包判假时定位问题**最早出在哪一层**。两者都无需
+持有日志、只读且确定，不新增签名原文与线格式，也不做报告编解码；既有布尔核验、
+逐条 / 批量回执诊断、各线格式与导出行为全部不变。
+
+```python
+from auditchain import inspect_signed_audit_receipt, inspect_signed_audit_batch
+
+report = inspect_signed_audit_receipt(bundle, public_key)   # 收 SignedAuditReceipt + 预置公钥
+report = inspect_signed_audit_batch(receipt, public_key)    # 收 SignedAuditBatch + 预置公钥
+# SignedAuditReport(ok=True, index=None, code=None)：成功恒为真加两个空位置
+```
+
+返回新的冻结报告 `SignedAuditReport(ok, index, code)`，支持位置构造、按三个字段
+相等；成功恒为 `SignedAuditReport(True, None, None)`，失败只记最早一层。码取六个
+值，前四个沿用无签名回执诊断（`inspect_audit_receipt` /
+`inspect_audit_batch`）的既有含义：
+
+- `"entry"`：该条目重算摘要（`entry_digest`）与记录的 `entry_hash` 不符，
+  `index` 记这条记录的**绝对索引**；
+- `"proof"`：证明连不到记录的快照根。逐条交付包里无签名主体本会把位置记到该条
+  索引，但本层只上抬 `"entry"` 的位置，故此处 `index` 恒为 `None`；批量交付包
+  本就是一份共享证明，同样不带位置；
+- `"root"`：仅空快照根不规范，`index=None`；
+- `"last"`：沿用无签名逐条诊断中“非空快照缺末条”的含义，`index=None`。在
+  可信交付包里嵌套 `AuditReceipt` 会被原样重建，缺末条在重建时即抛
+  `ValueError`（见下），因此该码在本层的正常构造路径上不可达，保留是为沿用
+  既有码集合；
+- `"checkpoint"`：检查点签名验不过——以预置公钥调 `verify_signed_root` 失败。
+  **公钥不受信任（错误公钥）与签名被伪造都归为这一层**，`index=None`；
+- `"binding"`：两半各自为真却对不上——无签名主体核验通过、检查点签名也有效，
+  但两半不描述同一快照（`hash_name`、`size`、`root` 不一致）；批量交付包还额外
+  要求检查点链头等于批量末条（索引 `size - 1`）的 `entry_hash`（空快照为同宽零
+  摘要），链头对不上也归这一层，`index=None`。
+
+检查顺序固定，只报最早一处：**先**沿用既有诊断看回执主体
+（`inspect_audit_receipt` / `inspect_audit_batch`，其失败码原样继承，但只有
+`"entry"` 上抬位置），**再**用预置公钥验检查点签名（失败报 `"checkpoint"`），
+**最后**才比对两半的绑定（失败报 `"binding"`）。因此报告成功当且仅当对应的既有
+布尔核验入口——`verify_signed_audit_receipt` 或 `verify_signed_audit_batch`
+——对同一交付包与同一公钥返回真，是否需要链头绑定也照各自的既有口径（逐条包只
+比 `hash_name`/`size`/`root`，批量包另比链头）。
+
+入参交付包类型不对（含把批量包传给逐条入口、反之亦然）或公钥不是 `bytes` 一律
+抛 `TypeError`；公钥不是 32 字节抛 `ValueError`，且公钥在任何检查之前先钉住，
+即使交付包主体本身已坏也一样抛。凡既有核验会抛的结构错误（嵌套 `AuditReceipt` /
+五元组 / `SignedRoot` 的版本、算法、范围、宽度、顺序、缺末条、证明节点数、签名
+长度等）诊断原样抛出 `TypeError` / `ValueError`，不改判成失败报告；类型与结构
+合法之后的任何签名、主体或绑定不符只产生报告，绝不抛异常。两个入口均不改动交付包
+与公钥，同一输入两次诊断结果完全相等。
+
+报告自身的构造规则与其他冻结诊断报告一致：`ok` 必须为 `bool`，`code` 必须为
+字符串，`index` 只能是非 `bool` 整数或 `None`，否则抛 `TypeError`；未知码、成功
+却带 `code` 或 `index`、失败却缺 `code`、`index` 为负抛 `ValueError`。此外
+`"entry"` 必须带非负绝对索引（缺位置抛 `ValueError`），其余五个码的位置必须留空
+（带位置抛 `ValueError`）。
+
 ### 可信跨快照一致性凭据（Ed25519）
 
 `signed_consistency` 在一个不可变 `SignedConsistency` 中打包同一日志两个
@@ -3954,6 +4014,20 @@ python3 -m auditchain
   `"last"`（仅非空快照缺末条，`index=None`）。`ok` 非 `bool`、`code`
   类型错、`index` 非整数/`None` 或为 `bool` 抛 `TypeError`；未知码、成功却带
   `code` 或 `index`、失败却缺 `code`、`index` 为负抛 `ValueError`
+- `SignedAuditReport(ok, index, code)` —
+  `inspect_signed_audit_receipt` / `inspect_signed_audit_batch` 返回的不可变
+  可信审计交付包诊断报告，判假时定位问题最早出在哪一层，按全部三个字段相等、
+  支持位置构造；成功恒为 `(True, None, None)`，失败只记最早一层。`code` 只取
+  `"entry"`（无签名主体的条目重算摘要不符，`index` 为该条绝对索引；六个码中
+  唯一可带位置者）、`"proof"`（证明连不到快照根，逐条/批量均 `index=None`）、
+  `"root"`（仅空快照根不规范，`index=None`）、`"last"`（沿用无签名逐条诊断的
+  缺末码，`index=None`；可信包内嵌回执会先被原样重建，缺末条直接抛
+  `ValueError`，故本层正常路径不可达）、`"checkpoint"`（检查点签名凭预置公钥
+  验不过——错误公钥与伪造签名都归此，`index=None`）或 `"binding"`（两半各自
+  为真却不描述同一快照；批量包另含链头不匹配，`index=None`）。`ok` 非
+  `bool`、`code` 类型错、`index` 非整数/`None` 或为 `bool` 抛 `TypeError`；
+  未知码、成功却带 `code` 或 `index`、失败却缺 `code`、`index` 为负、
+  `"entry"` 缺非负位置或其余码携带位置抛 `ValueError`
 - `SearchReceiptReport(ok, index, code)` —
   `inspect_full_search_receipt` /
   `inspect_full_encrypted_search_receipt` 返回的不可变全覆盖检索回执诊断
@@ -4522,6 +4596,37 @@ python3 -m auditchain
   算法、范围、宽度、顺序、缺末条、空快照携带条目或节点数不符等结构问题抛
   `ValueError`，与该核验入口完全一致——故批量回执缺末条抛 `ValueError`，而不
   生成 `("last", None)` 报告
+- `inspect_signed_audit_receipt(bundle, public_key)` —
+  `verify_signed_audit_receipt` 的只读诊断对应物，收一份
+  `SignedAuditReceipt` 与预置信任的 32 字节 Ed25519 公钥，无需持有日志、只读
+  且确定，不新增签名原文与线格式、不做报告编解码；返回冻结
+  `SignedAuditReport(ok, index, code)`，判假时定位问题最早出在哪一层，成功恒为
+  `(True, None, None)`。固定顺序为先沿用 `inspect_audit_receipt` 看无签名主体
+  （其码原样继承，但只有 `"entry"` 上抬该条绝对索引位置，其余码位置留空），再
+  用预置公钥调 `verify_signed_root` 验检查点签名（错误公钥与伪造签名都报
+  `("checkpoint", None)`），最后比两半是否描述同一快照（`hash_name`、`size`、
+  `root` 不一致报 `("binding", None)`）。`report.ok` 当且仅当
+  `verify_signed_audit_receipt(bundle, public_key)` 为真；交付包不是
+  `SignedAuditReceipt`（含把 `SignedAuditBatch` 等其他类型传入，或绕过构造器的
+  容器字段类型错）或公钥不是 `bytes` 抛 `TypeError`，公钥不是 32 字节抛
+  `ValueError`（在任何检查之前先钉住），嵌套回执 / 检查点的既有结构错误沿用
+  既有核验原样抛 `TypeError` / `ValueError`
+- `inspect_signed_audit_batch(receipt, public_key)` —
+  `verify_signed_audit_batch` 的只读诊断对应物，收一份 `SignedAuditBatch` 与
+  预置信任的 32 字节 Ed25519 公钥，无需持有日志、只读且确定，不新增签名原文与
+  线格式、不做报告编解码；返回冻结 `SignedAuditReport(ok, index, code)`，判假时
+  定位问题最早出在哪一层，成功恒为 `(True, None, None)`。固定顺序为先沿用
+  `inspect_audit_batch` 看五元组主体（只有 `"entry"` 上抬该条绝对索引位置，
+  共享 `"proof"` 与 `"root"` 位置留空），再用预置公钥调 `verify_signed_root`
+  验检查点签名（错误公钥与伪造签名都报 `("checkpoint", None)`），最后比两半的
+  快照三元组（`hash_name`、`size`、`root`）与链头绑定（非空快照检查点 `head`
+  须等于批量末条 `entry_hash`，空快照须为同宽零摘要；任一不符报
+  `("binding", None)`）。`report.ok` 当且仅当
+  `verify_signed_audit_batch(receipt, public_key)` 为真；交付包不是
+  `SignedAuditBatch`（含把 `SignedAuditReceipt` 等其他类型传入，或绕过构造器的
+  容器字段类型错）或公钥不是 `bytes` 抛 `TypeError`，公钥不是 32 字节抛
+  `ValueError`（在任何检查之前先钉住），嵌套五元组 / 检查点的既有结构错误沿用
+  既有核验原样抛 `TypeError` / `ValueError`
 - `verify_search_receipt(receipt)` — 无需持有日志即可验证 `SearchReceipt`：逐条
   重算每个命中条目的 `entry_digest`、核验其包含证明是否落在记录的快照根内，并
   比对命中内容与规范化查询值；只判定列出的命中是否属实，不判定结果集是否完整

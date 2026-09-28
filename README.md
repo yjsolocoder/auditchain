@@ -504,6 +504,58 @@ verify_signed_full_encrypted_search_receipt(restored, key, public_key)  # True�
   空树根）；两个入口均为只读且确定。本层不新增签名原文，签名仍是检查点那一
   份，既有线格式与旧接口不变
 
+### 命中型检索回执的只读诊断
+
+`verify_search_receipt` / `verify_encrypted_search_receipt` 只回答真假；本次
+补上的只读诊断入口在同一份命中型回执判假时定位**首个假命中**，无需持有日志、
+只读且确定，不新增签名原文与线格式，也不做这份报告的编解码；已有的查找、核验
+与全覆盖诊断等既有功能均不变。
+
+```python
+report = inspect_search_receipt(receipt)                    # 只收回执本身
+report = inspect_encrypted_search_receipt(receipt, key)     # 回执 + 一把追加密钥
+# SearchHitReport(ok=True, index=None, code=None)：成功恒为真加两个空位置
+```
+
+返回新的冻结报告 `SearchHitReport(ok, index, code)`，支持位置构造、按三个字段
+相等；成功恒为 `SearchHitReport(True, None, None)`，失败只记最早一处。诊断按
+命中条目的绝对索引升序逐条检查，每条固定顺序为：
+
+- `"entry"`：该条目按自身字段重算出的内容摘要（`entry_digest`）与记录的
+  `entry_hash` 不符，`index` 记这条记录的绝对索引；
+- `"proof"`：该条的包含证明（`verify_inclusion`）连不到记录的快照根，
+  `index` 同样记该条绝对索引（逐条证明指向单条，与全覆盖层的共享证明不同）；
+- `"hit"`：该条目确实存在于该索引（摘要与包含证明都成立），却不是查询命中——
+  明文层即条目内容不等于规范化查询值；加密层还包括以追加密钥解不开的封装
+  （错误密钥、AEAD 认证失败）、被列进来的普通（非封装）条目与异钥密文，以及
+  解封成功但恢复明文不等于查询值，`index` 记该条绝对索引。
+
+因此同一条目先看重算摘要，再看包含证明，最后才判内容是不是命中；多条都假时
+只报绝对索引最早的一条。
+
+```python
+# 加密层错误密钥示例（真实命中为 (0, 2, 4)）
+inspect_encrypted_search_receipt(receipt, wrong_key)
+# SearchHitReport(ok=False, index=0, code='hit')
+```
+
+零命中回执（`items == ()`，含空快照）不携带任何可核对证据：记录的快照根不
+参与比对，加密层也不考验密钥，在任意密钥下都恒报成功——与既有核验入口的判定
+一致。逐条检查全部成立却整体判假时（这种回执无法经冻结构造器产生），归为
+`"root"`，`index` 记空。
+
+对结构合法的回执，报告成功当且仅当对应核验入口
+（`verify_search_receipt` / `verify_encrypted_search_receipt`）对同一回执
+（与同一把密钥）核验为真；核验抛异常时诊断原样抛出——入参不是对应冻结回执或
+追加密钥不是 `bytes` 抛 `TypeError`；密钥不是 32 字节、范围/尺寸越界、未知
+算法、摘要宽度不符、索引乱序或证明结构非法（含绕过冻结构造器写入的非法字段）
+抛 `ValueError`。错误密钥不是异常：按假命中定位首个被列出的条目。被篡改只
+产生失败报告，绝不抛异常。同一回执诊断两次结果相同，回执字段不被改动。
+
+报告自身的构造规则与 `SearchReceiptReport` 一致：`ok`、`code`、`index` 类型
+不对一律抛 `TypeError`（`index` 为 `bool` 或非整数也在此列）；未知码、成功却
+带 `code` 或 `index`、失败却缺 `code` 或 `index` 为负，一律抛 `ValueError`。
+
 ### 全覆盖检索回执的只读诊断
 
 `verify_full_search_receipt` / `verify_full_encrypted_search_receipt` 只回答
@@ -3857,6 +3909,19 @@ python3 -m auditchain
   `"last"`（仅非空快照缺末条，`index=None`）。`ok` 非 `bool`、`code`
   类型错、`index` 非整数/`None` 或为 `bool` 抛 `TypeError`；未知码、成功却带
   `code` 或 `index`、失败却缺 `code`、`index` 为负抛 `ValueError`
+- `SearchHitReport(ok, index, code)` —
+  `inspect_search_receipt` / `inspect_encrypted_search_receipt` 返回的不可变
+  命中型检索回执诊断报告，在判假时定位**首个假命中**，按全部三个字段相等、
+  支持位置构造；成功恒为 `(True, None, None)`，失败只记最早一处。`code` 只取
+  `"entry"`（条目重算摘要与记录 `entry_hash` 不符，`index` 为该条绝对索引）、
+  `"proof"`（该条包含证明连不到记录的快照根，`index` 为该条绝对索引）、
+  `"hit"`（条目确实存在却不是查询命中：明文层内容不等于规范化查询值；加密层
+  另含解不开的封装、被列入的普通条目与异钥密文，`index` 为该条绝对索引）或
+  `"root"`（逐条检查全部成立却整体判假，正常构造的回执无法出现，
+  `index=None`）。零命中回执不考验密钥、记录的根不参与比对，恒报成功。`ok`
+  非 `bool`、`code` 类型错、`index` 非整数/`None` 或为 `bool` 抛
+  `TypeError`；未知码、成功却带 `code` 或 `index`、失败却缺 `code`、
+  `index` 为负抛 `ValueError`
 - `SearchReceiptReport(ok, index, code)` —
   `inspect_full_search_receipt` /
   `inspect_full_encrypted_search_receipt` 返回的不可变全覆盖检索回执诊断
@@ -4484,6 +4549,37 @@ python3 -m auditchain
   为真；密钥不是 32 字节、覆盖不全、乱序、范围尺寸越界、未知算法、摘要宽度
   不符或证明结构非法（含绕过冻结构造器写入的字段）抛 `ValueError`，核验抛
   其他异常时原样抛出，被篡改（含命中集被改）只给报告
+- `inspect_search_receipt(receipt)` —
+  `verify_search_receipt` 的只读诊断对应物，无需持有日志、只读且确定，
+  不新增签名原文与线格式、不做报告编解码；收一份冻结 `SearchReceipt`
+  （其他类型抛 `TypeError`），返回冻结 `SearchHitReport(ok, index, code)`
+  在判假时定位**首个假命中**，成功恒为 `(True, None, None)`。按所列命中的
+  绝对索引升序逐条检查，每条固定顺序为先重算 `entry_digest`（不符报
+  `("entry", index)`），再以 `verify_inclusion` 核验该条包含证明（连不到
+  记录的快照根报 `("proof", index)`），最后才比对条目内容与规范化查询值
+  （不相等报 `("hit", index)`）；多条都假只报索引最早的一条。零命中回执
+  （含空快照）不携带可核对证据、记录的根不参与比对，恒报成功；逐条检查全部
+  成立却整体判假时报 `("root", None)`（正常构造的回执无法出现）。
+  `report.ok` 当且仅当 `verify_search_receipt(receipt)` 为真；未知算法、
+  摘要宽度、范围尺寸、索引顺序或证明层数等结构非法（含绕过冻结构造器写入的
+  字段）抛 `ValueError`，核验抛其他异常时原样抛出，被篡改只给报告
+- `inspect_encrypted_search_receipt(receipt, key)` —
+  `verify_encrypted_search_receipt` 的只读诊断对应物，无需持有日志、
+  只读且确定，不新增签名原文与线格式、不做报告编解码；收一份冻结
+  `EncryptedSearchReceipt` 与一把追加密钥（入参类型不对抛 `TypeError`，
+  `key` 必须是精确 `bytes`、拒绝 `bytearray` / `memoryview`，非 32 字节抛
+  `ValueError`），返回冻结 `SearchHitReport(ok, index, code)` 在判假时定位
+  **首个假命中**，成功恒为 `(True, None, None)`。按所列命中的绝对索引升序
+  逐条检查，每条固定顺序为先重算 `entry_digest`（报 `("entry", index)`），
+  再以 `verify_inclusion` 核验该条包含证明（报 `("proof", index)`），最后
+  才以 `key` 用 `decrypt_entry` 解封并把恢复明文与规范化查询值逐字节比较；
+  错误密钥、AEAD 认证失败、被列入的普通条目与异钥密文都不是异常，按假命中
+  报 `("hit", index)`。零命中回执不考验密钥、记录的根不参与比对，任意密钥
+  下恒报成功；逐条检查全部成立却整体判假时报 `("root", None)`。
+  `report.ok` 当且仅当 `verify_encrypted_search_receipt(receipt, key)` 为真；
+  未知算法、摘要宽度、范围尺寸、索引顺序或证明层数等结构非法（含绕过冻结
+  构造器写入的字段）抛 `ValueError`，核验抛其他异常时原样抛出，被篡改只给
+  报告，同一回执诊断两次结果相同
 - `verify_signed_verifier(receipt, public_key)` — 凭预先信任的 32 字节 Ed25519
   公钥离线验证 `AuditLog.export_signed_verifier` 签发的 `SignedVerifier`：从嵌套
   `Verifier` 重建同一签名原文

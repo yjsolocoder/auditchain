@@ -1175,6 +1175,47 @@ verify_rotation_chain(restored, public_a)  # True：无需持有日志
   相等且重编码逐字节相同，结构合法但跳间接驳失败、记录重复或验真不匹配仍可解码
   （`verify_rotation_chain` 返回 `False`）
 
+### 多跳签名者信任链的只读诊断
+
+`verify_rotation_chain` 只回答整条链的真假；`inspect_rotation_chain` 在判假时定位
+**首个**出问题的那条轮换记录：全程离线只读，不持有日志、不改动任何记录与密钥，也不
+新增签名原文与线格式（仅按顺序复用既有 `verify_rotation`），返回既有的冻结
+`ContinuationChainReport`，不做这份报告之外的新码或编解码。
+
+```python
+from auditchain import ContinuationChainReport, inspect_rotation_chain
+
+inspect_rotation_chain(items, public_a)   # ContinuationChainReport(ok=True, ...)
+inspect_rotation_chain(items, public_b)   # ContinuationChainReport(ok=False, index=0, code='rotation')
+```
+
+记录严格按元组顺序逐条推进，每条只做两项检查，顺序固定：
+
+- 先与**更早出现**的记录比对，四元组逐字段完全相等时报 `"rotation_duplicate"`；
+- 没有重复再以**当前信任公钥**调用既有 `verify_rotation` 核验这条轮换，签名或授权
+  不通过报 `"rotation"`。
+
+两种失败的 `index` 都记这条记录在元组中的序号（从 0 起）。码沿用既有合法集合，只报
+`"rotation_duplicate"` 与 `"rotation"` 两个，不新增码。信任严格逐跳转移：只有核验
+通过的记录，其背书的 `new_key` 才用来核验下一条；某条一旦不成立，其后各条一律不再
+检查（后面的任何问题都被最早的失败掩盖）。单条记录组成的链也照常逐条诊断。结构与
+类型合法时，签名或授权不匹配只产生报告，绝不抛异常。
+
+```python
+inspect_rotation_chain((r1, r1), public_a)
+# ContinuationChainReport(ok=False, index=1, code='rotation_duplicate')：首条成立，重复在序号 1
+inspect_rotation_chain((r2, r1), public_a)
+# ContinuationChainReport(ok=False, index=0, code='rotation')：首条无法凭 public_a 验真
+```
+
+全部成立时返回成功报告 `ContinuationChainReport(True, None, None)`，**成功当且仅当**
+既有布尔入口 `verify_rotation_chain` 对同一输入返回真；同一输入两次诊断结果完全相等，
+诊断不改动任何记录或密钥。`items` 不是 `tuple`（含 list / 生成器 / `None`）、元素或
+其字段类型不对、或 `key` 不是 `bytes` 一律先抛 `TypeError`；类型正确而元素长度不是
+4、空链或 `key` 不是 32 字节一律抛 `ValueError`；嵌套检查点结构非法时沿用既有
+`verify_rotation` 的异常原样传播（`TypeError` / `ValueError`），不改判成失败报告。
+`python3 -m auditchain` 演示入口与既有编解码、核验入口的行为均不变。
+
 ### 可信紧凑批量审计包（Ed25519）
 
 `signed_audit_batch` 在一个不可变 `SignedAuditBatch` 中同时打包
@@ -4651,6 +4692,20 @@ python3 -m auditchain
   抛 `TypeError`，空元组抛 `ValueError`；密钥与嵌套记录的类型 / 长度 / 结构错误
   沿用 `verify_rotation` 的既有 `TypeError` / `ValueError`；不新增签名原文，
   调用只读
+- `inspect_rotation_chain(items, key)` — `verify_rotation_chain` 的只读诊断
+  对应物，同样全程离线、不持有日志、不改动任何记录与密钥、不新增签名原文与线
+  格式（仅按顺序复用既有 `verify_rotation`），返回既有的冻结
+  `ContinuationChainReport`：全部成立为 `(True, None, None)`，判假时只记
+  **首个**出问题的记录。逐条按元组顺序推进，每条先与更早记录比对，全等报
+  `"rotation_duplicate"`，否则以当前信任钥（首项为 `key`，其后为前一项验真
+  过的 `new_key`）调用 `verify_rotation`，不通过报 `"rotation"`；两码的
+  `index` 均为该记录的元组序号，码沿用既有合法集合、不新增码。信任严格逐跳
+  转移，某条不成立后不再检查后续各条；单条链照常诊断。成功当且仅当
+  `verify_rotation_chain` 对同一输入返回真，同一输入两次诊断结果相等。
+  `items` 非 `tuple`、元素或字段类型错、`key` 非 `bytes` 抛 `TypeError`；
+  空链、元素长度非 4、`key` 非 32 字节抛 `ValueError`；嵌套检查点结构非法
+  沿用 `verify_rotation` 的异常原样传播，签名 / 授权不匹配只产生报告、绝不
+  抛异常
 - `encode_rotations(items)` / `decode_rotations(data)` — 非空轮换四元组元组的
   规范二进制编码与解码，使多跳信任链可落盘、跨进程恢复后继续由
   `verify_rotation_chain` 离线逐跳核验，且不新增签名原文：字节流严格为

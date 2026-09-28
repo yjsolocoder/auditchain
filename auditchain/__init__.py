@@ -1,7 +1,7 @@
 """auditchain - an append-only hash-chained audit log.
 
 Public API: Entry / AuditLog / PruneReceipt / AuditReceipt /
-AuditReceiptReport / AuthTag /
+AuditReceiptReport / SearchReceiptReport / AuthTag /
 BatchInclusionProof / InclusionProof / ConsistencyProof / MerkleFrontier /
 Verifier / StageVerifier / SignedRoot / SignedStageVerifier / SignedVerifier /
 SignedStageAuthBundle /
@@ -31,6 +31,8 @@ verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
+inspect_full_search_receipt /
+inspect_full_encrypted_search_receipt /
 inspect_audit_receipt / inspect_audit_batch /
 inspect_continuation_chain / inspect_stage_continuation_chain /
 inspect_anchors / inspect_stage_anchors /
@@ -149,6 +151,7 @@ __all__ = [
     "StageRotatedAnchorSet",
     "StageRotatedChain",
     "SearchReceipt",
+    "SearchReceiptReport",
     "SignedAuditBatch",
     "SignedAuditReceipt",
     "SignedAuthAuditBundle",
@@ -281,6 +284,8 @@ __all__ = [
     "inspect_audit_batch",
     "inspect_audit_receipt",
     "inspect_continuation_chain",
+    "inspect_full_encrypted_search_receipt",
+    "inspect_full_search_receipt",
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
     "inspect_rotated_anchor_set",
@@ -7205,6 +7210,318 @@ def inspect_audit_batch(receipt: Any) -> AuditReceiptReport:
     ):
         return AuditReceiptReport(False, None, _AUDIT_RECEIPT_CODE_PROOF)
     return AuditReceiptReport(True, None, None)
+
+
+# Issue codes reported by SearchReceiptReport. "root" is used only when a
+# zero-size snapshot records a root other than the canonical empty-tree root
+# (no position); "entry" pinpoints the listed entry whose digest recomputed
+# from the entry's fields does not equal its recorded entry_hash (the entry's
+# absolute index); "proof" says the single shared compact batch proof does not
+# rebuild the recorded snapshot root (a shared proof pinpoints no single
+# entry, so no position); "hits" is specific to the encrypted layer and
+# pinpoints the first absolute index where the hit set recomputed with the
+# caller-supplied key differs from the recorded hits.
+_SEARCH_RECEIPT_CODE_ROOT = "root"
+_SEARCH_RECEIPT_CODE_ENTRY = "entry"
+_SEARCH_RECEIPT_CODE_PROOF = "proof"
+_SEARCH_RECEIPT_CODE_HITS = "hits"
+_SEARCH_RECEIPT_CODES = frozenset(
+    {
+        _SEARCH_RECEIPT_CODE_ROOT,
+        _SEARCH_RECEIPT_CODE_ENTRY,
+        _SEARCH_RECEIPT_CODE_PROOF,
+        _SEARCH_RECEIPT_CODE_HITS,
+    }
+)
+
+
+@dataclass(frozen=True)
+class SearchReceiptReport:
+    """Result of :func:`inspect_full_search_receipt` and
+    :func:`inspect_full_encrypted_search_receipt`.
+
+    A read-only diagnosis of an offline full-coverage search receipt,
+    locating the **first** point at which it fails to verify — only the
+    earliest problem is ever reported:
+
+    - ``ok``: the single source of truth, ``True`` exactly when the matching
+      offline verifier (:func:`verify_full_search_receipt` or
+      :func:`verify_full_encrypted_search_receipt`) returns ``True`` for the
+      same receipt;
+    - ``index``: the absolute index of the first mismatch for an ``"entry"``
+      code and for a ``"hits"`` code; ``None`` for ``"root"`` and for the
+      shared ``"proof"`` code, neither of which pinpoints a single entry;
+      ``None`` exactly when ``ok`` is ``True``;
+    - ``code``: one of ``"root"``, ``"entry"``, ``"proof"`` or ``"hits"``
+      describing that first failure — ``"root"`` says a zero-size snapshot
+      carries a root other than the canonical empty-tree root, ``"entry"``
+      says the entry's digest recomputed from its fields does not equal the
+      recorded ``entry_hash``, ``"proof"`` says the single shared compact
+      batch proof does not rebuild the recorded snapshot root, and ``"hits"``
+      (encrypted layer only) says the hit set recomputed with the
+      caller-supplied key differs from the recorded hits; ``None`` exactly
+      when ``ok`` is ``True``.
+
+    Reports are immutable, may be built positionally and compare by all three
+    fields. The success report is ``SearchReceiptReport(True, None, None)``.
+    A non-bool ``ok``, a non-string ``code`` or a non-integer, bool or
+    non-``None`` ``index`` raises TypeError; an unknown code string, a
+    successful report carrying a code or index, a failed report missing its
+    code, or a negative index raises ValueError.
+    """
+
+    ok: bool
+    index: int | None
+    code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if self.ok:
+            if self.index is not None or self.code is not None:
+                raise ValueError(
+                    "a successful report must carry index None and code None"
+                )
+            return
+        if self.code is None:
+            raise ValueError("a failed report must carry a code")
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _SEARCH_RECEIPT_CODES:
+            raise ValueError(
+                f"unknown search receipt code {self.code!r}; expected one of "
+                "'root', 'entry', 'proof', 'hits'"
+            )
+        if self.index is not None:
+            if not isinstance(self.index, int) or isinstance(self.index, bool):
+                raise TypeError("index must be an integer or None")
+            if self.index < 0:
+                raise ValueError("index must be non-negative")
+
+
+def _inspect_full_search_root_entries_proof(receipt: Any) -> SearchReceiptReport | None:
+    """Run the root/entry/proof checks shared by both full search receipts.
+
+    ``receipt`` has already been re-validated by the caller through the
+    matching frozen constructor (``FullSearchReceipt`` or
+    ``FullEncryptedSearchReceipt``), so only content is examined here, in the
+    fixed order both verifiers follow: the empty-snapshot root first, then
+    each entry digest in ascending index order, and only last the single
+    shared compact batch proof. Returns the first failing
+    :class:`SearchReceiptReport`, or ``None`` when all three checks pass.
+
+    A receipt carrying no items attests no content: a zero-size snapshot must
+    still carry the canonical empty-tree root (``"root"`` otherwise), while a
+    pure empty range of a non-empty snapshot carries no checkable evidence,
+    so its recorded root never participates and the receipt passes here.
+    """
+    if not receipt.items:
+        if receipt.size == 0:
+            if not hmac.compare_digest(
+                receipt.root, _hash_parts(receipt.hash_name, _EMPTY_DOMAIN)
+            ):
+                return SearchReceiptReport(False, None, _SEARCH_RECEIPT_CODE_ROOT)
+        # An empty range of a non-empty snapshot attests no content; the
+        # recorded root cannot be checked without evidence.
+        return None
+
+    for entry in receipt.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=receipt.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return SearchReceiptReport(
+                False, entry.index, _SEARCH_RECEIPT_CODE_ENTRY
+            )
+
+    indices = tuple(entry.index for entry in receipt.items)
+    entry_hashes = tuple(entry.entry_hash for entry in receipt.items)
+    if not verify_batch_inclusion(
+        indices,
+        entry_hashes,
+        receipt.size,
+        receipt.root,
+        receipt.proof,
+        hash_name=receipt.hash_name,
+    ):
+        return SearchReceiptReport(False, None, _SEARCH_RECEIPT_CODE_PROOF)
+    return None
+
+
+def inspect_full_search_receipt(receipt: Any) -> SearchReceiptReport:
+    """Diagnose a :class:`FullSearchReceipt` offline, without holding the log.
+
+    The read-only diagnostic counterpart of
+    :func:`verify_full_search_receipt`: it introduces no new signing or wire
+    domain, never mutates the receipt and, instead of a bare bool, returns a
+    frozen :class:`SearchReceiptReport` locating the **first** mismatch — a
+    genuine receipt reports ``SearchReceiptReport(True, None, None)`` and
+    only the earliest problem is ever reported. The fixed examination order
+    is:
+
+    1. the empty-snapshot root: when ``size == 0`` the recorded root must be
+       the canonical empty-tree root, otherwise ``"root"`` is reported with
+       no position; a pure empty range of a non-empty snapshot
+       (``items == ()`` and ``proof == ()``) carries no checkable evidence,
+       so its recorded root never participates and it passes this stage;
+    2. the items in ascending absolute index order: for each entry the
+       digest is recomputed from the entry's fields via
+       :func:`entry_digest` and compared with the recorded ``entry_hash`` —
+       a mismatch reports ``"entry"`` at that entry's absolute index;
+    3. last of all the single shared compact batch proof, which must rebuild
+       the snapshot root via :func:`verify_batch_inclusion` — a mismatch
+       reports ``"proof"`` with no position, since the shared proof
+       pinpoints no single entry.
+
+    The diagnosis performs exactly the same checks as
+    :func:`verify_full_search_receipt` in the same order, so ``report.ok``
+    is ``True`` exactly when that verifier returns ``True`` for the same
+    receipt, and anything the verifier raises propagates unchanged: a
+    non-:class:`FullSearchReceipt` argument raises TypeError, while an
+    unknown hash algorithm, a digest of the wrong width, incomplete
+    coverage, non-ascending items, an illegal range or size, and a proof
+    node count that does not fit the listed indices and ``size`` —
+    including the same violations written past the frozen constructor —
+    raise TypeError or ValueError exactly as :class:`FullSearchReceipt`
+    construction and :func:`verify_batch_inclusion` do. A merely tampered
+    receipt is reported, never raised. The call is read-only and
+    deterministic.
+    """
+    if not isinstance(receipt, FullSearchReceipt):
+        raise TypeError("receipt must be a FullSearchReceipt")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = FullSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    failure = _inspect_full_search_root_entries_proof(checked)
+    if failure is not None:
+        return failure
+    return SearchReceiptReport(True, None, None)
+
+
+def _first_hits_mismatch_index(recomputed: tuple, recorded: tuple) -> int:
+    """First absolute index where two ascending hit tuples disagree.
+
+    The hit sets are compared item by item in ascending order: at the first
+    position where they differ, the smaller of the two current indices is
+    the lowest absolute index present in one set but not the other; when one
+    tuple is a strict prefix, the longer tuple's next index is the answer.
+    """
+    for position in range(max(len(recomputed), len(recorded))):
+        if position >= len(recomputed):
+            return recorded[position]
+        if position >= len(recorded):
+            return recomputed[position]
+        if recomputed[position] != recorded[position]:
+            return min(recomputed[position], recorded[position])
+    raise ValueError("hit tuples are equal; there is no mismatch")
+
+
+def inspect_full_encrypted_search_receipt(
+    receipt: Any, key: Any
+) -> SearchReceiptReport:
+    """Diagnose a :class:`FullEncryptedSearchReceipt` offline, without the log.
+
+    The read-only diagnostic counterpart of
+    :func:`verify_full_encrypted_search_receipt`: it introduces no new
+    signing or wire domain, never mutates the receipt and, instead of a bare
+    bool, returns a frozen :class:`SearchReceiptReport` locating the
+    **first** mismatch — a genuine receipt reports
+    ``SearchReceiptReport(True, None, None)`` and only the earliest problem
+    is ever reported. The fixed examination order is:
+
+    1. the empty-snapshot root: when ``size == 0`` the recorded root must be
+       the canonical empty-tree root, otherwise ``"root"`` is reported with
+       no position; a pure empty range (``items == ()``, ``proof == ()`` and
+       ``hits == ()``) of a non-empty snapshot carries no checkable
+       evidence, so its recorded root never participates and it passes this
+       stage;
+    2. the items in ascending absolute index order: for each entry the
+       digest is recomputed from the entry's fields via
+       :func:`entry_digest` and compared with the recorded ``entry_hash`` —
+       a mismatch reports ``"entry"`` at that entry's absolute index;
+    3. then the single shared compact batch proof, which must rebuild the
+       snapshot root via :func:`verify_batch_inclusion` — a mismatch reports
+       ``"proof"`` with no position, since the shared proof pinpoints no
+       single entry;
+    4. only for the encrypted layer, and last of all, the hit sets: every
+       sealed entry is attempted with ``key`` via :func:`decrypt_entry`
+       (a plain entry, an envelope sealed under another key or any
+       decryption failure simply does not count as a hit, never an error),
+       and the recomputed ascending hit indices are compared item by item
+       with the recorded ``hits`` — the first disagreement reports
+       ``"hits"`` at the lowest absolute index where the two ascending hit
+       sets differ (the smaller differing index, or the longer tuple's next
+       index when one is a strict prefix).
+
+    The diagnosis performs exactly the same checks as
+    :func:`verify_full_encrypted_search_receipt` in the same order, so
+    ``report.ok`` is ``True`` exactly when that verifier returns ``True``
+    for the same receipt and key, and anything the verifier raises
+    propagates unchanged: a non-:class:`FullEncryptedSearchReceipt`
+    argument or a non-``bytes`` ``key`` raises TypeError, while a key that
+    is not 32 bytes, an unknown hash algorithm, a digest of the wrong
+    width, incomplete coverage, non-ascending items, an illegal range,
+    size or hit index, and an illegal shared-proof structure — including
+    the same violations written past the frozen constructor — raise
+    ValueError exactly as :class:`FullEncryptedSearchReceipt`
+    construction, :func:`_check_key` and :func:`verify_batch_inclusion`
+    do. A merely tampered receipt (including a tampered recorded hit set)
+    is reported, never raised. The call is read-only and deterministic.
+    """
+    if not isinstance(receipt, FullEncryptedSearchReceipt):
+        raise TypeError("receipt must be a FullEncryptedSearchReceipt")
+    _check_key(key)
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = FullEncryptedSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.query,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+        receipt.hits,
+    )
+    failure = _inspect_full_search_root_entries_proof(checked)
+    if failure is not None:
+        return failure
+
+    recomputed_hits: list[int] = []
+    for entry in checked.items:
+        try:
+            plaintext = decrypt_entry(entry, key, hash_name=checked.hash_name)
+        except ValueError:
+            # A plain entry, an envelope sealed under another key or any
+            # decryption failure is simply not a hit, never an error.
+            continue
+        if hmac.compare_digest(plaintext, checked.query):
+            recomputed_hits.append(entry.index)
+    recomputed = tuple(recomputed_hits)
+    if recomputed != checked.hits:
+        return SearchReceiptReport(
+            False,
+            _first_hits_mismatch_index(recomputed, checked.hits),
+            _SEARCH_RECEIPT_CODE_HITS,
+        )
+    return SearchReceiptReport(True, None, None)
 
 
 def _encode_u64(value: int, name: str) -> bytes:

@@ -215,6 +215,131 @@ verify_signed_full_search_receipt(restored, public_key)   # True：无需持有�
   空快照照常签发、往返与核验；内容被改的包照常往返、核验判 `False`。两个入口均
   为只读且确定
 
+### 按内容区间检索
+
+`find` 解决精确内容定位，`range_search` 在其同一保留段语义上新增按
+`Entry.payload` **原始字节序**的区间检索：命中满足左闭右开
+`left <= payload < right`（无符号字节的字典序），返回升序绝对索引元组。边界
+只收 `bytes` 或 `str`（`str` 按既有 UTF-8 规范编码）；左右边界相等恒为空结果，
+左边界大于右边界抛 `ValueError`，边界类型错抛 `TypeError`：
+
+```python
+for p in ("apple", "apricot", "banana", "cherry"):
+    log.append(p)
+log.range_search(b"ap", b"b")          # (0, 1)：左闭右开，banana 不含
+log.range_search("ap", "b")            # 同上：str 按 UTF-8 规范化，与 bytes 等价
+log.range_search(b"banana", b"banana") # ()：空内容区间恒为空
+log.range_search(b"c", b"a")           # ValueError：左边界大于右边界
+log.range_search(b"a", b"z", 1, 3)     # (1, 2)：可再叠加半开绝对索引范围 [1, 3)
+```
+
+- 签名为 `range_search(left, right, start=None, stop=None) -> tuple[int, ...]`，
+  索引范围的默认值、半开边界与越界规则与 `find` 完全相同（默认
+  `[retain_from, len(log))`，显式边界须为非 `bool` 整数且满足
+  `retain_from <= start <= stop <= len(log)`，类型非法抛 `TypeError`、越界抛
+  `ValueError`）
+- 比较只发生在存储的原始字节上：加密条目以 `Entry.payload` 中密封的封装字节
+  参与比较，**查询不解密、不改写条目**，不改变链、认证状态、Merkle 根与任何
+  既有精确查询结果；空日志、空区间、完全无命中都返回确定的 `()`；调用只读
+
+### 按内容区间检索的完整离线回执
+
+`range_search_receipt` 把同一次区间查询打包成脱离日志也能核验完整性的冻结
+`RangeSearchReceipt`：除快照尺寸、Merkle 根、左右边界与索引范围外，携带索引
+范围内**每一个**条目、一份覆盖它们的共享紧凑批量证明，以及签发时算出的命中
+索引元组。核验方先认证条目真伪，再用**同样的原始字节比较**自行重算命中集，
+重算结果必须与记录的 `hits` **逐元组相等**——删命中、伪造命中或伪造空命中都
+是核验失败，无法通过：
+
+```python
+receipt = log.range_search_receipt(b"ap", b"b")     # 范围默认 [retain_from, size)，size 默认当前长度
+receipt.left / receipt.right                        # b"ap" / b"b"：规范化后的字节边界
+[e.index for e in receipt.items]                    # [0, 1, 2, ...]：范围内逐条列出，证明全覆盖
+receipt.hits                                        # (0, 1)：left <= payload < right 的绝对索引
+verify_range_search_receipt(receipt)                # True：无需持有日志即可离线核验
+log.range_search_receipt(b"ap", b"b", 1, 3, size=3) # 半开索引范围 [1, 3) + 前 3 条快照
+```
+
+回执为冻结的
+`RangeSearchReceipt(version=1, hash_name, size, root, left, right, start, stop,
+items, proof, hits)`，支持位置构造、按全部十一个字段相等：`items` 恰为
+`start .. stop-1` 逐条各一份（覆盖不全、重复或乱序在构造端即抛
+`ValueError`），`proof` 是与 `batch_inclusion_proof` 同布局的共享紧凑批量证明，
+`hits` 为严格升序、无重复且全部位于 `[start, stop)` 的绝对索引。左右边界只收
+`bytes` 或 `str`（后者按 UTF-8 规范化）；其余二进制字段——`root`、每个条目的
+`payload` / `previous_hash` / `entry_hash` 与每个共享证明节点——只接受精确的
+`bytes`，`bytearray` 与 `memoryview` 抛 `TypeError`。索引范围默认
+`[retain_from, size)`，`size` 默认当前长度且快照须可重建；空索引范围与空快照
+照样签发与核验，此时 `items`、`proof`、`hits` 均为空元组。边界类型错抛
+`TypeError`、左大于右抛 `ValueError`，范围或尺寸类型非法抛 `TypeError`、越界
+或快照不可重建抛 `ValueError`。签发只读、可重复，不改变条目、`head`、认证
+状态、Merkle 根、证明或任何既有查询结果。
+
+离线核验逐条重算 `entry_digest`，用共享批量证明（`verify_batch_inclusion`）
+核对快照根，再对每个已认证条目执行 `left <= entry.payload < right` 重算命中集
+并与 `hits` 全等比较；加密条目不解密，以封装字节比较。结构合法但条目内容、
+证明、根不符或命中集不一致返回 `False`；入参不是 `RangeSearchReceipt` 抛
+`TypeError`，证明节点数与所列索引及 `size` 不符抛 `ValueError`，绕过冻结
+构造器写入的非法字段在核验端同样复验。
+
+回执提供稳定的规范字节编解码，重复编码逐字节一致：
+
+```python
+data = encode_range_search_receipt(receipt)
+restored = decode_range_search_receipt(data)
+encode_range_search_receipt(restored) == data   # True：逐字节确定
+verify_range_search_receipt(restored)           # True
+```
+
+编码以魔数 `b"auditchain/range-search/v1\0"`（含 NUL 结尾）开头，`version`
+恒为 1，随后严格按字段顺序写 `hash_name`（UTF-8 blob）、`size`、`root` blob、
+`left` blob、`right` blob、`start`、`stop`、条目计数及各条目（`Entry.index`、
+三个 blob，写法同 `encode_full_search_receipt`）、共享证明节点计数及各摘要
+blob，最后是命中索引计数与每个命中的裸 u64 索引；整数均为 8 字节无符号大端，
+blob 为 u64 长度前缀加原始字节。`encode_range_search_receipt` 只接受
+`RangeSearchReceipt` 并复验全部字段与证明节点计数；`decode_range_search_receipt`
+只接受精确 `bytes`（非 `bytes`，含 `bytearray` / `memoryview`，抛
+`TypeError`），魔数、版本、非法 UTF-8、未知算法、**截断、尾随字节、越界
+索引、重复条目、错误摘要宽度、不完整覆盖**、证明节点数不符或命中索引重复/
+越界/乱序均抛 `ValueError`；结构合法但内容被篡改的回执仍可往返，仅核验判
+`False`。
+
+#### 区间检索回执的可信签名封装（Ed25519）
+
+`signed_range_search_receipt` 在一个不可变 `SignedRangeSearchReceipt` 中同时
+打包 `range_search_receipt` 的全覆盖回执与 `sign_root` 对**同一快照**签发的
+`SignedRoot` 检查点；签名绑定回执全部字段与快照根（经回执内 `root` 与检查点
+快照一致性共同约束），离线接收方仅凭预置信任的 32 字节 Ed25519 公钥即可一次
+确认整个区间、完整命中集、快照 Merkle 根与链头均由日志持有者签发，不引入新
+签名原文：
+
+```python
+bundle = log.signed_range_search_receipt(b"ap", b"b", seed)
+verify_signed_range_search_receipt(bundle, public_key)       # True
+verify_signed_range_search_receipt(bundle, other_public_key) # False：不匹配不抛异常
+data = encode_signed_range_search_receipt(bundle)
+restored = decode_signed_range_search_receipt(data)
+encode_signed_range_search_receipt(restored) == data         # True：逐字节确定
+verify_signed_range_search_receipt(restored, public_key)     # True
+```
+
+- 包为冻结的 `SignedRangeSearchReceipt(receipt: RangeSearchReceipt,
+  checkpoint: SignedRoot)`，两部分必须描述同一快照（`hash_name`、`size`、
+  `root` 相等），容器类型错抛 `TypeError`、快照不一致抛 `ValueError`
+- `AuditLog.signed_range_search_receipt(left, right, private_key, start=None,
+  stop=None, size=None)` 先构造区间回执再 `sign_root`，全程只读、可重复；
+  失败在构造前抛出，不改日志、不产生半成品签名
+- `verify_signed_range_search_receipt(bundle, public_key)` 三项皆真才返回
+  `True`：区间回执核验为真、检查点签名与公钥相符、两部分为同一快照；
+  **签名或公钥不匹配、内容被改均返回 `False`，不抛异常**；入参类型、嵌套
+  结构或密钥宽度问题按各既有入口抛 `TypeError` / `ValueError`
+- 字节流以魔数 `b"auditchain/signed-range-search/v1\0"` 开头，随后依次为
+  `version`（恒为 1）、receipt blob 与 checkpoint blob，两个 blob 分别就是
+  `encode_range_search_receipt` 与 `encode_signed_root` 的完整规范字节；
+  解码精确消费且禁止尾随，`bytearray` / `memoryview` 抛 `TypeError`，魔数、
+  版本、截断、尾随或任一嵌套格式非法抛 `ValueError`；签名不匹配的结构合法
+  包照常往返、核验判 `False`
+
 ### 加密追加（AES-256-GCM）
 
 `encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但
@@ -4303,6 +4428,17 @@ python3 -m auditchain
     前缀的项（失败均不改索引）。候选命中后仍以查询密钥解密并逐字节比较 `P`，
     认证失败或摘要碰撞均不误命中；普通条目或不同密钥的条目不命中，合法但错误的
     密钥返回 `()`，查询为只读
+  - `range_search(left, right, start=None, stop=None)` — 在保留段内按
+    `Entry.payload` **原始字节序**（无符号字节字典序）检索左闭右开内容区间
+    `[left, right)`，返回满足 `left <= payload < right` 的绝对索引升序元组，
+    无命中为 `()`。`left` / `right` 只收 `bytes` 或 `str`（后者按 UTF-8
+    规范化），其他类型抛 `TypeError`；左右边界相等恒返回 `()`，左边界大于
+    右边界抛 `ValueError`；索引范围参数的默认值、半开 `[start, stop)` 边界
+    与越界规则与 `find` 完全相同（默认 `[retain_from, len(log))`，显式边界
+    须满足 `retain_from <= start <= stop <= len(log)`，类型非法抛
+    `TypeError`、越界抛 `ValueError`）。加密条目只以密封封装的原始字节参与
+    比较，查询不解密、不改写条目，也不改变链、认证状态、Merkle 根或既有
+    精确查询结果；查询为只读
   - `search_receipt(query, start=None, stop=None, size=None)` — 把一次按内容查找
     固化为可离线核验的冻结 `SearchReceipt`：在与 `find` 相同的半开范围
     `[start, stop)`（默认 `[retain_from, size)`）内查找，`size` 默认当前长度且
@@ -4345,6 +4481,24 @@ python3 -m auditchain
     长度不符抛 `ValueError`）；范围或尺寸类型错抛 `TypeError`、越界或快照
     不可重建抛 `ValueError`；异钥追加的条目与普通条目不命中；签发为只读、
     可重复调用，不改变条目、`head`、认证状态、密文定位索引、Merkle 根或证明
+  - `range_search_receipt(left, right, start=None, stop=None, size=None)` —
+    把一次内容区间检索固化为可离线核验**完整性**的冻结 `RangeSearchReceipt`：
+    在半开索引范围 `[start, stop)`（默认 `[retain_from, size)`）内，`size`
+    默认当前长度且快照须可重建；回执记录算法、快照尺寸与 Merkle 根、规范化
+    左右字节边界、索引范围、该范围内**每一个**条目（按绝对索引严格升序逐条
+    各一份）、一份覆盖全部条目的共享紧凑批量证明，以及
+    `left <= payload < right`（原始字节序，加密条目以密封封装字节参与、不解密）
+    的升序命中索引 `hits`（空索引范围与空快照时三者均为 `()`）。`left` /
+    `right` 只收 `bytes` 或 `str`（后者按 UTF-8 规范化），其他类型抛
+    `TypeError`；边界相等给出空命中集，左大于右抛 `ValueError`；范围或尺寸
+    类型错抛 `TypeError`、越界或快照不可重建抛 `ValueError`；签发为只读、
+    可重复调用，不改变条目、`head`、认证状态、Merkle 根、证明或既有查询结果
+  - `signed_range_search_receipt(left, right, private_key, start=None,
+    stop=None, size=None)` — 先构造 `range_search_receipt(left, right, start,
+    stop, size)`，再对同一快照 `sign_root(private_key, size)`，打包为冻结
+    `SignedRangeSearchReceipt(receipt, checkpoint)`；范围默认保留段、`size`
+    默认当前长度，两部分必须描述同一快照。全程只读、同状态同种子重复签发
+    逐字节相同，失败在构造前抛出、不改日志，且不引入新签名原文
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
   - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于
@@ -4700,6 +4854,17 @@ python3 -m auditchain
   `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
   版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序或命中索引非法（含绕过
   冻结构造器写入的字段）抛 `ValueError`；调用只读
+- `verify_range_search_receipt(receipt)` — 无需持有日志即可验证
+  `RangeSearchReceipt`：逐条重算每个所列条目的 `entry_digest`、用共享紧凑
+  批量证明核对记录的快照根（空快照只认规范空树根），再对每个已认证条目执行
+  与 `range_search` 相同的原始字节区间判定 `left <= entry.payload < right`
+  （加密条目不解密，以密封封装字节参与）；重算出的命中集与记录的 `hits`
+  逐项一致且真实性成立才返回 `True`——删命中、伪造命中或伪造空命中都是核验
+  失败而非静默遗漏。空索引范围（`size > 0` 而条目、证明、命中皆空）不携带
+  可核对证据、记录的快照根不参与比对，空快照则只接受规范空树根；篡改的内容、
+  证明或根一律返回 `False`。入参不是 `RangeSearchReceipt` 抛 `TypeError`；
+  版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序、证明节点数或命中索引
+  非法（含绕过冻结构造器写入的字段）抛 `ValueError`；调用只读
 - `inspect_full_search_receipt(receipt)` —
   `verify_full_search_receipt` 的只读诊断对应物，无需持有日志、只读且确定，
   不新增签名原文与线格式、不做报告编解码；收一份冻结 `FullSearchReceipt`
@@ -4898,6 +5063,18 @@ python3 -m auditchain
   `FullEncryptedSearchReceipt` / `verify_signed_root` 的既有异常
   （`TypeError` / `ValueError`），密钥或公钥长度非 32 字节抛 `ValueError`；
   调用只读
+- `verify_signed_range_search_receipt(bundle, public_key)` — 凭预先信任的 32
+  字节 Ed25519 公钥离线验证 `AuditLog.signed_range_search_receipt` 签发的
+  `SignedRangeSearchReceipt` 可信区间检索回执交付包，无需持有日志：先调用
+  `verify_range_search_receipt`（重验范围内每一个条目的摘要、用共享批量证明
+  核对快照根，并以原始字节区间判定重算完整命中集与记录 `hits` 逐项一致）与
+  `verify_signed_root`（核验检查点签名），并要求两部分的 `hash_name`、`size`、
+  `root` 一致，三者皆为真才返回 `True`。删命中、伪造命中、伪造空命中、公钥
+  不受信任、两部分不一致，或条目 / 证明 / 边界 / 根 / 命中 / 签名被改均返回
+  `False` 而不抛异常。入参不是 `SignedRangeSearchReceipt`（含绕过构造器的
+  容器字段类型错）或公钥不是 `bytes` 抛 `TypeError`；嵌套的回执或检查点
+  结构非法时沿用 `RangeSearchReceipt` / `verify_signed_root` 的既有异常
+  （`TypeError` / `ValueError`），公钥长度非 32 字节抛 `ValueError`；调用只读
 - `verify_signed_prune(item, public_key)` — 凭预先信任的 32 字节 Ed25519 公钥
   离线验证 `AuditLog.sign_prune` 签发的 `SignedPrune` 裁剪授权，无需持有日志：
   先用 `verify_signed_root` 校验检查点签名，再要求回执与检查点描述同一前缀——
@@ -5373,6 +5550,21 @@ python3 -m auditchain
   `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，空范围与空快照
   照常往返与核验（判定口径照旧），结构合法但签名、内容或命中不匹配仍可
   往返（验包返回 `False`）；两个入口均为只读且确定
+- `encode_signed_range_search_receipt(bundle)` /
+  `decode_signed_range_search_receipt(data)` — 可信区间检索回执交付包的
+  规范二进制编码与解码，使 `SignedRangeSearchReceipt` 可落盘、跨进程传输
+  后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：字节流以魔数
+  `b"auditchain/signed-range-search/v1\0"`（含 NUL 结尾）开头，严格依次写
+  version=1（u64）、receipt blob、checkpoint blob，顺序固定、禁止换序与
+  尾随；两个 blob 分别是既有 `encode_range_search_receipt` 与
+  `encode_signed_root` 的完整规范字节，解码精确消费并分别交给既有解码器。
+  前者只接受 `SignedRangeSearchReceipt`（容器字段类型错抛 `TypeError`，
+  两部分快照不一致抛 `ValueError`，嵌套错误沿用既有编码器），后者只接受
+  精确的 `bytes`（拒绝 `bytearray` / `memoryview`，抛 `TypeError`）；魔数、
+  版本、截断、尾随、blob 长度越界、两部分快照不一致或任一嵌套格式非法抛
+  `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，空索引范围与
+  空快照照常往返与核验，结构合法但签名或内容不匹配仍可往返（验包返回
+  `False`）；两个入口均为只读且确定
 - `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —
   可信跨快照一致性凭据的规范二进制编码与解码，使 `SignedConsistency` 可落盘、
   跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数
@@ -5823,6 +6015,25 @@ python3 -m auditchain
   UTF-8、未知算法、截断、尾随、长度越界、范围或顺序非法、覆盖不全、摘要宽度
   不符、证明节点数与所列条目及 `size` 不相称、命中索引重复或乱序或越出记录
   范围均抛 `ValueError`
+- `encode_range_search_receipt(receipt)` /
+  `decode_range_search_receipt(data)` — 区间检索完整回执的规范二进制编码与
+  解码，使 `RangeSearchReceipt` 可落盘、跨进程恢复后继续由
+  `verify_range_search_receipt` 离线核验（两个入口均只读且确定，重复编码
+  逐字节一致）：魔数 `b"auditchain/range-search/v1\0"`（含 NUL 结尾）开头，
+  后接恒为 1 的 `version`，随后严格按回执字段顺序写 `hash_name`（UTF-8
+  blob）、`size`、`root` blob、`left` blob、`right` blob、`start`、`stop`
+  与条目计数；每个条目依次写 `Entry.index`、`payload` blob、
+  `previous_hash` blob、`entry_hash` blob（与 `encode_full_search_receipt`
+  的条目写法相同），再写共享证明节点计数及各摘要 blob，最后写命中索引
+  计数及每个命中的裸 u64 索引；整数为 u64 大端，blob 为 u64 长度前缀加
+  原始字节，禁止换序与尾随。解码精确消费全部字节，恢复对象冻结、按全部
+  字段与原件相等、重编码逐字节相同；空索引范围与空快照照常往返，内容、
+  证明、根或命中被篡改的回执仍可往返、仅核验判 `False`。前者只接受
+  `RangeSearchReceipt` 并复验全部字段与证明节点计数，后者只接受精确的
+  `bytes`（非 `bytes`，含 `bytearray` / `memoryview`，抛 `TypeError`）；
+  魔数或版本不符、非法 UTF-8、未知算法、截断、尾随字节、长度越界、越界
+  索引、重复条目、错误摘要宽度、不完整覆盖、证明节点数不相称，或命中
+  索引重复、乱序、越出记录范围均抛 `ValueError`
 - `encode_batch_inclusion_proof(credential)` / `decode_batch_inclusion_proof(data)` —
   紧凑批量包含证明凭据 `BatchInclusionProof` 的规范二进制编码与解码：魔数
   `b"auditchain/batch-inclusion/v1\0"` 开头，后接恒为 1 的 version，随后严格按凭据

@@ -21,6 +21,7 @@ SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / RetentionTransition /
 IntegrityIssue / IntegrityReport /
+JsonSearchReceipt /
 ContinuationChainReport / AnchoredContinuationChain /
 StageAnchoredContinuationChain /
 AnchorSet /
@@ -36,6 +37,7 @@ verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
 verify_range_search_receipt /
+verify_json_search_receipt /
 verify_signed_range_search_receipt /
 inspect_full_search_receipt /
 inspect_full_encrypted_search_receipt /
@@ -127,6 +129,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
@@ -159,6 +163,7 @@ __all__ = [
     "InclusionProof",
     "IntegrityIssue",
     "IntegrityReport",
+    "JsonSearchReceipt",
     "MerkleFrontier",
     "PrefixSearchReceipt",
     "PruneReceipt",
@@ -209,6 +214,7 @@ __all__ = [
     "decode_full_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
+    "decode_json_search_receipt",
     "decode_merkle_frontier",
     "decode_prefix_search_receipt",
     "decode_prune_receipt",
@@ -271,6 +277,7 @@ __all__ = [
     "encode_full_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
+    "encode_json_search_receipt",
     "encode_merkle_frontier",
     "encode_prefix_search_receipt",
     "encode_prune_receipt",
@@ -358,6 +365,7 @@ __all__ = [
     "verify_full_encrypted_search_receipt",
     "verify_full_search_receipt",
     "verify_inclusion",
+    "verify_json_search_receipt",
     "verify_range_search_receipt",
     "verify_prefix_search_receipt",
     "verify_retention_chain",
@@ -469,6 +477,16 @@ _RANGE_SEARCH_VERSION = 1
 # comparison over the authenticated entries yields the complete hit set.
 _PREFIX_SEARCH_MAGIC = b"auditchain/prefix-search/v1\0"
 _PREFIX_SEARCH_VERSION = 1
+# Binary framing of encode_json_search_receipt / decode_json_search_receipt:
+# same u64/blob rules as the prefix search receipt, persisting an RFC 6901
+# JSON Pointer equality query: the canonical pointer string and a typed
+# scalar query replace the single prefix blob, and the receipt still carries
+# every entry of the searched half-open range plus one shared compact batch
+# inclusion proof, so an offline verifier's own strict JSON parse, pointer
+# resolution and type-separated scalar comparison over the authenticated
+# entries yields the complete hit set.
+_JSON_SEARCH_MAGIC = b"auditchain/json-search/v1\0"
+_JSON_SEARCH_VERSION = 1
 # Binary framing of encode_signed_range_search_receipt /
 # decode_signed_range_search_receipt: same u64/blob rules, bundling a range
 # receipt blob with a 64-byte Ed25519 signature over a domain-separated
@@ -1252,6 +1270,175 @@ def _encrypted_locator_digest(key: bytes, payload: bytes, hash_name: str) -> byt
     plaintext nor the key is stored in the index.
     """
     return hmac.new(key, _ENC_LOCATE_DOMAIN + payload, hash_name).digest()
+
+
+# --- RFC 6901 JSON Pointer field indexing ---------------------------------
+
+# Query value type tags persisted in a JsonSearchReceipt, keeping the JSON
+# scalar kinds apart (True is not 1, "" is not the string "null", ...).
+_JSON_TAG_STRING = 0
+_JSON_TAG_INTEGER = 1
+_JSON_TAG_FLOAT = 2
+_JSON_TAG_TRUE = 3
+_JSON_TAG_NULL = 4
+_JSON_TAG_FALSE = 5
+
+# Sentinel for "this payload yields no queryable scalar at the pointer".
+_JSON_MISSING = object()
+
+
+class _JsonDuplicateMember(ValueError):
+    """Internal: a JSON object repeated a member name."""
+
+
+def _check_json_value(value: Any) -> None:
+    """Validate a find_json / json_search_receipt scalar query value."""
+    if isinstance(value, bool) or isinstance(value, str) or value is None:
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return
+    raise TypeError("value must be str, int, float, bool or None")
+
+
+def _parse_json_pointer(pointer: Any) -> tuple[str, ...]:
+    """Parse an RFC 6901 JSON Pointer into its tuple of unescaped tokens.
+
+    The empty string is the root pointer and yields ``()``. A non-``str``
+    pointer raises TypeError; a non-empty pointer that does not start with
+    ``/`` or a reference token carrying an escape other than ``~0`` /
+    ``~1`` raises ValueError.
+    """
+    if not isinstance(pointer, str):
+        raise TypeError("pointer must be a string")
+    if pointer == "":
+        return ()
+    if not pointer.startswith("/"):
+        raise ValueError("a non-empty JSON Pointer must start with '/'")
+    tokens: list[str] = []
+    for raw in pointer.split("/")[1:]:
+        if "~" not in raw:
+            tokens.append(raw)
+            continue
+        decoded: list[str] = []
+        index = 0
+        while index < len(raw):
+            char = raw[index]
+            if char == "~":
+                if index + 1 >= len(raw) or raw[index + 1] not in "01":
+                    raise ValueError("JSON Pointer escape must be '~0' or '~1'")
+                decoded.append("~" if raw[index + 1] == "0" else "/")
+                index += 2
+            else:
+                decoded.append(char)
+                index += 1
+        tokens.append("".join(decoded))
+    return tuple(tokens)
+
+
+def _json_pointer_canonical(tokens: tuple[str, ...]) -> str:
+    """Canonical RFC 6901 spelling of parsed pointer tokens."""
+    if not tokens:
+        return ""
+    return "".join(
+        "/" + token.replace("~", "~0").replace("/", "~1") for token in tokens
+    )
+
+
+def _json_reject_duplicates(pairs: Any) -> dict:
+    document: dict = {}
+    for key, value in pairs:
+        if key in document:
+            raise _JsonDuplicateMember(f"duplicate JSON object member {key!r}")
+        document[key] = value
+    return document
+
+
+def _json_reject_constant(value: str) -> Any:
+    # RFC 8259 has no NaN/Infinity; Python's json accepts them by default.
+    raise ValueError(f"{value} is not valid JSON")
+
+
+def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
+    """Resolve parsed pointer tokens against strict UTF-8 JSON bytes.
+
+    Returns the addressed scalar, or the ``_JSON_MISSING`` sentinel when
+    the payload is not strict UTF-8 JSON, repeats an object member name at
+    any depth, carries a non-finite number, the pointer traverses a missing
+    member/element or a non-container, indexes an array with a non-numeric
+    (``-`` included), leading-zero or out-of-range token, or the addressed
+    value is an object or array rather than a scalar.
+    """
+    try:
+        text = payload.decode("utf-8")
+        document = json.loads(
+            text,
+            object_pairs_hook=_json_reject_duplicates,
+            parse_constant=_json_reject_constant,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _JSON_MISSING
+    current = document
+    for token in tokens:
+        if isinstance(current, dict):
+            if token not in current:
+                return _JSON_MISSING
+            current = current[token]
+        elif isinstance(current, list):
+            # "-" addresses the nonexistent append position; array tokens
+            # are plain decimal indices with no leading zeroes (RFC 6901).
+            if (
+                not token
+                or token == "-"
+                or any(char not in "0123456789" for char in token)
+                or (len(token) > 1 and token[0] == "0")
+            ):
+                return _JSON_MISSING
+            index = int(token)
+            if index >= len(current):
+                return _JSON_MISSING
+            current = current[index]
+        else:
+            return _JSON_MISSING
+    if current is None or isinstance(current, (str, bool, int, float)):
+        return current
+    return _JSON_MISSING
+
+
+def _json_scalar_matches(found: Any, value: Any) -> bool:
+    """Whether an addressed JSON scalar equals a query, per JSON kind.
+
+    Strings, booleans and null only match their own kind; ints and floats
+    are both JSON numbers and compare by numeric value (a JSON ``true`` is
+    never the number 1).
+    """
+    if value is None:
+        return found is None
+    if isinstance(value, bool):
+        return isinstance(found, bool) and found == value
+    if isinstance(value, str):
+        return isinstance(found, str) and found == value
+    # int and float are both JSON numbers: numeric equality across the two.
+    return (
+        isinstance(found, (int, float))
+        and not isinstance(found, bool)
+        and found == value
+    )
+
+
+def _json_entry_matches(
+    payload: bytes, tokens: tuple[str, ...], value: Any
+) -> bool:
+    """Whether one stored payload is a find_json hit."""
+    if payload.startswith(_ENC_MAGIC):
+        # An AES-256-GCM envelope is never plain JSON; it takes no part.
+        return False
+    found = _json_scalar_at(payload, tokens)
+    return found is not _JSON_MISSING and _json_scalar_matches(found, value)
+
 
 
 def _auth_tag(stage: int, entry_hash: bytes, key: bytes, hash_name: str) -> bytes:
@@ -2267,6 +2454,168 @@ class PrefixSearchReceipt:
             entry.index
             for entry in self.items
             if entry.payload.startswith(self.prefix)
+        )
+
+
+@dataclass(frozen=True)
+class JsonSearchReceipt:
+    """Offline completeness receipt for an RFC 6901 JSON-field scalar search.
+
+    Issued by :meth:`AuditLog.json_search_receipt` and verified entirely
+    offline by :func:`verify_json_search_receipt`:
+
+    - ``version``: receipt format version, always ``1``,
+    - ``hash_name``: hash algorithm of the log that issued the receipt,
+    - ``size``: number of entries in the snapshot the receipt refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``pointer``: the canonical RFC 6901 JSON Pointer (the empty string
+      addresses the whole document), re-derived at construction,
+    - ``value``: the scalar query, exactly one of ``str``, ``int``,
+      ``float`` (finite), ``bool`` or ``None``; JSON kinds are kept apart
+      and numbers compare by numeric value,
+    - ``start`` / ``stop``: the half-open absolute-index range the search
+      covered, satisfying ``0 <= start <= stop <= size``,
+    - ``items``: every :class:`Entry` of the searched range, one per
+      absolute index in strictly ascending order — exactly the indices
+      ``start, start + 1, ..., stop - 1``, so an incomplete coverage, a
+      duplicate or an out-of-order entry is rejected at construction,
+    - ``proof``: the single shared compact batch inclusion proof (as
+      produced by :meth:`AuditLog.batch_inclusion_proof`) covering all of
+      ``items`` within the snapshot.
+
+    Because the receipt carries the whole searched range, once the entries
+    are authenticated against the snapshot root, the verifier's own strict
+    UTF-8 JSON parse, duplicate-member rejection, pointer resolution and
+    type-separated scalar comparison over those authenticated entries
+    yields the complete hit set — available as :attr:`hits` — so a missing
+    hit cannot be concealed and an empty hit set cannot be forged without
+    dropping or altering the covered entry that would have hit. Entries
+    that are not strict JSON, repeat a member name, miss the field, address
+    a non-scalar or carry an AES-256-GCM envelope simply do not hit;
+    nothing is decrypted and no key is needed. An empty range (and any
+    empty snapshot) carries ``items == ()`` and ``proof == ()``.
+
+    Instances are immutable, may be built positionally and compare by all
+    ten fields. The constructor fixes only types, widths, ordering,
+    coverage and ranges — whether the entry digests and the shared proof
+    actually rebuild ``root`` is left to
+    :func:`verify_json_search_receipt`, so a tampered receipt is still
+    constructible and round-trips. Every binary field (``root``, each
+    entry's ``payload`` / ``previous_hash`` / ``entry_hash`` and every
+    shared-proof node) must be exact ``bytes``: ``bytearray`` and
+    ``memoryview`` are rejected rather than copied, so a received receipt
+    never silently aliases a mutable caller buffer.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    pointer: str
+    value: Any
+    start: int
+    stop: int
+    items: tuple
+    proof: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != 1:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        # root must be exact bytes: bytearray and memoryview are rejected
+        # rather than copied, so a received receipt never silently aliases a
+        # mutable caller buffer.
+        if not isinstance(self.root, bytes):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        if not isinstance(self.pointer, str):
+            raise TypeError("pointer must be a string")
+        tokens = _parse_json_pointer(self.pointer)
+        canonical = _json_pointer_canonical(tokens)
+        if canonical != self.pointer:
+            object.__setattr__(self, "pointer", canonical)
+        _check_json_value(self.value)
+        for name in ("start", "stop"):
+            bound = getattr(self, name)
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.start <= self.stop <= self.size:
+            raise ValueError(
+                f"range must satisfy 0 <= start <= stop <= size ({self.size})"
+            )
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of Entry records")
+        previous_index = -1
+        for entry in self.items:
+            if not isinstance(entry, Entry):
+                raise TypeError("item must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), bytes):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index <= previous_index:
+                raise ValueError("item indices must be in strictly ascending order")
+            if not self.start <= entry.index < self.stop:
+                raise ValueError(
+                    f"entry.index {entry.index} must satisfy "
+                    f"start ({self.start}) <= index < stop ({self.stop})"
+                )
+            previous_index = entry.index
+        if len(self.items) != self.stop - self.start:
+            # Strictly ascending in-range indices only cover the range when
+            # there is exactly one entry per absolute index.
+            raise ValueError(
+                f"items must carry every entry of the range "
+                f"[{self.start}, {self.stop})"
+            )
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof element must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+        if not self.items and self.proof:
+            raise ValueError("an empty range receipt must carry an empty proof")
+
+    @property
+    def hits(self) -> tuple[int, ...]:
+        """Absolute indices of the authenticated entries whose addressed JSON
+        scalar equals the query.
+
+        Computed from the receipt's own authenticated entries in strictly
+        ascending order with exactly the rules of
+        :meth:`AuditLog.find_json`: strict UTF-8 JSON, no repeated member
+        names, RFC 6901 resolution, type-separated scalar equality and
+        numeric equality across int/float; envelopes and non-scalar or
+        missing fields do not hit. This is exactly the complete hit set
+        :func:`verify_json_search_receipt` derives offline, so a concealed
+        hit or forged emptiness would have to remove or alter a covered
+        entry, which breaks coverage or authentication.
+        """
+        tokens = _parse_json_pointer(self.pointer)
+        return tuple(
+            entry.index
+            for entry in self.items
+            if _json_entry_matches(entry.payload, tokens, self.value)
         )
 
 
@@ -5100,6 +5449,54 @@ class AuditLog:
             )
         )
 
+    def find_json(
+        self,
+        pointer: Any,
+        value: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Absolute indices whose JSON payload has a scalar field equal to ``value``.
+
+        Every retained entry in the half-open range ``[start, stop)`` of
+        absolute indices (default ``[retain_from, len(log))``, exactly the
+        defaults and bounds of :meth:`find`) is treated as a JSON document:
+        its stored ``Entry.payload`` must decode as strict UTF-8 JSON
+        (RFC 8259, with no repeated object member names anywhere in the
+        document), ``pointer`` must resolve within it, and the addressed
+        value must be a scalar equal to ``value``. ``pointer`` follows RFC
+        6901 reference-token syntax: the empty string addresses the whole
+        document and each ``/``-separated token is unescaped (``~1`` ->
+        ``/``, ``~0`` -> ``~``). ``value`` accepts ``str``, ``int``,
+        ``float`` (must be finite), ``bool`` and ``None``; the JSON kinds
+        are compared separately, so ``True`` never equals ``1`` and the
+        string ``"1"`` never equals the number 1, while ints and floats
+        compare by numeric value.
+
+        An entry never hits when its payload is missing the field, is not
+        strict UTF-8 JSON (including a repeated member name), addresses a
+        non-scalar (object or array), an array index token that is
+        malformed/out of range, or is an AES-256-GCM encrypted-entry
+        envelope — encrypted entries are never parsed and no key is used.
+        Hits come back as a tuple of absolute indices in strictly ascending
+        order. A non-``str`` pointer or a query value of any other type
+        raises TypeError; a malformed pointer or a non-finite float query
+        raises ValueError. Range type/value errors are exactly those of
+        :meth:`find`. The query is read-only: it never stores parsed
+        documents, changes entries, the head, authentication state, the
+        locator indexes, a Merkle root or any proof.
+        """
+        tokens = _parse_json_pointer(pointer)
+        _check_json_value(value)
+        start, stop = self._resolve_find_range(start, stop)
+        return tuple(
+            index
+            for index in range(start, stop)
+            if _json_entry_matches(
+                self._entries[index - self._retain_from].payload, tokens, value
+            )
+        )
+
     def search_receipt(
         self,
         query: Any,
@@ -5577,6 +5974,93 @@ class AuditLog:
             size=size,
             root=root,
             prefix=prefix_material,
+            start=start,
+            stop=stop,
+            items=items,
+            proof=proof,
+        )
+
+    def json_search_receipt(
+        self,
+        pointer: Any,
+        value: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> JsonSearchReceipt:
+        """Issue an offline :class:`JsonSearchReceipt` proving completeness
+        for an RFC 6901 JSON-field scalar equality search over the snapshot's
+        first ``size`` entries.
+
+        Runs the same lookup as :meth:`find_json` over the half-open range
+        ``[start, stop)`` — an entry hits exactly when its stored payload is
+        strict UTF-8 JSON with no repeated member names, the pointer
+        resolves and the addressed scalar equals ``value`` under the JSON
+        kind rules — but, like :meth:`prefix_search_receipt`, the receipt
+        carries *every* entry of the searched range together with a single
+        shared compact batch inclusion proof covering all of them.
+        :func:`verify_json_search_receipt` can therefore check offline —
+        without holding the log or any key — that the listed entries are
+        exactly the range's authenticated content; its own parse, pointer
+        resolution and comparison over those payloads then yields the
+        complete hit set (also exposed as the receipt's ``hits`` property),
+        so no hit can be concealed and an empty hit set cannot be forged
+        without dropping or altering a covered entry.
+
+        ``pointer`` follows RFC 6901 (the empty string is the root); a
+        non-``str`` raises TypeError and a malformed pointer raises
+        ValueError. ``value`` must be ``str``, ``int``, ``float`` (finite),
+        ``bool`` or ``None``; another type raises TypeError and a
+        non-finite float raises ValueError. Encrypted entries take part
+        with their sealed envelope bytes, which never parse as queryable
+        JSON and therefore never hit; nothing is decrypted or rewritten.
+        ``size`` defaults to the current log length and the snapshot must
+        still be rebuildable (a prefix released by :meth:`prune` is not).
+        The range defaults to the retained segment
+        ``[retain_from, size)``; explicit bounds must be non-bool integers
+        satisfying ``retain_from <= start <= stop <= size``. Wrong types
+        raise TypeError, out-of-range values or an unrebuildable snapshot
+        ValueError. An empty range — and any empty snapshot — yields
+        ``items == ()`` and ``proof == ()``. The call is read-only:
+        entries, head, authentication state, the locator indexes, Merkle
+        roots and proofs are left untouched, and a failed call raises
+        before anything observable changes.
+        """
+        tokens = _parse_json_pointer(pointer)
+        _check_json_value(value)
+        canonical = _json_pointer_canonical(tokens)
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        first = self._retain_from
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = size
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= size:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({size})"
+            )
+        root = self.merkle_root(size)
+        items = tuple(self.entry(index) for index in range(start, stop))
+        if items:
+            _, proof = self.batch_inclusion_proof(
+                tuple(range(start, stop)), size
+            )
+        else:
+            proof = ()
+        return JsonSearchReceipt(
+            version=_JSON_SEARCH_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            pointer=canonical,
+            value=value,
             start=start,
             stop=stop,
             items=items,
@@ -7834,6 +8318,84 @@ def verify_prefix_search_receipt(receipt: Any) -> bool:
         # An empty range of a non-empty snapshot attests no content; the
         # recorded root cannot be checked without evidence, exactly as for
         # an empty-range RangeSearchReceipt.
+        return True
+    entry_hashes: list[bytes] = []
+    for entry in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        entry_hashes.append(entry.entry_hash)
+    indices = tuple(entry.index for entry in checked.items)
+    return verify_batch_inclusion(
+        indices,
+        tuple(entry_hashes),
+        checked.size,
+        checked.root,
+        checked.proof,
+        hash_name=checked.hash_name,
+    )
+
+
+def verify_json_search_receipt(receipt: Any) -> bool:
+    """Verify a :class:`JsonSearchReceipt` without holding the log or a key.
+
+    Recomputes every listed entry's digest from the entry's fields and
+    re-verifies the single shared compact batch inclusion proof against the
+    receipt's snapshot root via :func:`verify_batch_inclusion`. Because the
+    receipt carries every entry of the searched range ``[start, stop)`` —
+    the constructor rejects an incomplete coverage, duplicates and
+    out-of-order indices — the verifier's own strict UTF-8 JSON parse,
+    repeated-member rejection, RFC 6901 pointer resolution and
+    type-separated scalar comparison over those authenticated entries
+    yields the complete hit set: a concealed hit, a duplicate, a reordering,
+    a tampered payload or a forged hit is a structural or content failure,
+    never a silent mismatch. Encrypted envelopes and entries whose payload
+    is not strict JSON, misses the field or addresses a non-scalar simply
+    do not hit and never fail verification on their own.
+
+    An empty range (``items == ()`` and ``proof == ()``) attests no
+    content; an empty snapshot (``size == 0``) additionally only accepts
+    the canonical empty-tree root. A structurally valid receipt whose entry
+    content, proof or root does not match returns False rather than
+    raising. A receipt that is not a :class:`JsonSearchReceipt` raises
+    TypeError; a receipt whose frozen fields were bypassed into an illegal
+    shape (wrong types, an unknown hash algorithm, a malformed pointer, a
+    non-finite numeric query, an out-of-range range or size, digest-width
+    mismatches, non-ascending or incomplete items) raises the same
+    TypeError or ValueError construction would, and a proof node count that
+    does not fit the listed indices and ``size`` raises ValueError as in
+    :func:`verify_batch_inclusion`. The call is read-only.
+    """
+    if not isinstance(receipt, JsonSearchReceipt):
+        raise TypeError("receipt must be a JsonSearchReceipt")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = JsonSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.pointer,
+        receipt.value,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    if not checked.items:
+        if checked.size == 0:
+            return hmac.compare_digest(
+                checked.root, _hash_parts(checked.hash_name, _EMPTY_DOMAIN)
+            )
+        # An empty range of a non-empty snapshot attests no content; the
+        # recorded root cannot be checked without evidence, exactly as for
+        # an empty-range PrefixSearchReceipt.
         return True
     entry_hashes: list[bytes] = []
     for entry in checked.items:
@@ -10213,6 +10775,220 @@ def decode_prefix_search_receipt(data: Any) -> PrefixSearchReceipt:
         size=size,
         root=root,
         prefix=prefix,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+        proof=proof,
+    )
+    _check_full_search_receipt_proof(receipt)
+    return receipt
+
+
+def _encode_json_value(value: Any) -> tuple[int, bytes]:
+    """Deterministically tag a JSON scalar query for the receipt encoding."""
+    if isinstance(value, bool):
+        return (_JSON_TAG_TRUE if value else _JSON_TAG_FALSE), b""
+    if value is None:
+        return _JSON_TAG_NULL, b""
+    if isinstance(value, str):
+        return _JSON_TAG_STRING, value.encode("utf-8")
+    if isinstance(value, int):
+        # Canonical decimal spelling handles every integer width and sign.
+        return _JSON_TAG_INTEGER, str(value).encode("ascii")
+    # float: repr round-trips the exact binary value (Python >= 3.1).
+    return _JSON_TAG_FLOAT, repr(value).encode("ascii")
+
+
+def _decode_json_value(tag: int, blob: bytes) -> Any:
+    if tag == _JSON_TAG_STRING:
+        try:
+            return blob.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("encoded JSON string value is not valid UTF-8") from error
+    if tag == _JSON_TAG_INTEGER:
+        try:
+            text = blob.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError("encoded JSON integer value is not ASCII decimal") from error
+        digits = text[1:] if text[:1] == "-" else text
+        if not digits or any(ch not in "0123456789" for ch in digits):
+            raise ValueError("encoded JSON integer value is not canonical decimal")
+        return int(text)
+    if tag == _JSON_TAG_FLOAT:
+        try:
+            text = blob.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError("encoded JSON float value is not ASCII") from error
+        try:
+            value = float(text)
+        except ValueError as error:
+            raise ValueError("encoded JSON float value is not a number") from error
+        if not math.isfinite(value):
+            raise ValueError("encoded JSON float value must be finite")
+        return value
+    if tag == _JSON_TAG_TRUE:
+        if blob:
+            raise ValueError("a boolean JSON value must carry an empty blob")
+        return True
+    if tag == _JSON_TAG_NULL:
+        if blob:
+            raise ValueError("a null JSON value must carry an empty blob")
+        return None
+    if tag == _JSON_TAG_FALSE:
+        if blob:
+            raise ValueError("a boolean JSON value must carry an empty blob")
+        return False
+    raise ValueError(f"unknown JSON value type tag {tag}")
+
+
+def encode_json_search_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`JsonSearchReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/json-search/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in the order ``version`` (always 1), ``hash_name`` (UTF-8
+    blob), ``size``, ``root`` blob, ``pointer`` (canonical RFC 6901 UTF-8
+    blob), the scalar ``value`` as a type tag u64 followed by one blob
+    (UTF-8 bytes for a string, canonical ASCII decimal for an integer,
+    ``repr`` ASCII for a float, and an empty blob for ``true``, ``false``
+    and ``null``, each distinguished by its own tag), ``start``, ``stop``,
+    item count,
+    one item per listed entry — ``Entry.index``, ``payload`` blob,
+    ``previous_hash`` blob, ``entry_hash`` blob, exactly as entries are
+    written by :func:`encode_prefix_search_receipt` — and finally the
+    shared proof node count followed by one blob per proof digest, with
+    nothing omitted, reordered or appended. ``receipt`` must be a
+    :class:`JsonSearchReceipt` (anything else raises TypeError); every
+    field is re-validated exactly as the constructor would, so a receipt
+    whose frozen fields were bypassed into an illegal shape raises the same
+    TypeError or ValueError, and a shared proof whose node count does not
+    fit the listed indices and ``size`` raises ValueError. Encoding is
+    read-only and deterministic: re-encoding a decoded receipt reproduces
+    the original bytes exactly.
+    """
+    if not isinstance(receipt, JsonSearchReceipt):
+        raise TypeError("receipt must be a JsonSearchReceipt")
+    checked = JsonSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.pointer,
+        receipt.value,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    # Reuse the same proof-length rule the other full-range receipts use.
+    _check_full_search_receipt_proof(checked)
+    value_tag, value_blob = _encode_json_value(checked.value)
+    parts = [
+        _JSON_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(checked.pointer.encode("utf-8")),
+        _encode_u64(value_tag, "value type tag"),
+        _encode_blob(value_blob),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for digest in checked.proof:
+        parts.append(_encode_blob(bytes(digest)))
+    return b"".join(parts)
+
+
+def decode_json_search_receipt(data: Any) -> JsonSearchReceipt:
+    """Decode bytes produced by :func:`encode_json_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad
+    magic, a version other than 1, invalid UTF-8 in ``hash_name``,
+    ``pointer`` or a string value, an unknown hash algorithm or value type
+    tag, a malformed encoded number, a non-canonical or non-finite one,
+    truncation, trailing bytes, an oversized blob length, digest-width
+    mismatches, an out-of-range or inverted index range, non-ascending or
+    duplicate item indices, an item index outside the recorded range, an
+    incomplete coverage of the searched range, a non-empty proof on an
+    empty range, or a shared proof whose node count does not fit the listed
+    indices and ``size`` all raise ValueError. The decoded receipt's fields
+    equal the originally encoded ones and satisfy
+    :func:`verify_json_search_receipt` whenever the original did; a
+    structurally valid receipt whose content does not match still decodes
+    and only fails verification. The call is read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_JSON_SEARCH_MAGIC):
+        raise ValueError("not an auditchain json-search encoding")
+    offset = len(_JSON_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    raw_pointer = read_blob("pointer")
+    try:
+        pointer = raw_pointer.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("pointer is not valid UTF-8") from error
+    value_tag = read_u64("value type tag")
+    value_blob = read_blob("value")
+    value = _decode_json_value(value_tag, value_blob)
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = JsonSearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        pointer=pointer,
+        value=value,
         start=start,
         stop=stop,
         items=tuple(items),

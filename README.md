@@ -314,6 +314,79 @@ encode_signed_range_search_receipt(restored) == blob        # True
 既有 `find`、`search_receipt`、`full_search_receipt`、Merkle 规则、裁剪保留段与
 全部旧序列化格式行为不变；新区间入口不重新定义任何旧格式。
 
+### 按内容原始字节的前缀检索
+
+`find_prefix(prefix, start=None, stop=None)` 在保留段内按 `Entry.payload` 的原始
+字节做前缀检索：当且仅当 `entry.payload.startswith(prefix)`（Python 原生 `bytes`
+语义）时命中，返回升序绝对索引 tuple；`prefix` 接受 `bytes` 或 `str`（后者按
+UTF-8 规范化）。空前缀命中范围内全部条目；前缀比 payload 更长自然不命中。前缀
+类型错误抛 `TypeError`。索引范围沿用 `find` 的半开 `[start, stop)` 与
+`retain_from <= start <= stop <= len(log)` 约束（显式边界须为非 bool 整数，越界
+抛 `ValueError`），缺省为 `[retain_from, len(log))`。加密条目只比较封存的
+envelope 原始字节，前缀查询不解密、不改写条目，也不改变链、认证状态、定位索引、
+Merkle 根和任何既有查询结果。
+
+```python
+for p in ("a", "b", "aa", "c", "az", "b", b"a\x00"):
+    log.append(p)
+log.find_prefix(b"a")        # (0, 2, 4, 6)：a、aa、az、a\x00
+log.find_prefix("a")         # str 按 UTF-8 规范化，结果相同
+log.find_prefix(b"aa")       # (2,)
+log.find_prefix(b"")         # (0, 1, 2, 3, 4, 5, 6)：空前缀命中全部
+log.find_prefix(b"aaa")      # ()：前缀比 payload 长
+# log.find_prefix(1)        # TypeError：前缀只接受 bytes 或 str
+log.find_prefix(b"a", 1, 5)  # 半开索引范围 [1, 5)
+```
+
+### 前缀检索的完整离线回执（全覆盖）
+
+`prefix_search_receipt(prefix, start=None, stop=None, size=None)` 把同一前缀查询
+固化为冻结的
+`PrefixSearchReceipt(version=1, hash_name, size, root, prefix, start, stop, items,
+proof)`：除用单个规范化 `prefix` 取代等值 `query` / 区间边界外，结构与
+`RangeSearchReceipt` 相同——携带被搜范围 `[start, stop)` 内**每一个** `Entry`
+（恰为 `start .. stop-1` 各一份）和一份覆盖它们的共享紧凑批量包含证明。离线核验
+方先用 `verify_prefix_search_receipt` 重算每个 `entry_digest`、用共享批量证明核对
+快照 `root`，再自行对这些已认证条目做 `entry.payload.startswith(prefix)` 比较，
+得出的就是范围内全部命中（也可直接读 `receipt.hits`，严格升序绝对索引 tuple）：
+遗漏命中、重复、调序、改写 payload 或伪造空结果都无法通过。范围与 `size` 默认、
+异常语义与 `range_search_receipt` 一致：显式边界须为非 bool 整数且
+`retain_from <= start <= stop <= size`；显式 `size` 须为非 bool 整数且
+`0 <= size <= len(log)`，裁剪导致快照不可重建抛 `ValueError`；前缀类型错误抛
+`TypeError`；空日志、空索引范围与完全无命中都有确定结果（空范围时
+`items == proof == ()`，空前缀时命中为整个覆盖范围）。签发全程只读，失败不改变
+日志。
+
+```python
+receipt = log.prefix_search_receipt(b"a")
+receipt.root == log.merkle_root()       # 快照根
+receipt.hits                            # (0, 2, 4, 6)：完整命中集
+[e.index for e in receipt.items         # 核验方自行对已认证条目做前缀比较
+ if e.payload.startswith(receipt.prefix)]
+verify_prefix_search_receipt(receipt)   # True：无需持有日志即可离线核验
+log.prefix_search_receipt(b"a", 1, 5, size=7)   # 索引范围 + 指定快照
+```
+
+回执有稳定的规范字节编解码入口，魔数为
+`b"auditchain/prefix-search/v1\0"`，其后严格按字段顺序写 `version`、`hash_name`
+（UTF-8 blob）、`size`、`root` blob、`prefix` blob、`start`、`stop`、条目计数、
+各条目（写法与 `encode_range_search_receipt` 相同）与共享证明计数及摘要 blob；
+整数均为 8 字节无符号大端，blob 为 u64 长度前缀加原始字节。重复编码逐字节一致；
+解码只接受精确 `bytes`（拒绝 `bytearray` / `memoryview`），拒绝截断、尾随字节、
+错误魔数/版本、未知算法、错误摘要宽度、越界或重复索引、覆盖不全以及证明节点数
+不符——结构错误抛 `ValueError`，非 `bytes` 输入抛 `TypeError`；内容被篡改但结构
+合法的回执仍可往返，仅核验判 `False`（非回执参数抛 `TypeError`）。
+
+```python
+data = encode_prefix_search_receipt(receipt)
+restored = decode_prefix_search_receipt(data)
+encode_prefix_search_receipt(restored) == data   # True：重复编码逐字节相同
+verify_prefix_search_receipt(restored)           # True
+```
+
+既有 `find`、`find_range`、各搜索回执、签名消息与全部旧序列化格式行为不变；新
+前缀入口不重新定义任何旧格式。
+
 ### 加密追加（AES-256-GCM）
 
 `encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但

@@ -159,6 +159,7 @@ __all__ = [
     "MerkleFrontier",
     "PruneReceipt",
     "RangeSearchReceipt",
+    "RetentionTransition",
     "RotatedAnchorSet",
     "RotatedChain",
     "StageRotatedAnchorSet",
@@ -207,6 +208,7 @@ __all__ = [
     "decode_merkle_frontier",
     "decode_prune_receipt",
     "decode_range_search_receipt",
+    "decode_retention_transition",
     "decode_rotation",
     "decode_rotated_anchor",
     "decode_rotated_anchor_set",
@@ -267,6 +269,7 @@ __all__ = [
     "encode_merkle_frontier",
     "encode_prune_receipt",
     "encode_range_search_receipt",
+    "encode_retention_transition",
     "encode_rotation",
     "encode_rotated_anchor",
     "encode_rotated_anchor_set",
@@ -350,6 +353,7 @@ __all__ = [
     "verify_full_search_receipt",
     "verify_inclusion",
     "verify_range_search_receipt",
+    "verify_retention_chain",
     "verify_rotated_chain",
     "verify_rotation",
     "verify_rotation_chain",
@@ -607,6 +611,15 @@ _SIGNED_CONSISTENCY_VERSION = 1
 # that order and with nothing else.
 _SIGNED_PRUNE_MAGIC = b"auditchain/signed-prune/v1\0"
 _SIGNED_PRUNE_VERSION = 1
+
+# Binary framing of encode_retention_transition / decode_retention_transition:
+# a fixed magic, then the envelope version as a u64 and three
+# u64-length-prefixed blobs holding the complete canonical encode_signed_root
+# (the before boundary), encode_signed_prune (the release authorization) and
+# encode_signed_consistency (the append-only extension) bytes, in that order
+# and with nothing else.
+_RETENTION_TRANSITION_MAGIC = b"auditchain/retention-transition/v1\0"
+_RETENTION_TRANSITION_VERSION = 1
 
 # Binary framing of encode_signed_auth_bundle / decode_signed_auth_bundle:
 # a fixed magic, then the envelope version as a u64 and two u64-length-prefixed
@@ -2828,6 +2841,51 @@ class SignedPrune:
             raise TypeError("receipt must be a PruneReceipt")
         if not isinstance(self.checkpoint, SignedRoot):
             raise TypeError("checkpoint must be a SignedRoot")
+
+
+@dataclass(frozen=True)
+class RetentionTransition:
+    """One signed retention release, offline-chainable to the ones around it.
+
+    Issued by :meth:`AuditLog.prune_with_retention_transition` and verified
+    entirely offline by :func:`verify_retention_chain` against a pre-trusted
+    32-byte Ed25519 public key. Unlike the independent credentials of
+    successive :meth:`AuditLog.prune_signed` releases, a transition names the
+    boundary it starts from, so a chain of transitions proves that every
+    release began exactly where the previous one ended and that every old
+    snapshot grew into its new snapshot by appends alone:
+
+    - ``before``: the :class:`SignedRoot` checkpoint of the retaining
+      boundary at issue time — ``retain_from`` of the signing log, equal to
+      the previous transition's ending checkpoint (or the initial trusted
+      checkpoint for the first transition),
+    - ``prune``: the :class:`SignedPrune` authorizing the release, whose
+      checkpoint is the new retaining boundary at a strictly greater size,
+    - ``consistency``: the :class:`SignedConsistency` linking ``before`` to
+      that new boundary, so the retained prefix can be shown to be an
+      append-only extension of the previous one.
+
+    Instances are immutable, may be built positionally and compare by all
+    three fields. Only the container shape is validated here: ``before`` must
+    be a :class:`SignedRoot`, ``prune`` a :class:`SignedPrune` and
+    ``consistency`` a :class:`SignedConsistency`; a field of the wrong type
+    raises TypeError. Whether the three credentials describe one consistent
+    transition and whether the signatures verify is left to
+    :func:`verify_retention_chain` and the existing single-credential
+    verifiers.
+    """
+
+    before: SignedRoot
+    prune: SignedPrune
+    consistency: SignedConsistency
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.before, SignedRoot):
+            raise TypeError("before must be a SignedRoot")
+        if not isinstance(self.prune, SignedPrune):
+            raise TypeError("prune must be a SignedPrune")
+        if not isinstance(self.consistency, SignedConsistency):
+            raise TypeError("consistency must be a SignedConsistency")
 
 
 @dataclass(frozen=True)
@@ -6609,6 +6667,125 @@ class AuditLog:
         receipt = self.seal(target)
         self.prune(target, receipt)
         return receipt
+
+    def prune_with_retention_transition(
+        self,
+        before: Any,
+        retain_from: int,
+        private_key: Any,
+    ) -> "RetentionTransition":
+        """Release a prefix and return an offline-chainable transition record.
+
+        Issues — before anything is released — the three credentials proving
+        one retention evolution, prunes only after every signature and proof
+        has been re-verified, and returns them bundled as one
+        :class:`RetentionTransition`:
+
+        - ``before`` must be the :class:`SignedRoot` checkpoint of the
+          *current* retaining boundary, i.e. ``sign_root(private_key,
+          self.retain_from)`` under this log's hash algorithm (the caller
+          obtains it as the previous transition's ending checkpoint, or as
+          the initial trusted checkpoint for the first release);
+        - :attr:`RetentionTransition.prune` is the :class:`SignedPrune` for
+          the target prefix, exactly :meth:`sign_prune` output, whose
+          checkpoint becomes the new retaining boundary;
+        - :attr:`RetentionTransition.consistency` is the
+          :class:`SignedConsistency` from ``before.size`` to ``retain_from``,
+          exactly :meth:`signed_consistency` output, proving the new boundary
+          snapshot is the old one extended by appends only.
+
+        ``retain_from`` must be a non-bool integer strictly greater than
+        ``before.size`` and no greater than ``len(log)``; ``before.size`` must
+        equal the log's current retain point, so releases can only follow the
+        last transition's end. ``private_key`` is a 32-byte Ed25519 seed used
+        for the new signatures and never stored; no new signing message is
+        introduced — every signature inside the artifact is an existing
+        :meth:`sign_root` signature. All three credentials are built and
+        verified first (with :func:`verify_signed_root`,
+        :func:`verify_signed_prune` and
+        :func:`verify_signed_consistency` against the seed's public key) and
+        only then is the log pruned exactly as
+        ``prune(retain_from, transition.prune.receipt)`` would, so on any
+        failure every entry, authentication tag/stage/key, locator index,
+        frontier checkpoint, head and nonce history stays exactly as it was.
+        A wrong-typed ``before`` or ``retain_from`` raises TypeError, a
+        non-``bytes`` seed TypeError; a seed of the wrong length, a reversed
+        or out-of-range target, a target that is not the current boundary, a
+        ``before`` checkpoint that does not match this log's boundary, or an
+        illegal credential field, signature or proof shape raises ValueError.
+        """
+        if not isinstance(before, SignedRoot):
+            raise TypeError("before must be a SignedRoot")
+        if not isinstance(retain_from, int) or isinstance(retain_from, bool):
+            raise TypeError("retain_from must be an integer")
+        # Validate the seed and derive the public verification key before any
+        # snapshot is built, exactly as the other signing entry points do.
+        signing_key = _load_ed25519_seed(private_key)
+        public_key = signing_key.public_key().public_bytes(
+            encoding=Encoding.Raw, format=PublicFormat.Raw
+        )
+        length = len(self)
+        # The target must release at least one entry, stay inside the log and
+        # sit exactly on the boundary named by ``before``; that boundary must
+        # be the log's current retain point, so releases follow the previous
+        # transition's end instead of skipping or re-opening one.
+        if not retain_from > before.size:
+            raise ValueError(
+                f"retain_from ({retain_from}) must be strictly greater than "
+                f"before.size ({before.size})"
+            )
+        if retain_from > length:
+            raise ValueError(f"retain_from must not exceed the log length ({length})")
+        if before.size != self._retain_from:
+            raise ValueError(
+                f"before.size ({before.size}) must equal the current retain "
+                f"point ({self._retain_from})"
+            )
+        # The supplied boundary checkpoint must authenticate this very log at
+        # the retain point. Re-validate it through the SignedRoot constructor
+        # so a bypassed field raises exactly as construction would, then check
+        # the signature against the seed and the recorded boundary root/head.
+        signed_before = SignedRoot(
+            before.version,
+            before.hash_name,
+            before.size,
+            before.root,
+            before.head,
+            before.signature,
+        )
+        if signed_before.hash_name != self._hash_name:
+            raise ValueError(
+                f"before hash_name {signed_before.hash_name!r} does not match "
+                f"log {self._hash_name!r}"
+            )
+        if not verify_signed_root(signed_before, public_key):
+            raise ValueError("before checkpoint signature does not verify")
+        if not hmac.compare_digest(signed_before.root, self._fold_occupied(self._frontier)):
+            raise ValueError("before root does not match the current boundary")
+        if not hmac.compare_digest(signed_before.head, self._checkpoint_head):
+            raise ValueError("before head does not match the current boundary")
+        # All issuance below is read-only and built from log-derived data, so
+        # the credentials agree with one another and the log by construction;
+        # the explicit verifications below still re-check every signature and
+        # the consistency proof before any state changes.
+        prune = self.sign_prune(private_key, retain_from)
+        consistency = self.signed_consistency(
+            signed_before.size, private_key, retain_from
+        )
+        if not verify_signed_prune(prune, public_key):
+            raise ValueError("signed prune authorization does not verify")
+        if not verify_signed_consistency(consistency, public_key):
+            raise ValueError("signed consistency proof does not verify")
+        transition = RetentionTransition(
+            before=signed_before,
+            prune=prune,
+            consistency=consistency,
+        )
+        # Authorization fully checked; release the prefix through the same
+        # atomic state-changing path prune_signed uses, which re-derives the
+        # prefix root and chain hash from the log itself.
+        self.prune(retain_from, prune.receipt)
+        return transition
 
 
 def _check_digest(value: Any, name: str, digest_size: int) -> bytes:
@@ -11504,6 +11681,101 @@ def verify_signed_prune(item: Any, public_key: Any) -> bool:
     )
 
 
+def verify_retention_chain(initial: Any, transitions: Any, public_key: Any) -> bool:
+    """Verify an offline chain of retention transitions from an initial checkpoint.
+
+    Confirms, holding neither the log nor any checkpoint history, that the
+    tuple of :class:`RetentionTransition` records describes releases along one
+    strictly increasing sequence of retaining boundaries, every one of them
+    authorized by the holder of the pre-trusted 32-byte Ed25519
+    ``public_key`` and every new boundary shown to be the previous boundary
+    extended by appends only:
+
+    - ``initial`` must be a genuine :class:`SignedRoot` from the trusted key;
+      with an empty ``transitions`` tuple that is the whole check and a valid
+      initial returns True;
+    - the first transition's ``before`` must equal ``initial`` on every field
+      (hash name, size, root, head and signature), and each later
+      transition's ``before`` must equal the previous transition's ending
+      boundary — its ``prune.checkpoint`` / ``consistency.new`` checkpoint;
+    - every transition's :class:`SignedPrune` must pass
+      :func:`verify_signed_prune` and its :class:`SignedConsistency`
+      :func:`verify_signed_consistency` against ``public_key``, so every
+      signature, the prune receipt's root and chain-head binding and the
+      Merkle consistency proof linking the two snapshots are checked;
+    - the three credentials of one transition must describe the same move:
+      ``consistency.old`` equals ``before`` and ``consistency.new`` equals
+      ``prune.checkpoint`` on every field, both snapshots name the same hash
+      algorithm as the running boundary, and the new boundary size is
+      strictly greater than the old one.
+
+    A genuine chain returns True. ``initial`` that is not a
+    :class:`SignedRoot`, a non-tuple ``transitions`` or a non-
+    :class:`RetentionTransition` element raises TypeError; nested structural
+    violations raise exactly the exceptions of the container constructors and
+    the existing verifiers (TypeError or ValueError), and a public key that
+    is not 32 ``bytes`` raises ValueError (a non-``bytes`` key TypeError). A
+    structurally well-formed chain whose initial or transition signature does
+    not verify, whose snapshot roots, chain heads, sizes or proofs do not
+    match, or whose adjacent boundaries do not join returns False. The call
+    is read-only and never mutates its arguments.
+    """
+    if not isinstance(initial, SignedRoot):
+        raise TypeError("initial must be a SignedRoot")
+    if not isinstance(transitions, tuple):
+        raise TypeError("transitions must be a tuple")
+    for transition in transitions:
+        if not isinstance(transition, RetentionTransition):
+            raise TypeError("each transition must be a RetentionTransition")
+    # Re-validate the initial even when its fields were bypassed, so
+    # structural corruption raises exactly as the constructor would.
+    current = SignedRoot(
+        initial.version,
+        initial.hash_name,
+        initial.size,
+        initial.root,
+        initial.head,
+        initial.signature,
+    )
+    if not verify_signed_root(current, public_key):
+        return False
+    for transition in transitions:
+        # Re-validate every container even for fields set bypassing the
+        # frozen constructors, so bypassed corruption raises exactly as
+        # construction would and only a genuine mismatch returns False.
+        checked = RetentionTransition(
+            transition.before, transition.prune, transition.consistency
+        )
+        before = checked.before
+        prune = checked.prune
+        SignedPrune(prune.receipt, prune.checkpoint)
+        consistency = checked.consistency
+        SignedConsistency(consistency.old, consistency.new, consistency.proof)
+        # The transition must begin exactly at the running boundary, with the
+        # very same signed checkpoint — not merely another checkpoint of the
+        # same size.
+        if before != current:
+            return False
+        if not verify_signed_prune(prune, public_key):
+            return False
+        if not verify_signed_consistency(consistency, public_key):
+            return False
+        new_boundary = prune.checkpoint
+        # The consistency proof must span exactly this release: the old
+        # snapshot is the named before boundary and the new snapshot is the
+        # boundary the signed prune seals. verify_signed_consistency already
+        # required the two checkpoints to share a hash algorithm; here they
+        # must also be the boundary checkpoints of this same transition.
+        if consistency.old != before:
+            return False
+        if consistency.new != new_boundary:
+            return False
+        if not before.size < new_boundary.size:
+            return False
+        current = new_boundary
+    return True
+
+
 def verify_signed_auth_bundle(bundle: Any, public_key: Any) -> tuple[bool, ...]:
     """Verify a :class:`SignedAuthBundle` against a pre-trusted Ed25519 key.
 
@@ -13397,6 +13669,118 @@ def decode_signed_prune(data: Any) -> SignedPrune:
     receipt = decode_prune_receipt(receipt_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedPrune(receipt=receipt, checkpoint=checkpoint)
+
+
+def encode_retention_transition(transition: Any) -> bytes:
+    """Encode a :class:`RetentionTransition` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/retention-transition/v1\\0"``; it then writes, strictly in
+    order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the before-boundary blob, the signed-prune blob and
+    the signed-consistency blob — nothing may be omitted, reordered or
+    appended. Each blob is a u64 byte length followed by the raw bytes: the
+    three blobs are, in that fixed order, the complete canonical outputs of
+    :func:`encode_signed_root` over ``transition.before``,
+    :func:`encode_signed_prune` over ``transition.prune`` and
+    :func:`encode_signed_consistency` over ``transition.consistency``. No new
+    signing message is introduced: encoding is read-only and only re-uses
+    the existing canonical encodings.
+
+    ``transition`` must be a :class:`RetentionTransition` — anything else,
+    or a transition whose fields have been bypassed to wrong types, raises
+    TypeError; nested structural problems raise exactly the exceptions of
+    :func:`encode_signed_root`, :func:`encode_signed_prune` and
+    :func:`encode_signed_consistency` (TypeError or ValueError). Encoding is
+    deterministic: re-encoding a decoded transition reproduces the original
+    bytes exactly, and a structurally valid transition whose signatures do
+    not match encodes just as well.
+    """
+    if not isinstance(transition, RetentionTransition):
+        raise TypeError("transition must be a RetentionTransition")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = RetentionTransition(
+        transition.before, transition.prune, transition.consistency
+    )
+    before_blob = encode_signed_root(checked.before)
+    prune_blob = encode_signed_prune(checked.prune)
+    consistency_blob = encode_signed_consistency(checked.consistency)
+    return b"".join((
+        _RETENTION_TRANSITION_MAGIC,
+        _encode_u64(_RETENTION_TRANSITION_VERSION, "version"),
+        _encode_blob(before_blob),
+        _encode_blob(prune_blob),
+        _encode_blob(consistency_blob),
+    ))
+
+
+def decode_retention_transition(data: Any) -> RetentionTransition:
+    """Decode bytes produced by :func:`encode_retention_transition`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/retention-transition/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed before-boundary blob, one length-prefixed signed-prune
+    blob and one length-prefixed signed-consistency blob, in that order, with
+    no trailing bytes. Each blob is handed whole to its existing decoder —
+    :func:`decode_signed_root`, :func:`decode_signed_prune` and
+    :func:`decode_signed_consistency` respectively — so every nested framing
+    and structural rule is theirs. A bad magic or version, truncation, an
+    oversized blob length, trailing bytes or an illegal nested encoding
+    raises ValueError.
+
+    Signatures and the association between the three credentials are not
+    checked here. The returned object is a frozen
+    :class:`RetentionTransition` whose fields equal the originally encoded
+    ones (positionally constructed, compared by all three fields), and
+    re-encoding reproduces the original bytes exactly. A structurally sound
+    encoding whose boundaries do not join or whose signatures simply do not
+    verify still decodes; :func:`verify_retention_chain` reports False (or
+    raises as its own contract specifies).
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_RETENTION_TRANSITION_MAGIC):
+        raise ValueError("not an auditchain retention-transition encoding")
+    offset = len(_RETENTION_TRANSITION_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _RETENTION_TRANSITION_VERSION:
+        raise ValueError(f"unsupported retention-transition version {version}")
+    before_blob = read_blob("before checkpoint")
+    prune_blob = read_blob("signed prune")
+    consistency_blob = read_blob("signed consistency")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the retention transition")
+    # Decode the three nested blobs with their existing decoders; their own
+    # magic, version, truncation/trailing-byte and structural checks apply
+    # verbatim.
+    before = decode_signed_root(before_blob)
+    prune = decode_signed_prune(prune_blob)
+    consistency = decode_signed_consistency(consistency_blob)
+    return RetentionTransition(before=before, prune=prune, consistency=consistency)
 
 
 def encode_signed_auth_bundle(bundle: Any) -> bytes:

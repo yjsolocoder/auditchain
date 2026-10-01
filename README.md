@@ -1645,6 +1645,98 @@ fresh_log.prune_signed(2, restored, public_key)  # 跨进程恢复后直接授�
   格式非法抛 `ValueError`；结构合法但两部分不一致或签名不匹配仍可解码，
   `verify_signed_prune` 返回 `False`；两个入口均为只读且确定
 
+### 可离线串联的保留演进凭据（Ed25519）
+
+连续的 `prune_signed` 只产生彼此独立的裁剪凭据，无法离线证明「这次释放
+紧接上次的边界、旧快照到新快照只经过只追加扩展」。
+`prune_with_retention_transition` 在**原子裁剪之前**一次签发并复核三项凭据，
+把它们绑定为一个不可变 `RetentionTransition`：释放起点边界 `before`
+（上一次 transition 的结束检查点，首次为初始检查点）、授权释放的
+`SignedPrune`、以及连接两快照的 `SignedConsistency`；下一次调用直接以上一次
+返回的结束检查点 `transition.prune.checkpoint` 为 `before`：
+
+```python
+from auditchain import verify_retention_chain
+
+initial = log.sign_root(seed, 0)                       # 初始边界检查点
+t1 = log.prune_with_retention_transition(initial, 3, seed)
+log.append("later-a"); log.append("later-b")
+t2 = log.prune_with_retention_transition(t1.prune.checkpoint, 6, seed)
+# 三项凭据均为既有原语，不引入任何新的签名原文
+t1.before == initial                                   # True：释放起点
+t1.prune == log.sign_prune(seed, 3)                    # True：裁剪授权
+t1.consistency.old == t1.before                        # True：证明起点
+t1.consistency.new == t1.prune.checkpoint              # True：证明终点
+# 完全离线核验整条保留演进链，只需初始检查点、transitions 与公钥
+verify_retention_chain(initial, (t1, t2), public_key)  # True
+verify_retention_chain(initial, (), public_key)        # True：空链，初始有效即可
+```
+
+- 凭据为冻结的 `RetentionTransition(before:SignedRoot, prune:SignedPrune,
+  consistency:SignedConsistency)`，字段顺序即绑定顺序，支持位置构造、按三个
+  字段相等；三个字段分别必须是 `SignedRoot`、`SignedPrune`、
+  `SignedConsistency`，字段类型错抛 `TypeError`；三项凭据是否描述同一次
+  演进、签名是否有效由 `verify_retention_chain` 判定
+- `AuditLog.prune_with_retention_transition(before, retain_from, private_key)`
+  先校验再签发再核验、最后才裁剪：`retain_from` 必须是非 `bool` 整数且
+  **严格大于** `before.size`、**不超过** `len(log)`；`before.size` 必须等于
+  日志当前 `retain_from`（释放只能沿上次结束边界发生，不能跳跃或重开），
+  `before` 还须与当前边界同摘要算法、同根、同链头且以该私钥对应公钥验签通过。
+  `prune` 与 `consistency` 分别就是既有 `sign_prune(seed, retain_from)` 与
+  `signed_consistency(before.size, seed, retain_from)` 的输出；三者构造后在
+  本地分别经 `verify_signed_root` / `verify_signed_prune` /
+  `verify_signed_consistency` 复核通过，才等价于
+  `prune(retain_from, transition.prune.receipt)` 原子裁剪（后者仍自行从日志
+  重算前缀根与链摘要）。`before`、`retain_from` 类型错抛 `TypeError`，
+  `private_key` 不是 `bytes` 抛 `TypeError`；私钥长度错误、目标逆序（小于或
+  等于起点）、越界、`before` 不是当前边界、以及字段 / 签名 / 证明形状非法抛
+  `ValueError`。任何失败都在裁剪前抛出，日志条目、认证 tag/stage/key、定位
+  索引、frontier 检查点、链头与 nonce 历史均保持原样
+- `verify_retention_chain(initial, transitions, public_key)` 只凭初始
+  `SignedRoot`、`RetentionTransition` 元组与 32 字节公钥离线核验：初始检查点
+  先独立验签；随后逐条要求 `before` 与运行中的当前边界**逐字段相等**（含
+  签名本身，而非同尺寸的另一检查点），`SignedPrune` 经
+  `verify_signed_prune` 验真（含回执与检查点的根、链头绑定），
+  `SignedConsistency` 经 `verify_signed_consistency` 验真（含两端同算法与
+  Merkle 一致性证明），且 `consistency.old == before`、
+  `consistency.new == prune.checkpoint`、新边界尺寸严格大于旧边界——由此确认
+  删除沿**严格递增边界**发生且每次演进只是只追加扩展。`initial` 不是
+  `SignedRoot`、`transitions` 不是元组或元素不是 `RetentionTransition` 抛
+  `TypeError`（含绕过冻结构造器写入的容器字段类型错）；嵌套结构非法沿用各
+  既有容器与验真入口的 `TypeError` / `ValueError`；公钥不是 `bytes` 抛
+  `TypeError`、不是 32 字节抛 `ValueError`；结构合法但签名、根、链头、证明
+  或相邻边界不符返回 `False`；`transitions` 为空且 `initial` 有效时返回
+  `True`；核验全程只读
+- `encode_retention_transition(transition)` /
+  `decode_retention_transition(data)` 把单个保留演进凭据序列化为规范二进制并
+  原样还原，使其可落盘、跨进程恢复后继续参与离线链核验，且不引入任何新的
+  签名原文：
+
+```python
+from auditchain import (
+    encode_retention_transition,
+    decode_retention_transition,
+)
+
+data = encode_retention_transition(t2)              # bytes，可写文件/发网络
+restored = decode_retention_transition(data)        # 冻结 RetentionTransition
+restored == t2                                      # True：字段相等
+encode_retention_transition(restored) == data       # True：重编码逐字节相同
+verify_retention_chain(initial, (t1, restored), public_key)  # True
+```
+
+  字节流为 `D || U(1) || B(B0) || B(P) || B(C)`，其中
+  `D = b"auditchain/retention-transition/v1\0"`，`U` 为 8 字节无符号大端整数，
+  `B(x) = U(len(x)) || x`；三个 blob 依次为既有
+  `encode_signed_root(before)`、`encode_signed_prune(prune)`、
+  `encode_signed_consistency(consistency)` 输出的完整规范字节，顺序固定、解码
+  精确消费且**禁止尾随字节**。`encode_retention_transition` 只接受
+  `RetentionTransition`（其余类型抛 `TypeError`，嵌套错误沿用既有编码器的
+  `TypeError` / `ValueError`），`decode_retention_transition` 只接受 `bytes`
+  （含拒绝 `bytearray` / `memoryview`）；魔数、版本、截断、尾随、blob 长度或
+  任一嵌套格式非法抛 `ValueError`；结构合法但三项凭据不互洽或签名不匹配仍可
+  解码，`verify_retention_chain` 返回 `False`；两个入口均为只读且确定
+
 ### 完整日志状态的签名导出与恢复（Ed25519）
 
 `dump_log(log, private_key)` 把一份**完整、未裁剪、无认证、无加密历史**的

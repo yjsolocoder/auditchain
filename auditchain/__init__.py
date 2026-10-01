@@ -15,6 +15,8 @@ FullEncryptedSearchReceipt /
 SignedFullEncryptedSearchReceipt /
 FullSearchReceipt /
 SignedFullSearchReceipt /
+RangeSearchReceipt /
+SignedRangeSearchReceipt /
 SignedSearchReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / IntegrityIssue / IntegrityReport /
@@ -32,6 +34,8 @@ verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
+verify_range_search_receipt /
+verify_signed_range_search_receipt /
 inspect_full_search_receipt /
 inspect_full_encrypted_search_receipt /
 inspect_search_receipt /
@@ -60,6 +64,9 @@ encode_audit_receipt / decode_audit_receipt /
 encode_full_encrypted_search_receipt /
 decode_full_encrypted_search_receipt /
 encode_full_search_receipt / decode_full_search_receipt /
+encode_range_search_receipt / decode_range_search_receipt /
+encode_signed_range_search_receipt /
+decode_signed_range_search_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_batch_inclusion_proof / decode_batch_inclusion_proof /
@@ -151,6 +158,7 @@ __all__ = [
     "IntegrityReport",
     "MerkleFrontier",
     "PruneReceipt",
+    "RangeSearchReceipt",
     "RotatedAnchorSet",
     "RotatedChain",
     "StageRotatedAnchorSet",
@@ -169,6 +177,7 @@ __all__ = [
     "SignedFullEncryptedSearchReceipt",
     "SignedFullSearchReceipt",
     "SignedPrune",
+    "SignedRangeSearchReceipt",
     "SignedRoot",
     "SignedSearchReceipt",
     "SignedStageAuthBundle",
@@ -197,6 +206,7 @@ __all__ = [
     "decode_integrity_report",
     "decode_merkle_frontier",
     "decode_prune_receipt",
+    "decode_range_search_receipt",
     "decode_rotation",
     "decode_rotated_anchor",
     "decode_rotated_anchor_set",
@@ -212,6 +222,7 @@ __all__ = [
     "decode_signed_full_encrypted_search_receipt",
     "decode_signed_full_search_receipt",
     "decode_signed_prune",
+    "decode_signed_range_search_receipt",
     "decode_signed_root",
     "decode_signed_search_receipt",
     "decode_signed_stage_auth_audit_bundle",
@@ -255,6 +266,7 @@ __all__ = [
     "encode_integrity_report",
     "encode_merkle_frontier",
     "encode_prune_receipt",
+    "encode_range_search_receipt",
     "encode_rotation",
     "encode_rotated_anchor",
     "encode_rotated_anchor_set",
@@ -270,6 +282,7 @@ __all__ = [
     "encode_signed_full_encrypted_search_receipt",
     "encode_signed_full_search_receipt",
     "encode_signed_prune",
+    "encode_signed_range_search_receipt",
     "encode_signed_root",
     "encode_signed_search_receipt",
     "encode_signed_stage_auth_audit_bundle",
@@ -336,6 +349,7 @@ __all__ = [
     "verify_full_encrypted_search_receipt",
     "verify_full_search_receipt",
     "verify_inclusion",
+    "verify_range_search_receipt",
     "verify_rotated_chain",
     "verify_rotation",
     "verify_rotation_chain",
@@ -350,6 +364,7 @@ __all__ = [
     "verify_signed_full_encrypted_search_receipt",
     "verify_signed_full_search_receipt",
     "verify_signed_prune",
+    "verify_signed_range_search_receipt",
     "verify_signed_root",
     "verify_signed_search_receipt",
     "verify_signed_stage_auth_bundle",
@@ -424,6 +439,23 @@ _FULL_ENCRYPTED_SEARCH_VERSION = 1
 # decode_full_encrypted_search_receipt: same u64/blob rules as the full
 # search receipt, appending the hit-index count and one u64 per hit.
 _FULL_ENCRYPTED_SEARCH_MAGIC = b"auditchain/full-encrypted-search/v1\0"
+# Binary framing of encode_range_search_receipt /
+# decode_range_search_receipt: same u64/blob rules as the full search
+# receipt, persisting a raw byte-order interval query: the normalized
+# ``left`` and ``right`` bounds replace the equality ``query``, and the
+# receipt still carries every entry of the searched half-open range plus one
+# shared compact batch inclusion proof, so an offline verifier's own
+# ``left <= payload < right`` comparison over the authenticated entries
+# yields the complete hit set.
+_RANGE_SEARCH_MAGIC = b"auditchain/range-search/v1\0"
+_RANGE_SEARCH_VERSION = 1
+# Binary framing of encode_signed_range_search_receipt /
+# decode_signed_range_search_receipt: same u64/blob rules, bundling a range
+# receipt blob with a 64-byte Ed25519 signature over a domain-separated
+# message that embeds the whole canonical range-receipt encoding, so the
+# signature binds every receipt field, including the snapshot root.
+_SIGNED_RANGE_SEARCH_MAGIC = b"auditchain/signed-range-search/v1\0"
+_SIGNED_RANGE_SEARCH_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -997,6 +1029,23 @@ def _signed_root_message(hash_name: str, size: int, root: bytes, head: bytes) ->
         + _encode_u64(size, "size")
         + _encode_blob(root)
         + _encode_blob(head)
+    )
+
+
+def _signed_range_search_message(receipt_blob: bytes) -> bytes:
+    """M of signed_range_search_receipt / verify_signed_range_search_receipt.
+
+    ``D || 0x01 || B(receipt_blob)`` with
+    ``D = b"auditchain/signed-range-search/v1\\0"`` and
+    ``B(x) = U(len(x)) || x``; ``receipt_blob`` is the complete canonical
+    output of :func:`encode_range_search_receipt`, so the signature binds
+    every field of the receipt — both bounds, the index range, the complete
+    entry set and the shared proof — including the snapshot Merkle root.
+    """
+    return (
+        _SIGNED_RANGE_SEARCH_MAGIC
+        + bytes((0x01,))
+        + _encode_blob(receipt_blob)
     )
 
 
@@ -1885,6 +1934,202 @@ class FullEncryptedSearchReceipt:
                     f"start ({self.start}) <= hit < stop ({self.stop})"
                 )
             previous_hit = hit
+
+
+@dataclass(frozen=True)
+class RangeSearchReceipt:
+    """Offline completeness receipt for a raw byte-order interval search.
+
+    Issued by :meth:`AuditLog.range_search_receipt` and verified entirely
+    offline by :func:`verify_range_search_receipt`:
+
+    - ``version``: receipt format version, always ``1``,
+    - ``hash_name``: hash algorithm of the log that issued the receipt,
+    - ``size``: number of entries in the snapshot the receipt refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``left`` / ``right``: the normalized interval bounds (a ``str`` bound
+      is UTF-8 encoded at construction; the stored values are always
+      ``bytes``); an entry hits exactly when
+      ``left <= entry.payload < right`` under native ``bytes`` ordering,
+    - ``start`` / ``stop``: the half-open absolute-index range the search
+      covered, satisfying ``0 <= start <= stop <= size``,
+    - ``items``: every :class:`Entry` of the searched range, one per
+      absolute index in strictly ascending order — exactly the indices
+      ``start, start + 1, ..., stop - 1``, so an incomplete coverage, a
+      duplicate or an out-of-order entry is rejected at construction,
+    - ``proof``: the single shared compact batch inclusion proof (as
+      produced by :meth:`AuditLog.batch_inclusion_proof`) covering all of
+      ``items`` within the snapshot.
+
+    Because the receipt carries the whole searched range, once the entries
+    are authenticated against the snapshot root, the verifier's own
+    comparison of each payload against ``left`` and ``right`` yields the
+    complete hit set — available as :attr:`hits` — so a missing hit cannot
+    be concealed and an empty hit set cannot be forged: the payloads that
+    decide it are the authenticated ones. Encrypted entries participate
+    with their sealed envelope bytes exactly as in
+    :meth:`AuditLog.find_range`; nothing is decrypted. Equal bounds are
+    legal and always yield ``hits == ()``; ``left > right`` is rejected. An
+    empty range (and any empty snapshot) carries ``items == ()`` and
+    ``proof == ()``.
+
+    Instances are immutable, may be built positionally and compare by all
+    ten fields. The constructor fixes only types, widths, ordering,
+    coverage and ranges — whether the entry digests and the shared proof
+    actually rebuild ``root`` is left to :func:`verify_range_search_receipt`,
+    so a tampered receipt is still constructible and round-trips. Every
+    binary field (``root``, each entry's ``payload`` / ``previous_hash`` /
+    ``entry_hash`` and every shared-proof node) must be exact ``bytes``:
+    ``bytearray`` and ``memoryview`` are rejected rather than copied, so a
+    received receipt never silently aliases a mutable caller buffer.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    left: bytes
+    right: bytes
+    start: int
+    stop: int
+    items: tuple
+    proof: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != 1:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        # root must be exact bytes: bytearray and memoryview are rejected
+        # rather than copied, so a received receipt never silently aliases a
+        # mutable caller buffer.
+        if not isinstance(self.root, bytes):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        for name in ("left", "right"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.encode("utf-8"))
+            elif not isinstance(value, bytes):
+                raise TypeError(f"{name} must be bytes or str")
+        if self.left > self.right:
+            raise ValueError("left must not exceed right")
+        for name in ("start", "stop"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.start <= self.stop <= self.size:
+            raise ValueError(
+                f"range must satisfy 0 <= start <= stop <= size ({self.size})"
+            )
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of Entry records")
+        previous_index = -1
+        for entry in self.items:
+            if not isinstance(entry, Entry):
+                raise TypeError("item must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), bytes):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index <= previous_index:
+                raise ValueError("item indices must be in strictly ascending order")
+            if not self.start <= entry.index < self.stop:
+                raise ValueError(
+                    f"entry.index {entry.index} must satisfy "
+                    f"start ({self.start}) <= index < stop ({self.stop})"
+                )
+            previous_index = entry.index
+        if len(self.items) != self.stop - self.start:
+            # Strictly ascending in-range indices only cover the range when
+            # there is exactly one entry per absolute index.
+            raise ValueError(
+                f"items must carry every entry of the range "
+                f"[{self.start}, {self.stop})"
+            )
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof element must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+        if not self.items and self.proof:
+            raise ValueError("an empty range receipt must carry an empty proof")
+
+    @property
+    def hits(self) -> tuple[int, ...]:
+        """Absolute indices of the authenticated entries inside ``[left, right)``.
+
+        Computed from the receipt's own authenticated entries in strictly
+        ascending order; equal bounds always yield ``()``. This is exactly
+        the complete hit set :func:`verify_range_search_receipt` derives
+        offline, so a concealed hit or forged emptiness would have to remove
+        or alter a covered entry, which breaks coverage or authentication.
+        """
+        return tuple(
+            entry.index
+            for entry in self.items
+            if self.left <= entry.payload < self.right
+        )
+
+
+@dataclass(frozen=True)
+class SignedRangeSearchReceipt:
+    """Range-search completeness receipt sealed by a pre-trusted Ed25519 key.
+
+    Bundles a :class:`RangeSearchReceipt` with a 64-byte Ed25519 signature
+    over a domain-separated message embedding the receipt's whole canonical
+    encoding (:func:`encode_range_search_receipt`), so the signature binds
+    every receipt field — both interval bounds, the index range, the
+    complete entry set and the shared proof — together with the snapshot
+    Merkle root. An offline receiver holding only a pre-trusted 32-byte
+    Ed25519 public key can therefore confirm with
+    :func:`verify_signed_range_search_receipt` that the whole artifact was
+    issued by the log holder, without holding the :class:`AuditLog`.
+
+    - ``receipt``: the :class:`RangeSearchReceipt` produced by
+      :meth:`AuditLog.range_search_receipt`,
+    - ``signature``: the 64-byte Ed25519 signature over
+      ``D || 0x01 || B(encode_range_search_receipt(receipt))`` with
+      ``D = b"auditchain/signed-range-search/v1\\0"``.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. ``receipt`` must be a :class:`RangeSearchReceipt` and
+    ``signature`` exact 64-byte ``bytes`` — wrong field types raise
+    TypeError and a wrong signature width ValueError. Whether the signature
+    is genuine is left to :func:`verify_signed_range_search_receipt`.
+    """
+
+    receipt: RangeSearchReceipt
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, RangeSearchReceipt):
+            raise TypeError("receipt must be a RangeSearchReceipt")
+        if not isinstance(self.signature, bytes):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
 
 
 @dataclass(frozen=True)
@@ -4539,6 +4784,60 @@ class AuditLog:
                 matches.append(index)
         return tuple(matches)
 
+    def find_range(
+        self,
+        left: Any,
+        right: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Absolute indices whose raw payload bytes lie in ``[left, right)``.
+
+        Like :meth:`find`, the search covers the half-open range
+        ``[start, stop)`` of absolute indices (default
+        ``[retain_from, len(log))``; explicit bounds must be non-bool
+        integers satisfying ``retain_from <= start <= stop <= len(log)``)
+        and the hits come back as a tuple of absolute indices in strictly
+        ascending order. Unlike :meth:`find`, the match is a raw byte-order
+        interval over each retained entry's stored ``Entry.payload``: an
+        entry at index ``i`` hits exactly when
+        ``left <= self.entry(i).payload < right`` under Python's native
+        ``bytes`` lexicographic ordering.
+
+        ``left`` and ``right`` accept ``bytes`` or ``str`` (a ``str`` is
+        UTF-8 encoded at the boundary, exactly like :meth:`find`'s query);
+        anything else raises TypeError. Equal bounds return ``()`` (a
+        half-open interval never contains its own boundary); ``left >
+        right`` raises ValueError. Encrypted entries are treated exactly as
+        by :meth:`find`: their ``Entry.payload`` is the sealed envelope and
+        only those envelope bytes participate in the comparison — the query
+        never decrypts, rewrites an entry, or touches the chain,
+        authentication state, the locator indexes, a Merkle root or any
+        proof.
+        """
+        if isinstance(left, str):
+            left_material = left.encode("utf-8")
+        elif isinstance(left, bytes):
+            left_material = left
+        else:
+            raise TypeError("left must be bytes or str")
+        if isinstance(right, str):
+            right_material = right.encode("utf-8")
+        elif isinstance(right, bytes):
+            right_material = right
+        else:
+            raise TypeError("right must be bytes or str")
+        start, stop = self._resolve_find_range(start, stop)
+        if left_material == right_material:
+            return ()
+        if left_material > right_material:
+            raise ValueError("left must not exceed right")
+        return tuple(
+            index
+            for index in range(start, stop)
+            if left_material <= self._entries[index - self._retain_from].payload < right_material
+        )
+
     def search_receipt(
         self,
         query: Any,
@@ -4843,6 +5142,141 @@ class AuditLog:
             proof=proof,
             hits=hits,
         )
+
+    def range_search_receipt(
+        self,
+        left: Any,
+        right: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> RangeSearchReceipt:
+        """Issue an offline :class:`RangeSearchReceipt` proving completeness
+        for a raw byte-order interval search over the snapshot's first
+        ``size`` entries.
+
+        Runs the same lookup as :meth:`find_range` over the half-open range
+        ``[start, stop)`` — an entry hits exactly when its stored raw
+        ``Entry.payload`` bytes satisfy ``left <= payload < right`` — but,
+        like :meth:`full_search_receipt`, the receipt carries *every* entry
+        of the searched range together with a single shared compact batch
+        inclusion proof covering all of them. :func:`verify_range_search_receipt`
+        can therefore check offline — without holding the log — that the
+        listed entries are exactly the range's authenticated content; its
+        own interval comparison over those payloads then yields the complete
+        hit set (also exposed as the receipt's ``hits`` property), so no hit
+        can be concealed and an empty hit set cannot be forged without
+        dropping or altering a covered entry.
+
+        ``left`` and ``right`` accept ``bytes`` or ``str`` (UTF-8 encoded);
+        anything else raises TypeError. Equal bounds are legal and yield no
+        hits; ``left > right`` raises ValueError. Encrypted entries take
+        part with their sealed envelope bytes exactly as in
+        :meth:`find_range`; nothing is decrypted or rewritten. ``size``
+        defaults to the current log length and the snapshot must still be
+        rebuildable (a prefix released by :meth:`prune` is not). The range
+        defaults to the retained segment ``[retain_from, size)``; explicit
+        bounds must be non-bool integers satisfying
+        ``retain_from <= start <= stop <= size``. Wrong types raise
+        TypeError, out-of-range values or an unrebuildable snapshot
+        ValueError. An empty range — and any empty snapshot — yields
+        ``items == ()`` and ``proof == ()``. The call is read-only:
+        entries, head, authentication state, the locator indexes, Merkle
+        roots and proofs are left untouched.
+        """
+        if isinstance(left, str):
+            left_material = left.encode("utf-8")
+        elif isinstance(left, bytes):
+            left_material = left
+        else:
+            raise TypeError("left must be bytes or str")
+        if isinstance(right, str):
+            right_material = right.encode("utf-8")
+        elif isinstance(right, bytes):
+            right_material = right
+        else:
+            raise TypeError("right must be bytes or str")
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        first = self._retain_from
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = size
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= size:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({size})"
+            )
+        if left_material > right_material:
+            raise ValueError("left must not exceed right")
+        root = self.merkle_root(size)
+        items = tuple(self.entry(index) for index in range(start, stop))
+        if items:
+            _, proof = self.batch_inclusion_proof(
+                tuple(range(start, stop)), size
+            )
+        else:
+            proof = ()
+        return RangeSearchReceipt(
+            version=_RANGE_SEARCH_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            left=left_material,
+            right=right_material,
+            start=start,
+            stop=stop,
+            items=items,
+            proof=proof,
+        )
+
+    def signed_range_search_receipt(
+        self,
+        left: Any,
+        right: Any,
+        private_key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> SignedRangeSearchReceipt:
+        """Issue a :class:`SignedRangeSearchReceipt`: a complete interval
+        search receipt sealed by a pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``receipt =
+        range_search_receipt(left, right, start, stop, size)`` followed by
+        one Ed25519 signature over a domain-separated message embedding the
+        receipt's whole canonical encoding (``D || 0x01 ||
+        B(encode_range_search_receipt(receipt))`` with
+        ``D = b"auditchain/signed-range-search/v1\\0"``), bundled as one
+        :class:`SignedRangeSearchReceipt`. The signature therefore binds
+        every receipt field — both bounds, the index range, the complete
+        entry set and the shared proof — and the snapshot Merkle root; an
+        offline receiver with only a pre-trusted 32-byte Ed25519 public key
+        confirms the whole artifact with
+        :func:`verify_signed_range_search_receipt`, no :class:`AuditLog`
+        required.
+
+        The bounds, range, ``size`` and failure semantics are exactly those
+        of :meth:`range_search_receipt`; ``private_key`` must be a 32-byte
+        Ed25519 seed (non-``bytes`` raises TypeError, a wrong length
+        ValueError). The call is read-only and repeatable: the same log
+        state and seed yield byte-for-byte the same bundle, and any failure
+        raises before the bundle is constructed, leaving all state
+        unchanged.
+        """
+        receipt = self.range_search_receipt(left, right, start, stop, size)
+        signing_key = _load_ed25519_seed(private_key)
+        message = _signed_range_search_message(
+            encode_range_search_receipt(receipt)
+        )
+        signature = signing_key.sign(message)
+        return SignedRangeSearchReceipt(receipt=receipt, signature=signature)
 
     def verify_entry(self, index: int) -> bool:
         """Check that one retained entry links correctly to its predecessor."""
@@ -6799,6 +7233,143 @@ def verify_full_encrypted_search_receipt(receipt: Any, key: Any) -> bool:
         if hmac.compare_digest(plaintext, checked.query):
             hits.append(entry.index)
     return tuple(hits) == checked.hits
+
+
+def verify_range_search_receipt(receipt: Any) -> bool:
+    """Verify a :class:`RangeSearchReceipt` without holding the log.
+
+    Recomputes every listed entry's digest from the entry's fields and
+    re-verifies the single shared compact batch inclusion proof against the
+    receipt's snapshot root via :func:`verify_batch_inclusion`. Because the
+    receipt carries every entry of the searched range ``[start, stop)`` —
+    the constructor rejects an incomplete coverage, duplicates and
+    out-of-order indices — the caller's own interval comparison,
+    ``receipt.left <= entry.payload < receipt.right``, over those
+    authenticated entries yields the complete hit set (exactly
+    :attr:`RangeSearchReceipt.hits`): unlike :func:`verify_search_receipt`,
+    a concealed hit is a structural failure, not a silent omission, and an
+    empty hit set cannot be forged without dropping or altering the covered
+    entry that would have hit. Encrypted entries are compared by their
+    sealed envelope bytes exactly as :meth:`AuditLog.find_range` does;
+    nothing is decrypted.
+
+    An empty range (``items == ()`` and ``proof == ()``) attests no
+    content; an empty snapshot (``size == 0``) additionally only accepts
+    the canonical empty-tree root. A structurally valid receipt whose entry
+    content, proof or root does not match returns False. Malformed input
+    raises TypeError or ValueError exactly as
+    :class:`RangeSearchReceipt` construction does (a non-
+    :class:`RangeSearchReceipt` argument, or a receipt whose frozen fields
+    were bypassed into an illegal shape, raises the same errors; a proof
+    node count that does not fit the listed indices and ``size`` raises
+    ValueError as in :func:`verify_batch_inclusion`). The call is read-only.
+    """
+    if not isinstance(receipt, RangeSearchReceipt):
+        raise TypeError("receipt must be a RangeSearchReceipt")
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = RangeSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.left,
+        receipt.right,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    if not checked.items:
+        if checked.size == 0:
+            return hmac.compare_digest(
+                checked.root, _hash_parts(checked.hash_name, _EMPTY_DOMAIN)
+            )
+        # An empty range of a non-empty snapshot attests no content; the
+        # recorded root cannot be checked without evidence, exactly as for
+        # an empty-range FullSearchReceipt.
+        return True
+    entry_hashes: list[bytes] = []
+    for entry in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        entry_hashes.append(entry.entry_hash)
+    indices = tuple(entry.index for entry in checked.items)
+    return verify_batch_inclusion(
+        indices,
+        tuple(entry_hashes),
+        checked.size,
+        checked.root,
+        checked.proof,
+        hash_name=checked.hash_name,
+    )
+
+
+def verify_signed_range_search_receipt(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedRangeSearchReceipt` against a pre-trusted key.
+
+    Confirms both claims of the sealed bundle without holding the log:
+    :func:`verify_range_search_receipt` recomputes every entry digest in
+    the complete searched range and re-verifies the shared compact batch
+    proof against the receipt's snapshot root, and the bundle's 64-byte
+    Ed25519 signature is checked with the 32-byte ``public_key`` over the
+    domain-separated message embedding the whole canonical receipt
+    encoding — so it binds every receipt field, both interval bounds and
+    the snapshot root. A genuine sealed bundle from the trusted key
+    returns True; a structurally valid bundle signed by another key, or
+    whose receipt, signature or any bound/entry/proof/root has been
+    altered, returns False — all without raising. Input that is not a
+    :class:`SignedRangeSearchReceipt` (or whose container fields have been
+    bypassed to wrong types) raises TypeError; nested structural violations
+    raise exactly the exceptions of :class:`RangeSearchReceipt` and
+    :func:`verify_range_search_receipt` (TypeError or ValueError), and a
+    public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedRangeSearchReceipt):
+        raise TypeError("bundle must be a SignedRangeSearchReceipt")
+    # Re-validate the container fields even for an instance whose fields
+    # were set bypassing the frozen constructor, so container-type
+    # corruption raises TypeError exactly as the constructor would.
+    if not isinstance(bundle.receipt, RangeSearchReceipt):
+        raise TypeError("receipt must be a RangeSearchReceipt")
+    if not isinstance(bundle.signature, bytes):
+        raise TypeError("signature must be bytes")
+    if len(bundle.signature) != _ED25519_SIGNATURE_BYTES:
+        raise ValueError(
+            f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+        )
+    # Re-validate the nested receipt as its own constructor would, so a
+    # bypassed field raises exactly the constructor's TypeError or
+    # ValueError rather than being reported as False.
+    receipt = RangeSearchReceipt(
+        bundle.receipt.version,
+        bundle.receipt.hash_name,
+        bundle.receipt.size,
+        bundle.receipt.root,
+        bundle.receipt.left,
+        bundle.receipt.right,
+        bundle.receipt.start,
+        bundle.receipt.stop,
+        bundle.receipt.items,
+        bundle.receipt.proof,
+    )
+    if not verify_range_search_receipt(receipt):
+        return False
+    verification_key = _load_ed25519_public(public_key)
+    message = _signed_range_search_message(encode_range_search_receipt(receipt))
+    try:
+        verification_key.verify(bundle.signature, message)
+    except InvalidSignature:
+        return False
+    return True
 
 
 def _unpack_audit_batch(
@@ -8825,6 +9396,249 @@ def decode_full_encrypted_search_receipt(data: Any) -> FullEncryptedSearchReceip
     )
     _check_full_search_receipt_proof(receipt)
     return receipt
+
+
+def encode_range_search_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`RangeSearchReceipt` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/range-search/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in the order ``version`` (always 1), ``hash_name`` (UTF-8
+    blob), ``size``, ``root`` blob, ``left`` blob, ``right`` blob,
+    ``start``, ``stop``, item count, one item per listed entry —
+    ``Entry.index``, ``payload`` blob, ``previous_hash`` blob,
+    ``entry_hash`` blob, exactly as entries are written by
+    :func:`encode_full_search_receipt` — and finally the shared proof node
+    count followed by one blob per proof digest, with nothing omitted,
+    reordered or appended. ``receipt`` must be a :class:`RangeSearchReceipt`
+    (anything else raises TypeError); every field is re-validated exactly
+    as the constructor would, so a receipt whose frozen fields were
+    bypassed into an illegal shape raises the same TypeError or
+    ValueError, and a shared proof whose node count does not fit the listed
+    indices and ``size`` raises ValueError. Encoding is read-only and
+    deterministic: re-encoding a decoded receipt reproduces the original
+    bytes exactly.
+    """
+    if not isinstance(receipt, RangeSearchReceipt):
+        raise TypeError("receipt must be a RangeSearchReceipt")
+    checked = RangeSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.left,
+        receipt.right,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+    )
+    _check_full_search_receipt_proof(checked)
+    parts = [
+        _RANGE_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(bytes(checked.left)),
+        _encode_blob(bytes(checked.right)),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for digest in checked.proof:
+        parts.append(_encode_blob(bytes(digest)))
+    return b"".join(parts)
+
+
+def decode_range_search_receipt(data: Any) -> RangeSearchReceipt:
+    """Decode bytes produced by :func:`encode_range_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad
+    magic, a version other than 1, invalid UTF-8 in ``hash_name``, an
+    unknown hash algorithm, truncation, trailing bytes, an oversized blob
+    length, digest-width mismatches, inverted interval bounds
+    (``left > right``), an out-of-range or inverted index range,
+    non-ascending or duplicate item indices, an item index outside the
+    recorded range, an incomplete coverage of the searched range, a
+    non-empty proof on an empty range, or a shared proof whose node count
+    does not fit the listed indices and ``size`` all raise ValueError. The
+    decoded receipt's fields equal the originally encoded ones and satisfy
+    :func:`verify_range_search_receipt` whenever the original did; a
+    structurally valid receipt whose content does not match still decodes
+    and only fails verification. The call is read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_RANGE_SEARCH_MAGIC):
+        raise ValueError("not an auditchain range-search encoding")
+    offset = len(_RANGE_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    left = read_blob("left")
+    right = read_blob("right")
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = RangeSearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        left=left,
+        right=right,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+        proof=proof,
+    )
+    _check_full_search_receipt_proof(receipt)
+    return receipt
+
+
+def encode_signed_range_search_receipt(bundle: Any) -> bytes:
+    """Encode a :class:`SignedRangeSearchReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-range-search/v1\\0"``; it then writes, strictly
+    in order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the receipt blob and the raw 64-byte Ed25519
+    signature — nothing may be omitted, reordered or appended. The receipt
+    blob is a u64 byte length followed by the complete canonical output of
+    :func:`encode_range_search_receipt` over ``bundle.receipt``; the
+    signature follows verbatim. The signed message embeds exactly those
+    receipt bytes, so no new signing message is introduced beyond the
+    range-search domain separator.
+
+    ``bundle`` must be a :class:`SignedRangeSearchReceipt` — anything else,
+    or a bundle whose container fields have been bypassed to wrong types,
+    raises TypeError; nested structural problems raise exactly the
+    exceptions of :func:`encode_range_search_receipt` (TypeError or
+    ValueError), and a signature that is not 64 bytes raises ValueError.
+    Encoding is deterministic: re-encoding a decoded bundle reproduces the
+    original bytes exactly, and a structurally valid bundle whose signature
+    does not match encodes just as well.
+    """
+    if not isinstance(bundle, SignedRangeSearchReceipt):
+        raise TypeError("bundle must be a SignedRangeSearchReceipt")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedRangeSearchReceipt(bundle.receipt, bundle.signature)
+    receipt_blob = encode_range_search_receipt(checked.receipt)
+    return b"".join((
+        _SIGNED_RANGE_SEARCH_MAGIC,
+        _encode_u64(_SIGNED_RANGE_SEARCH_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        checked.signature,
+    ))
+
+
+def decode_signed_range_search_receipt(data: Any) -> SignedRangeSearchReceipt:
+    """Decode bytes produced by :func:`encode_signed_range_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-range-search/v1\\0"`` it must contain, strictly
+    in order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed receipt blob and exactly 64 raw signature bytes, with no
+    trailing bytes. The receipt blob is handed whole to
+    :func:`decode_range_search_receipt`, so every nested framing and
+    structural rule is hers. A bad magic or version, truncation, an
+    oversized blob length, trailing bytes, a signature that is not 64 bytes
+    or an illegal nested encoding all raise ValueError.
+
+    The returned object is a frozen :class:`SignedRangeSearchReceipt` whose
+    fields equal the originally encoded ones, and re-encoding reproduces
+    the original bytes exactly. A structurally sound encoding whose
+    signature simply does not verify still decodes;
+    :func:`verify_signed_range_search_receipt` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_RANGE_SEARCH_MAGIC):
+        raise ValueError("not an auditchain signed-range-search encoding")
+    offset = len(_SIGNED_RANGE_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_RANGE_SEARCH_VERSION:
+        raise ValueError(
+            f"unsupported signed-range-search version {version}"
+        )
+    receipt_blob = read_blob("receipt")
+    signature_end = offset + _ED25519_SIGNATURE_BYTES
+    if signature_end > len(data):
+        raise ValueError("truncated encoding: expected 64 bytes for signature")
+    signature = data[offset:signature_end]
+    offset = signature_end
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed range search receipt")
+    receipt = decode_range_search_receipt(receipt_blob)
+    return SignedRangeSearchReceipt(receipt=receipt, signature=signature)
 
 
 def encode_prune_receipt(receipt: Any) -> bytes:

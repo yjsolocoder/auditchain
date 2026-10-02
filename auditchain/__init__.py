@@ -14080,6 +14080,62 @@ def decode_audit_batch(data: Any) -> tuple[str, int, bytes, tuple[Entry, ...], t
     return receipt
 
 
+class _CredentialReader:
+    """Cursor over a canonical offline-credential encoding.
+
+    Single home for the parsing rules the InclusionProof /
+    BatchInclusionProof / ConsistencyProof / MerkleFrontier decoders apply
+    identically: the input must be exact ``bytes`` and start with the
+    codec's magic, integers are unsigned 8-byte big-endian values, blobs are
+    a u64 byte length followed by the raw bytes, ``hash_name`` is a UTF-8
+    blob, and the whole input must be consumed exactly. Keeping the rules
+    here stops the four decoders from drifting apart; each decoder only
+    supplies its own magic, version and error wording.
+    """
+
+    __slots__ = ("_data", "_offset")
+
+    def __init__(self, data: Any, magic: bytes, magic_error: str) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError("data must be bytes")
+        if not data.startswith(magic):
+            raise ValueError(magic_error)
+        self._data = data
+        self._offset = len(magic)
+
+    def read_u64(self, name: str) -> int:
+        end = self._offset + _U64_BYTES
+        if end > len(self._data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(self._data[self._offset:end], "big")
+        self._offset = end
+        return value
+
+    def read_blob(self, name: str) -> bytes:
+        length = self.read_u64(f"{name} length")
+        end = self._offset + length
+        if end > len(self._data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = self._data[self._offset:end]
+        self._offset = end
+        return blob
+
+    def read_version(self, expected: int, version_error: str) -> None:
+        if self.read_u64("version") != expected:
+            raise ValueError(version_error)
+
+    def read_hash_name(self) -> str:
+        raw_name = self.read_blob("hash_name")
+        try:
+            return raw_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("hash_name is not valid UTF-8") from error
+
+    def finish(self, trailing_error: str) -> None:
+        if self._offset != len(self._data):
+            raise ValueError(trailing_error)
+
+
 def encode_batch_inclusion_proof(credential: Any) -> bytes:
     """Encode a :class:`BatchInclusionProof` into its canonical binary form.
 
@@ -14153,49 +14209,24 @@ def decode_batch_inclusion_proof(data: Any) -> BatchInclusionProof:
     passed to :func:`verify_batch_inclusion` in another process exactly as
     the original could.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_BATCH_INCLUSION_MAGIC):
-        raise ValueError("not an auditchain batch-inclusion-proof encoding")
-    offset = len(_BATCH_INCLUSION_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    if version != _BATCH_INCLUSION_VERSION:
-        raise ValueError("unsupported batch-inclusion-proof version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    index_count = read_u64("indices count")
-    indices = tuple(read_u64("index") for _ in range(index_count))
-    entry_hash_count = read_u64("entry_hashes count")
-    entry_hashes = tuple(read_blob("entry_hash") for _ in range(entry_hash_count))
-    size = read_u64("size")
-    root = read_blob("root")
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    if offset != len(data):
-        raise ValueError("trailing bytes after the batch inclusion proof")
+    reader = _CredentialReader(
+        data,
+        _BATCH_INCLUSION_MAGIC,
+        "not an auditchain batch-inclusion-proof encoding",
+    )
+    reader.read_version(
+        _BATCH_INCLUSION_VERSION, "unsupported batch-inclusion-proof version"
+    )
+    hash_name = reader.read_hash_name()
+    index_count = reader.read_u64("indices count")
+    indices = tuple(reader.read_u64("index") for _ in range(index_count))
+    entry_hash_count = reader.read_u64("entry_hashes count")
+    entry_hashes = tuple(reader.read_blob("entry_hash") for _ in range(entry_hash_count))
+    size = reader.read_u64("size")
+    root = reader.read_blob("root")
+    proof_count = reader.read_u64("proof count")
+    proof = tuple(reader.read_blob("proof element") for _ in range(proof_count))
+    reader.finish("trailing bytes after the batch inclusion proof")
     return BatchInclusionProof(
         hash_name=hash_name,
         indices=indices,
@@ -14271,47 +14302,18 @@ def decode_inclusion_proof(data: Any) -> InclusionProof:
     passed to :func:`verify_inclusion` in another process exactly as the
     original could.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_INCLUSION_MAGIC):
-        raise ValueError("not an auditchain inclusion-proof encoding")
-    offset = len(_INCLUSION_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    if version != _INCLUSION_VERSION:
-        raise ValueError("unsupported inclusion-proof version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    index = read_u64("index")
-    size = read_u64("size")
-    entry_hash = read_blob("entry_hash")
-    root = read_blob("root")
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    if offset != len(data):
-        raise ValueError("trailing bytes after the inclusion proof")
+    reader = _CredentialReader(
+        data, _INCLUSION_MAGIC, "not an auditchain inclusion-proof encoding"
+    )
+    reader.read_version(_INCLUSION_VERSION, "unsupported inclusion-proof version")
+    hash_name = reader.read_hash_name()
+    index = reader.read_u64("index")
+    size = reader.read_u64("size")
+    entry_hash = reader.read_blob("entry_hash")
+    root = reader.read_blob("root")
+    proof_count = reader.read_u64("proof count")
+    proof = tuple(reader.read_blob("proof element") for _ in range(proof_count))
+    reader.finish("trailing bytes after the inclusion proof")
     return InclusionProof(
         hash_name=hash_name,
         index=index,
@@ -14388,47 +14390,18 @@ def decode_consistency_proof(data: Any) -> ConsistencyProof:
     it can be passed to :func:`verify_consistency` in another process
     exactly as the original could.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_CONSISTENCY_MAGIC):
-        raise ValueError("not an auditchain consistency-proof encoding")
-    offset = len(_CONSISTENCY_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    if version != _CONSISTENCY_VERSION:
-        raise ValueError("unsupported consistency-proof version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    old_size = read_u64("old_size")
-    old_root = read_blob("old_root")
-    new_size = read_u64("new_size")
-    new_root = read_blob("new_root")
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    if offset != len(data):
-        raise ValueError("trailing bytes after the consistency proof")
+    reader = _CredentialReader(
+        data, _CONSISTENCY_MAGIC, "not an auditchain consistency-proof encoding"
+    )
+    reader.read_version(_CONSISTENCY_VERSION, "unsupported consistency-proof version")
+    hash_name = reader.read_hash_name()
+    old_size = reader.read_u64("old_size")
+    old_root = reader.read_blob("old_root")
+    new_size = reader.read_u64("new_size")
+    new_root = reader.read_blob("new_root")
+    proof_count = reader.read_u64("proof count")
+    proof = tuple(reader.read_blob("proof element") for _ in range(proof_count))
+    reader.finish("trailing bytes after the consistency proof")
     return ConsistencyProof(
         hash_name=hash_name,
         old_size=old_size,
@@ -14551,47 +14524,18 @@ def decode_merkle_frontier(data: Any) -> MerkleFrontier:
     originally encoded ones and whose re-encoding reproduces the original
     bytes exactly.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_FRONTIER_MAGIC):
-        raise ValueError("not an auditchain merkle-frontier encoding")
-    offset = len(_FRONTIER_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    if version != _FRONTIER_VERSION:
-        raise ValueError("unsupported merkle-frontier version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    size = read_u64("size")
-    subtree_count = read_u64("subtree count")
+    reader = _CredentialReader(
+        data, _FRONTIER_MAGIC, "not an auditchain merkle-frontier encoding"
+    )
+    reader.read_version(_FRONTIER_VERSION, "unsupported merkle-frontier version")
+    hash_name = reader.read_hash_name()
+    size = reader.read_u64("size")
+    subtree_count = reader.read_u64("subtree count")
     subtrees = tuple(
-        (read_u64("subtree height"), read_blob("subtree digest"))
+        (reader.read_u64("subtree height"), reader.read_blob("subtree digest"))
         for _ in range(subtree_count)
     )
-    if offset != len(data):
-        raise ValueError("trailing bytes after the merkle frontier")
+    reader.finish("trailing bytes after the merkle frontier")
     return MerkleFrontier(hash_name=hash_name, size=size, subtrees=subtrees)
 
 

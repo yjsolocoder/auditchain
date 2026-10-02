@@ -387,6 +387,94 @@ verify_prefix_search_receipt(restored)           # True
 既有 `find`、`find_range`、各搜索回执、签名消息与全部旧序列化格式行为不变；新
 前缀入口不重新定义任何旧格式。
 
+### 可持久化、可离线验证的 JSON 字段检索索引（Ed25519）
+
+`find_json(pointer, value, start=None, stop=None)` 按 RFC 6901 JSON Pointer 对
+每条 JSON 条目的标量字段做相等查询：严格 UTF-8 JSON（禁止重复对象成员名）、指针
+成功解析且定位到标量，并按 JSON 种类比较（字符串/布尔/null 只与同类相等，整数
+与浮点数都是 JSON 数、按数值相等，`True` 永不等于 `1`）；非 JSON、缺字段、
+定位到对象/数组或 AES-256-GCM 密文封装都不命中，返回严格升序绝对索引 tuple。
+
+```python
+log.append(b'{"a": 1}')
+log.append(b'{"a": 1.0}')     # 与 1 数值相等
+log.append(b'{"a": true}')    # 不同种类，不与 1 相等
+log.find_json("/a", 1)        # (0, 1)
+log.find_json("/a", True)     # (2,)
+```
+
+`signed_json_search_index(pointer, private_key, size=None)` 为**同一指针的多次
+标量相等查询**冻结一个可持久化、可离线验证的字段检索索引，绑定指针、摘要算法、
+`size` 处快照的 Merkle 根与链头，覆盖 `[retain_from, size)` 全部保留条目（
+`size` 默认当前日志长度，且快照必须仍可重建）。返回不可变
+`SignedJsonSearchIndex(index, signature)`，其中
+`JsonSearchIndex(version=1, hash_name, size, root, head, retain_from, pointer,
+items, proof, groups)` 携带覆盖范围内**每一个** `Entry` 与一份覆盖它们的共享
+紧凑批量包含证明，`groups` 则按解析出的标量种类（字符串/整数/浮点数/true/
+false/null）分组、再按规范化标量值分桶，每个桶保存该值命中的升序绝对索引；
+非 JSON、缺字段、定位非标量或密文条目不进入任何桶。
+
+```python
+bundle = log.signed_json_search_index("/a", seed)
+bundle.index.root == log.merkle_root()
+bundle.index.head == log.head
+bundle.find(1)          # (0, 1)：与 find_json("/a", 1) 完全一致
+bundle.find(True)       # (2,)：不同 value 可在同一冻结制品上反复查询
+bundle.find(1, 0, 1)    # (0,)：半开区间、默认 [retain_from, size)，规则同 find_json
+```
+
+因为制品携带覆盖范围内全部条目并用共享证明对快照 `root` 认证，离线核验方仅凭
+制品与已信任的 32 字节 Ed25519 公钥，就能用
+`verify_signed_json_search_index(bundle, public_key)` 重算每个 `entry_digest`、
+核对批量包含证明，并自行对已认证条目做严格 JSON 解析与指针解析，要求其完整标量
+分区与签名桶逐一吻合——少一条命中（隐藏）、多列一条（伪造）、错配桶或篡改
+payload/证明/根/链头都无法通过，全过程无需 `AuditLog`。无签名的
+`verify_json_search_index(index)` 做除验签外的同样检查。`find` 的 `value` 只
+接受 `str`、`int`、有限 `float`、`bool`、`None`（否则 `TypeError`，非有限
+float 抛 `ValueError`）；区间越界抛 `ValueError`、区间类型错误抛 `TypeError`。
+
+```python
+verify_signed_json_search_index(bundle, public_key)      # True
+verify_signed_json_search_index(bundle, other_public)    # False，不抛异常
+# 追加或裁剪后，旧快照制品的结果不变；不同 value 可重复离线查询
+log.append(b'{"a": 1}')
+bundle.find(1)                                           # 仍是快照内的命中
+```
+
+索引与签名包各有稳定的规范字节编解码入口，整数为 8 字节无符号大端、blob 为
+u64 长度前缀：索引魔数 `b"auditchain/json-search-index/v1\0"`，其后严格按字段
+顺序写 `version`、`hash_name`（UTF-8 blob）、`size`、`root` blob、`head`
+blob、`retain_from`、`pointer`（规范 RFC 6901 UTF-8 blob）、覆盖条目计数及
+各条目（`index` 与三个 blob）、共享证明计数及摘要 blob、最后为分组（每组写
+种类标签、桶数，每桶写键 blob、命中计数与升序命中）；签名包魔数为
+`b"auditchain/signed-json-search-index/v1\0"`，后接 `version`、索引 blob 与
+恰好 64 字节签名，签名原文为
+`D || 0x01 || B(encode_json_search_index(index))`（
+`D = b"auditchain/signed-json-search-index/v1\0"`），绑定指针、快照
+size/根/链头、保留点、完整覆盖条目集、共享证明与全部命中桶。
+
+```python
+from auditchain import (
+    encode_signed_json_search_index,
+    decode_signed_json_search_index,
+    verify_signed_json_search_index,
+)
+
+blob = encode_signed_json_search_index(bundle)
+restored = decode_signed_json_search_index(blob)
+encode_signed_json_search_index(restored) == blob        # True：往返逐字节一致
+verify_signed_json_search_index(restored, public_key)    # True
+```
+
+同状态同私钥两次签发逐字节相同；解码只接受精确 `bytes`（拒绝 `bytearray` /
+`memoryview`），拒绝截断、尾随字节、错误魔数/版本、未知算法或种类标签、非法
+桶键（非规范/非有限数、非 UTF-8 字符串）、摘要宽度不符、覆盖不完整、命中越界、
+一条目落入多个桶以及证明节点数不符——结构错误抛 `ValueError`，非 `bytes`
+输入抛 `TypeError`；结构合法但内容或签名被篡改的制品仍可解码，仅核验判
+`False`。`pointer` 非 `str`、私钥或解码输入非 `bytes` 抛 `TypeError`；指针
+非法、`size` 越界或指向已裁剪不可重建快照、私钥长度不对抛 `ValueError`。签发
+只读且可重复，失败不改变条目、链头、认证、裁剪状态或既有索引。
+
 ### 加密追加（AES-256-GCM）
 
 `encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但

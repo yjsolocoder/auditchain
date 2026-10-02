@@ -22,6 +22,8 @@ SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / RetentionTransition /
 IntegrityIssue / IntegrityReport /
 JsonSearchReceipt /
+JsonSearchIndex / JsonSearchIndexGroup / JsonSearchIndexBucket /
+SignedJsonSearchIndex /
 ContinuationChainReport / AnchoredContinuationChain /
 StageAnchoredContinuationChain /
 AnchorSet /
@@ -128,6 +130,7 @@ dump_hybrid / load_hybrid.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import hmac
 import json
 import math
@@ -163,6 +166,9 @@ __all__ = [
     "InclusionProof",
     "IntegrityIssue",
     "IntegrityReport",
+    "JsonSearchIndex",
+    "JsonSearchIndexBucket",
+    "JsonSearchIndexGroup",
     "JsonSearchReceipt",
     "MerkleFrontier",
     "PrefixSearchReceipt",
@@ -186,6 +192,7 @@ __all__ = [
     "SignedEncryptedSearchReceipt",
     "SignedFullEncryptedSearchReceipt",
     "SignedFullSearchReceipt",
+    "SignedJsonSearchIndex",
     "SignedPrune",
     "SignedRangeSearchReceipt",
     "SignedRoot",
@@ -214,6 +221,7 @@ __all__ = [
     "decode_full_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
+    "decode_json_search_index",
     "decode_json_search_receipt",
     "decode_merkle_frontier",
     "decode_prefix_search_receipt",
@@ -234,6 +242,7 @@ __all__ = [
     "decode_signed_encrypted_search_receipt",
     "decode_signed_full_encrypted_search_receipt",
     "decode_signed_full_search_receipt",
+    "decode_signed_json_search_index",
     "decode_signed_prune",
     "decode_signed_range_search_receipt",
     "decode_signed_root",
@@ -277,6 +286,7 @@ __all__ = [
     "encode_full_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
+    "encode_json_search_index",
     "encode_json_search_receipt",
     "encode_merkle_frontier",
     "encode_prefix_search_receipt",
@@ -297,6 +307,7 @@ __all__ = [
     "encode_signed_encrypted_search_receipt",
     "encode_signed_full_encrypted_search_receipt",
     "encode_signed_full_search_receipt",
+    "encode_signed_json_search_index",
     "encode_signed_prune",
     "encode_signed_range_search_receipt",
     "encode_signed_root",
@@ -365,6 +376,7 @@ __all__ = [
     "verify_full_encrypted_search_receipt",
     "verify_full_search_receipt",
     "verify_inclusion",
+    "verify_json_search_index",
     "verify_json_search_receipt",
     "verify_range_search_receipt",
     "verify_prefix_search_receipt",
@@ -382,6 +394,7 @@ __all__ = [
     "verify_signed_encrypted_search_receipt",
     "verify_signed_full_encrypted_search_receipt",
     "verify_signed_full_search_receipt",
+    "verify_signed_json_search_index",
     "verify_signed_prune",
     "verify_signed_range_search_receipt",
     "verify_signed_root",
@@ -494,6 +507,27 @@ _JSON_SEARCH_VERSION = 1
 # signature binds every receipt field, including the snapshot root.
 _SIGNED_RANGE_SEARCH_MAGIC = b"auditchain/signed-range-search/v1\0"
 _SIGNED_RANGE_SEARCH_VERSION = 1
+# Persistent, offline-verifiable JSON field retrieval index for the repeated
+# scalar-equality queries of find_json against one RFC 6901 pointer. The
+# envelope binds the canonical pointer, hash algorithm, snapshot size, Merkle
+# root and chain head, covers [retain_from, size) and carries, per observed
+# resolved-scalar kind, every entry of that kind (with a single shared compact
+# batch inclusion proof over the covered range) plus the ascending absolute
+# indices of those entries grouped by their canonical scalar value, so a
+# verifier can reproduce every hit set offline.
+_JSON_SEARCH_INDEX_MAGIC = b"auditchain/json-search-index/v1\0"
+_JSON_SEARCH_INDEX_VERSION = 1
+# Signed envelope of AuditLog.signed_json_search_index: a fixed magic, then the
+# envelope version as a u64, a u64-length-prefixed blob holding the complete
+# canonical encoding of the index, and the raw 64-byte Ed25519 signature over a
+# domain-separated message embedding exactly those index bytes.
+_SIGNED_JSON_SEARCH_INDEX_MAGIC = (
+    b"auditchain/signed-json-search-index/v1\0"
+)
+_SIGNED_JSON_SEARCH_INDEX_VERSION = 1
+_SIGNED_JSON_SEARCH_INDEX_DOMAIN = (
+    b"auditchain/signed-json-search-index/v1\0"
+)
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -1095,6 +1129,23 @@ def _signed_range_search_message(receipt_blob: bytes) -> bytes:
     )
 
 
+def _signed_json_search_index_message(index_blob: bytes) -> bytes:
+    """M of signed_json_search_index / verify_signed_json_search_index.
+
+    ``D || 0x01 || B(index_blob)`` with
+    ``D = b"auditchain/signed-json-search-index/v1\\0"`` and
+    ``B(x) = U(len(x)) || x``; ``index_blob`` is the complete canonical
+    output of :func:`encode_json_search_index`, so the signature binds the
+    pointer, hash algorithm, snapshot size/root/head, retain point, the
+    whole covered entry set, the shared proof and every hit bucket.
+    """
+    return (
+        _SIGNED_JSON_SEARCH_INDEX_DOMAIN
+        + bytes((0x01,))
+        + _encode_blob(index_blob)
+    )
+
+
 def _signed_verifier_message(hash_name: str, key: bytes) -> bytes:
     """M of export_signed_verifier / verify_signed_verifier.
 
@@ -1286,9 +1337,73 @@ _JSON_TAG_FALSE = 5
 # Sentinel for "this payload yields no queryable scalar at the pointer".
 _JSON_MISSING = object()
 
+# Scalar kinds that may appear in a JsonSearchIndex group.
+_JSON_INDEX_KINDS = frozenset(
+    {
+        _JSON_TAG_STRING,
+        _JSON_TAG_INTEGER,
+        _JSON_TAG_FLOAT,
+        _JSON_TAG_TRUE,
+        _JSON_TAG_NULL,
+        _JSON_TAG_FALSE,
+    }
+)
+
+# Kinds whose single value is encoded as the empty blob (true / false / null).
+_JSON_INDEX_EMPTY_KINDS = frozenset(
+    {_JSON_TAG_TRUE, _JSON_TAG_FALSE, _JSON_TAG_NULL}
+)
+
 
 class _JsonDuplicateMember(ValueError):
     """Internal: a JSON object repeated a member name."""
+
+
+def _decode_json_index_numeric(kind: int, key: bytes) -> Any:
+    """Decode a canonical integer/float bucket key back to its number.
+
+    Structural validity (ASCII, finite) is enforced by
+    :func:`_check_json_index_bucket_key`; this only re-parses.
+    """
+    if kind == _JSON_TAG_INTEGER:
+        return int(key.decode("ascii"))
+    return float(key.decode("ascii"))
+
+
+def _check_json_index_bucket_key(kind: int, key: Any) -> None:
+    """Validate one bucket key blob for its group's kind."""
+    if not isinstance(key, bytes):
+        raise TypeError("bucket key must be bytes")
+    if kind in _JSON_INDEX_EMPTY_KINDS:
+        if key:
+            raise ValueError(
+                "a boolean or null bucket key must be the empty blob"
+            )
+        return
+    if kind == _JSON_TAG_STRING:
+        # Strings carry arbitrary text; the key must be valid UTF-8.
+        try:
+            key.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("string bucket key must be valid UTF-8") from error
+        return
+    try:
+        text = key.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("numeric bucket key must be ASCII") from error
+    if kind == _JSON_TAG_INTEGER:
+        digits = text[1:] if text[:1] == "-" else text
+        if not digits or any(ch not in "0123456789" for ch in digits):
+            raise ValueError("integer bucket key must be canonical ASCII decimal")
+    elif kind == _JSON_TAG_FLOAT:
+        try:
+            value = float(text)
+        except ValueError as error:
+            raise ValueError("float bucket key must be an ASCII number") from error
+        if not math.isfinite(value):
+            raise ValueError("float bucket key must be finite")
+        if repr(value).encode("ascii") != key:
+            raise ValueError("float bucket key must be the canonical repr spelling")
 
 
 def _check_json_value(value: Any) -> None:
@@ -1438,6 +1553,109 @@ def _json_entry_matches(
         return False
     found = _json_scalar_at(payload, tokens)
     return found is not _JSON_MISSING and _json_scalar_matches(found, value)
+
+
+def _json_entry_scalar(payload: bytes, tokens: tuple[str, ...]) -> Any:
+    """The addressed scalar of one stored payload, or ``_JSON_MISSING``.
+
+    Same resolution rules as :func:`_json_entry_matches` — an AES-256-GCM
+    envelope is never parsed — but returns the resolved scalar itself so the
+    JSON field retrieval index can group entries by their addressed value.
+    """
+    if payload.startswith(_ENC_MAGIC):
+        return _JSON_MISSING
+    return _json_scalar_at(payload, tokens)
+
+
+def _json_index_tag_of_scalar(value: Any) -> int:
+    """Value-type tag of a resolved JSON scalar (mirrors _encode_json_value)."""
+    if isinstance(value, bool):
+        return _JSON_TAG_TRUE if value else _JSON_TAG_FALSE
+    if value is None:
+        return _JSON_TAG_NULL
+    if isinstance(value, str):
+        return _JSON_TAG_STRING
+    if isinstance(value, int):
+        return _JSON_TAG_INTEGER
+    return _JSON_TAG_FLOAT
+
+
+def _json_index_key_of_scalar(kind: int, value: Any) -> bytes:
+    """Canonical encoded bucket key of a resolved scalar of ``kind``."""
+    if kind == _JSON_TAG_STRING:
+        return value.encode("utf-8")
+    if kind == _JSON_TAG_INTEGER:
+        return str(value).encode("ascii")
+    if kind == _JSON_TAG_FLOAT:
+        # -0.0 and 0.0 are equal JSON numbers (find_json compares them by
+        # value), so normalize a negative zero before spelling the key.
+        return repr(value + 0.0).encode("ascii")
+    return b""
+
+
+def _build_json_search_index(
+    log: "AuditLog", tokens: tuple[str, ...], size: int
+) -> "JsonSearchIndex":
+    """Construct the unsigned :class:`JsonSearchIndex` snapshot artifact.
+
+    Assumes the pointer is already parsed and ``size`` resolved and
+    rebuildable by the caller; all state is read from the log without
+    mutating it.
+    """
+    first = log._retain_from
+    if size == 0:
+        root = _hash_parts(log._hash_name, _EMPTY_DOMAIN)
+    else:
+        # Mirror merkle_root: a non-empty prefix released by prune cannot
+        # be rebuilt. (The empty root is universal and needs no data.)
+        log._require_retained_snapshot(size)
+        root = log._fold_occupied(log._occupied_at(size))
+    head = log._chain_head_at(size)
+    items = tuple(log.entry(index) for index in range(first, size))
+    if items:
+        _, proof = log.batch_inclusion_proof(tuple(range(first, size)), size)
+    else:
+        proof = ()
+    # tag -> canonical key -> ascending absolute indices
+    collected: dict[int, dict[bytes, list[int]]] = {}
+    for entry in items:
+        scalar = _json_entry_scalar(entry.payload, tokens)
+        if scalar is _JSON_MISSING:
+            continue
+        if isinstance(scalar, float) and not math.isfinite(scalar):
+            # Strict JSON payloads can never reach here; stay defensive.
+            continue
+        kind = _json_index_tag_of_scalar(scalar)
+        key = _json_index_key_of_scalar(kind, scalar)
+        collected.setdefault(kind, {}).setdefault(key, []).append(entry.index)
+    groups: list[JsonSearchIndexGroup] = []
+    for kind in sorted(collected):
+        keyed = collected[kind]
+        if kind == _JSON_TAG_STRING:
+            ordered_keys = sorted(keyed)
+        elif kind in _JSON_INDEX_EMPTY_KINDS:
+            ordered_keys = (b"",)
+        else:
+            ordered_keys = sorted(
+                keyed, key=lambda blob: _decode_json_index_numeric(kind, blob)
+            )
+        buckets = tuple(
+            JsonSearchIndexBucket(key=key, hits=tuple(keyed[key]))
+            for key in ordered_keys
+        )
+        groups.append(JsonSearchIndexGroup(kind=kind, buckets=buckets))
+    return JsonSearchIndex(
+        version=_JSON_SEARCH_INDEX_VERSION,
+        hash_name=log._hash_name,
+        size=size,
+        root=root,
+        head=head,
+        retain_from=first,
+        pointer=_json_pointer_canonical(tokens),
+        items=items,
+        proof=proof,
+        groups=tuple(groups),
+    )
 
 
 
@@ -2617,6 +2835,393 @@ class JsonSearchReceipt:
             for entry in self.items
             if _json_entry_matches(entry.payload, tokens, self.value)
         )
+
+
+@dataclass(frozen=True)
+class JsonSearchIndexBucket:
+    """One scalar value bucket of a :class:`JsonSearchIndexGroup`.
+
+    ``key`` is the canonical encoded scalar of the bucket under the group's
+    kind — UTF-8 bytes for a string, canonical ASCII decimal for an integer,
+    ``repr`` ASCII for a float, an empty blob for ``true``, ``false`` and
+    ``null`` — and ``hits`` is the tuple of ascending absolute indices whose
+    addressed scalar is exactly that value.
+    """
+
+    key: bytes
+    hits: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, bytes):
+            raise TypeError("bucket key must be bytes")
+        if not isinstance(self.hits, tuple):
+            raise TypeError("bucket hits must be a tuple of integers")
+        previous = -1
+        for index in self.hits:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("bucket hit must be a non-bool integer")
+            if index < 0:
+                raise ValueError("bucket hit must be non-negative")
+            if index <= previous:
+                raise ValueError(
+                    "bucket hits must be strictly ascending with no duplicates"
+                )
+            previous = index
+
+
+@dataclass(frozen=True)
+class JsonSearchIndexGroup:
+    """All hit buckets of one JSON scalar kind in a :class:`JsonSearchIndex`.
+
+    ``kind`` is one of the JSON value type tags
+    (``_JSON_TAG_STRING`` / ``_JSON_TAG_INTEGER`` / ``_JSON_TAG_FLOAT`` /
+    ``_JSON_TAG_TRUE`` / ``_JSON_TAG_NULL`` / ``_JSON_TAG_FALSE``) and
+    ``buckets`` partitions the kind's entries by their canonical encoded
+    scalar value in canonical order (lexicographic key bytes for strings,
+    numeric order for integers and floats, a single empty-key bucket for
+    ``true`` / ``false`` / ``null``).
+    """
+
+    kind: int
+    buckets: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, int) or isinstance(self.kind, bool):
+            raise TypeError("group kind must be an integer")
+        if self.kind not in _JSON_INDEX_KINDS:
+            raise ValueError(f"unknown JSON scalar kind tag {self.kind}")
+        if not isinstance(self.buckets, tuple):
+            raise TypeError("buckets must be a tuple of JsonSearchIndexBucket")
+        previous_key: bytes | None = None
+        previous_numeric: Any = None
+        for bucket in self.buckets:
+            if not isinstance(bucket, JsonSearchIndexBucket):
+                raise TypeError("bucket must be a JsonSearchIndexBucket")
+            # Re-validate the bucket even for one built bypassing its
+            # constructor, so structural corruption raises exactly as the
+            # bucket constructor would.
+            JsonSearchIndexBucket(bucket.key, bucket.hits)
+            _check_json_index_bucket_key(self.kind, bucket.key)
+            if not bucket.hits:
+                raise ValueError("a bucket must carry at least one hit")
+            if self.kind in _JSON_INDEX_EMPTY_KINDS:
+                if len(self.buckets) != 1:
+                    raise ValueError(
+                        "a boolean or null group carries exactly one bucket"
+                    )
+            elif self.kind == _JSON_TAG_STRING:
+                # Strings are ordered lexicographically by their UTF-8 bytes.
+                if previous_key is not None and not bucket.key > previous_key:
+                    raise ValueError(
+                        "buckets must be unique and in ascending key order"
+                    )
+            else:
+                numeric = _decode_json_index_numeric(self.kind, bucket.key)
+                if previous_numeric is not None and not numeric > previous_numeric:
+                    raise ValueError(
+                        "buckets must be unique and in ascending numeric order"
+                    )
+                previous_numeric = numeric
+            previous_key = bucket.key
+
+
+@dataclass(frozen=True)
+class JsonSearchIndex:
+    """Persistent, offline-verifiable JSON field retrieval index.
+
+    Issued (signed) by :meth:`AuditLog.signed_json_search_index` and verified
+    entirely offline by :func:`verify_signed_json_search_index`, it freezes
+    the repeated scalar-equality lookups of :meth:`AuditLog.find_json` for
+    one RFC 6901 ``pointer`` over the entries ``[retain_from, size)`` of the
+    snapshot of the first ``size`` entries:
+
+    - ``version``: format version, always ``1``,
+    - ``hash_name``: hash algorithm of the issuing log,
+    - ``size``: number of entries in the bound snapshot,
+    - ``root``: Merkle root of that snapshot,
+    - ``head``: chain head at that snapshot (the entry hash of its last
+      record, the digest-width zero value for an empty prefix),
+    - ``retain_from``: absolute index of the first covered entry,
+    - ``pointer``: the canonical RFC 6901 JSON Pointer the index is bound
+      to (the empty string addresses the whole document),
+    - ``items``: every :class:`Entry` of the covered range, one per absolute
+      index in strictly ascending order — exactly the indices
+      ``retain_from, retain_from + 1, ..., size - 1``,
+    - ``proof``: the single shared compact batch inclusion proof (as produced
+      by :meth:`AuditLog.batch_inclusion_proof`) covering all of ``items``
+      within the snapshot,
+    - ``groups``: one :class:`JsonSearchIndexGroup` per observed scalar
+      kind; its buckets list, per canonical encoded scalar value, the
+      ascending indices of entries whose addressed JSON scalar is that
+      value. Entries that are not strict JSON, repeat a member name, miss
+      the field or address a non-scalar appear in no bucket.
+
+    Because the index carries the whole covered range and the shared proof
+    authenticates every entry against ``root``, the offline verifier's own
+    strict JSON parse and pointer resolution over those entries must
+    reproduce every bucket exactly: a concealed hit, a forged hit or a
+    reordering cannot survive verification. :meth:`find` then answers any
+    number of scalar-equality queries for the bound pointer purely from
+    the frozen groups — later appends or prunes never change a snapshot's
+    index.
+
+    Instances are immutable, may be built positionally and compare by all
+    ten fields. The constructor validates types, widths, ranges, ordering
+    and bucket structure; whether the entry digests, the shared proof and
+    the bucket partition actually match the authenticated content is left
+    to :func:`verify_signed_json_search_index`, so a tampered index is
+    still constructible and round-trips.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    head: bytes
+    retain_from: int
+    pointer: str
+    items: tuple
+    proof: tuple
+    groups: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != _JSON_SEARCH_INDEX_VERSION:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        for name in ("size", "retain_from"):
+            bound = getattr(self, name)
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.size < _U64_LIMIT:
+            raise ValueError("size must satisfy 0 <= size < 2**64")
+        if not 0 <= self.retain_from <= self.size:
+            raise ValueError(
+                "retain_from must satisfy 0 <= retain_from <= size"
+            )
+        for name in ("root", "head"):
+            value = getattr(self, name)
+            if not isinstance(value, bytes):
+                raise TypeError(f"{name} must be bytes")
+            if len(value) != digest_size:
+                raise ValueError(f"{name} must be {digest_size} bytes")
+        if not isinstance(self.pointer, str):
+            raise TypeError("pointer must be a string")
+        tokens = _parse_json_pointer(self.pointer)
+        canonical = _json_pointer_canonical(tokens)
+        if canonical != self.pointer:
+            object.__setattr__(self, "pointer", canonical)
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of Entry records")
+        expected_index = self.retain_from
+        for entry in self.items:
+            if not isinstance(entry, Entry):
+                raise TypeError("item must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), bytes):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index != expected_index:
+                raise ValueError(
+                    "items must carry every covered entry in ascending order "
+                    f"[retain_from ({self.retain_from}), size ({self.size}))"
+                )
+            expected_index += 1
+        if len(self.items) != self.size - self.retain_from:
+            raise ValueError(
+                "items must carry every entry of [retain_from, size)"
+            )
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof element must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+        if not self.items and self.proof:
+            raise ValueError("an empty coverage index must carry an empty proof")
+        if not isinstance(self.groups, tuple):
+            raise TypeError("groups must be a tuple of JsonSearchIndexGroup")
+        seen_kinds: list[int] = []
+        assigned: dict[int, tuple[int, bytes]] = {}
+        for group in self.groups:
+            if not isinstance(group, JsonSearchIndexGroup):
+                raise TypeError("group must be a JsonSearchIndexGroup")
+            # Re-validate the group even for one built bypassing its
+            # constructor, so structural corruption raises exactly as the
+            # group constructor would.
+            JsonSearchIndexGroup(group.kind, group.buckets)
+            if seen_kinds and group.kind <= seen_kinds[-1]:
+                raise ValueError(
+                    "groups must be unique and in ascending kind order"
+                )
+            seen_kinds.append(group.kind)
+            for bucket in group.buckets:
+                for index in bucket.hits:
+                    if not self.retain_from <= index < self.size:
+                        raise ValueError(
+                            f"bucket hit {index} must satisfy retain_from "
+                            f"({self.retain_from}) <= index < size ({self.size})"
+                        )
+                    if index in assigned:
+                        raise ValueError(
+                            f"entry {index} is assigned to more than one bucket"
+                        )
+                    assigned[index] = (group.kind, bucket.key)
+
+    def _range_bounds(self, start: Any, stop: Any) -> tuple[int, int]:
+        """Validate a :meth:`find` half-open range exactly like find_json."""
+        first = self.retain_from
+        last = self.size
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = last
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= last:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({last})"
+            )
+        return start, stop
+
+    def _groups_by_kind(self) -> dict[int, JsonSearchIndexGroup]:
+        return {group.kind: group for group in self.groups}
+
+    def find(
+        self,
+        value: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Answer a find_json scalar-equality query from the frozen index.
+
+        The accepted ``value`` types, the JSON kind-separated comparison
+        (strings, booleans and null match only their own kind; ints and
+        floats are both JSON numbers and compare by numeric value), the
+        half-open ``[start, stop)`` range defaults and bounds, and the
+        strictly ascending absolute-index result order are exactly those of
+        :meth:`AuditLog.find_json` over the index's covered snapshot.
+        A value of another type raises TypeError; a non-finite float or an
+        out-of-range bound raises ValueError and a wrong bound type
+        TypeError. The lookup is read-only and never mutates the index.
+        """
+        _check_json_value(value)
+        start, stop = self._range_bounds(start, stop)
+        groups = self._groups_by_kind()
+        streams: list[tuple[int, ...]] = []
+
+        def add_bucket(kind: int, key: bytes) -> None:
+            group = groups.get(kind)
+            if group is None:
+                return
+            for bucket in group.buckets:
+                if bucket.key == key:
+                    streams.append(bucket.hits)
+                    return
+
+        if isinstance(value, bool):
+            add_bucket(_JSON_TAG_TRUE if value else _JSON_TAG_FALSE, b"")
+        elif value is None:
+            add_bucket(_JSON_TAG_NULL, b"")
+        elif isinstance(value, str):
+            add_bucket(_JSON_TAG_STRING, value.encode("utf-8"))
+        elif isinstance(value, int):
+            add_bucket(_JSON_TAG_INTEGER, str(value).encode("ascii"))
+            group = groups.get(_JSON_TAG_FLOAT)
+            if group is not None:
+                # Python compares an int and a float by exact rational value
+                # without rounding the int, so big integers never spuriously
+                # match a nearby float; compare against the decoded int query
+                # directly rather than converting anything to float first.
+                for bucket in group.buckets:
+                    if _decode_json_index_numeric(
+                        _JSON_TAG_FLOAT, bucket.key
+                    ) == value:
+                        streams.append(bucket.hits)
+        else:
+            # float (finiteness was checked above): numbers match across the
+            # integer and float kinds by exact numeric value.
+            group = groups.get(_JSON_TAG_FLOAT)
+            if group is not None:
+                for bucket in group.buckets:
+                    if _decode_json_index_numeric(
+                        _JSON_TAG_FLOAT, bucket.key
+                    ) == value:
+                        streams.append(bucket.hits)
+            group = groups.get(_JSON_TAG_INTEGER)
+            if group is not None:
+                for bucket in group.buckets:
+                    if (
+                        _decode_json_index_numeric(
+                            _JSON_TAG_INTEGER, bucket.key
+                        )
+                        == value
+                    ):
+                        streams.append(bucket.hits)
+        merged = heapq.merge(*streams) if streams else ()
+        return tuple(index for index in merged if start <= index < stop)
+
+
+@dataclass(frozen=True)
+class SignedJsonSearchIndex:
+    """Persistent JSON field retrieval index sealed by a trusted Ed25519 key.
+
+    Bundles the :class:`JsonSearchIndex` of
+    :meth:`AuditLog.signed_json_search_index` with a 64-byte Ed25519
+    signature over a domain-separated message embedding the index's whole
+    canonical encoding (:func:`encode_json_search_index`), so the
+    signature binds the pointer, hash algorithm, snapshot ``size``, Merkle
+    root, chain head, retain point, the complete covered entry set, the
+    shared proof and every hit bucket. An offline receiver holding only a
+    pre-trusted 32-byte Ed25519 public key confirms coverage, the complete
+    hit sets and the signature with
+    :func:`verify_signed_json_search_index` — no :class:`AuditLog`
+    required — then answers repeated :meth:`find` queries offline.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. ``index`` must be a :class:`JsonSearchIndex` and ``signature``
+    exact 64-byte ``bytes`` (``bytearray`` / ``memoryview`` are rejected);
+    whether the signature is genuine is left to
+    :func:`verify_signed_json_search_index`.
+    """
+
+    index: JsonSearchIndex
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.index, JsonSearchIndex):
+            raise TypeError("index must be a JsonSearchIndex")
+        if not isinstance(self.signature, bytes):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
+
+    @property
+    def pointer(self) -> str:
+        return self.index.pointer
+
+    def find(
+        self,
+        value: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Find on the bundled :class:`JsonSearchIndex`; semantics identical."""
+        return self.index.find(value, start, stop)
 
 
 @dataclass(frozen=True)
@@ -6067,6 +6672,58 @@ class AuditLog:
             proof=proof,
         )
 
+    def signed_json_search_index(
+        self,
+        pointer: Any,
+        private_key: Any,
+        size: int | None = None,
+    ) -> SignedJsonSearchIndex:
+        """Freeze a persistent, offline-verifiable JSON field retrieval index.
+
+        Builds a :class:`JsonSearchIndex` bound to the RFC 6901 ``pointer``,
+        this log's hash algorithm and the snapshot of the first ``size``
+        entries (defaulting to the current log length): it carries the
+        snapshot ``size``, its Merkle ``root`` and the chain ``head``, the
+        ``retain_from`` retain point, every retained entry of
+        ``[retain_from, size)`` with one shared compact batch inclusion
+        proof over that range, and the complete hit buckets grouping those
+        entries by the kind and value of their addressed JSON scalar. One
+        Ed25519 signature over a domain-separated message embedding the
+        index's whole canonical encoding is then bundled as a
+        :class:`SignedJsonSearchIndex`; an offline receiver holding only a
+        pre-trusted 32-byte Ed25519 public key confirms coverage, every hit
+        set and the signature with
+        :func:`verify_signed_json_search_index`, no :class:`AuditLog`
+        required, and answers repeated
+        :meth:`SignedJsonSearchIndex.find` scalar-equality queries purely
+        from the frozen artifact.
+
+        The pointer rules are exactly those of :meth:`find_json`: a
+        non-``str`` raises TypeError and a malformed pointer raises
+        ValueError. ``size`` must be a non-bool integer in
+        ``0..len(log)`` whose snapshot is still rebuildable (a prefix
+        released by :meth:`prune` is not); a wrong type raises TypeError
+        and an out-of-range or unrebuildable value ValueError.
+        ``private_key`` must be a 32-byte Ed25519 seed (non-``bytes``
+        raises TypeError, a wrong length ValueError). The call is
+        read-only and repeatable: the same log state, pointer and seed
+        yield byte-for-byte the same artifact, entries, head,
+        authentication state, the locator indexes, Merkle roots, proofs
+        and pruning state are left untouched, and a failed call raises
+        before the artifact is constructed.
+        """
+        tokens = _parse_json_pointer(pointer)
+        signing_key = _load_ed25519_seed(private_key)
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        index = _build_json_search_index(self, tokens, size)
+        message = _signed_json_search_index_message(
+            encode_json_search_index(index)
+        )
+        signature = signing_key.sign(message)
+        return SignedJsonSearchIndex(index=index, signature=signature)
+
     def signed_range_search_receipt(
         self,
         left: Any,
@@ -8417,6 +9074,143 @@ def verify_json_search_receipt(receipt: Any) -> bool:
         checked.proof,
         hash_name=checked.hash_name,
     )
+
+
+def verify_json_search_index(index: Any) -> bool:
+    """Verify an unsigned :class:`JsonSearchIndex` without holding the log.
+
+    Recomputes every covered entry's digest from its fields and re-verifies
+    the single shared compact batch inclusion proof against the index's
+    snapshot root via :func:`verify_batch_inclusion`, then re-runs the
+    issuer's own strict UTF-8 JSON parse, duplicate-member rejection and
+    RFC 6901 pointer resolution over every authenticated entry and checks
+    that the recorded groups and buckets reproduce the *complete*
+    partition: each hit index must carry exactly the claimed scalar kind
+    and value, every resolved scalar must be listed, and no index may be
+    listed twice. A concealed hit, a forged or misassigned bucket entry,
+    a tampered payload/proof/root or a dropped covered entry is therefore
+    a structural or content failure, never a silent mismatch.
+
+    An empty coverage (``items == ()``) with ``size == 0`` additionally
+    accepts only the canonical empty-tree root and carries no groups; an
+    empty retained segment of a non-empty snapshot (``retain_from ==
+    size`` after a prune) attests no content and likewise carries no
+    groups. Structurally valid data whose digests, proof, root or buckets
+    do not match returns False rather than raising. Input that is not a
+    :class:`JsonSearchIndex` raises TypeError; an instance whose frozen
+    fields were bypassed into an illegal shape raises the same
+    TypeError or ValueError the constructor would. The call is read-only.
+    """
+    if not isinstance(index, JsonSearchIndex):
+        raise TypeError("index must be a JsonSearchIndex")
+    checked = JsonSearchIndex(
+        index.version,
+        index.hash_name,
+        index.size,
+        index.root,
+        index.head,
+        index.retain_from,
+        index.pointer,
+        index.items,
+        index.proof,
+        index.groups,
+    )
+    if not checked.items:
+        if checked.groups:
+            return False
+        if checked.size == 0:
+            return hmac.compare_digest(
+                checked.root,
+                _hash_parts(checked.hash_name, _EMPTY_DOMAIN),
+            )
+        # An empty retained segment of a non-empty snapshot attests no
+        # content; the recorded root cannot be checked without evidence.
+        return True
+    entry_hashes: list[bytes] = []
+    for entry in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        entry_hashes.append(entry.entry_hash)
+    indices = tuple(entry.index for entry in checked.items)
+    if not verify_batch_inclusion(
+        indices,
+        tuple(entry_hashes),
+        checked.size,
+        checked.root,
+        checked.proof,
+        hash_name=checked.hash_name,
+    ):
+        return False
+    # Reproduce the complete scalar partition from the authenticated
+    # entries and require it to equal the signed groups exactly.
+    tokens = _parse_json_pointer(checked.pointer)
+    expected: dict[tuple[int, bytes], list[int]] = {}
+    for entry in checked.items:
+        scalar = _json_entry_scalar(entry.payload, tokens)
+        if scalar is _JSON_MISSING:
+            continue
+        if isinstance(scalar, float) and not math.isfinite(scalar):
+            # Python's json accepts an overflowing numeric literal as inf;
+            # such a scalar can never equal an accepted (finite) query, so
+            # the issuer lists it in no bucket and the verifier skips it too.
+            continue
+        kind = _json_index_tag_of_scalar(scalar)
+        key = _json_index_key_of_scalar(kind, scalar)
+        expected.setdefault((kind, key), []).append(entry.index)
+    actual: dict[tuple[int, bytes], list[int]] = {}
+    for group in checked.groups:
+        for bucket in group.buckets:
+            marker = (group.kind, bucket.key)
+            if marker in actual:
+                return False
+            actual[marker] = list(bucket.hits)
+    if set(actual) != set(expected):
+        return False
+    return all(actual[marker] == expected[marker] for marker in expected)
+
+
+def verify_signed_json_search_index(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedJsonSearchIndex` against a pre-trusted key.
+
+    Confirms the whole sealed artifact offline, with no :class:`AuditLog`:
+    :func:`verify_json_search_index` recomputes every covered entry digest,
+    re-verifies the shared compact batch inclusion proof against the
+    snapshot root and checks the complete hit-bucket partition, and the
+    bundle's 64-byte Ed25519 signature is checked with the 32-byte
+    ``public_key`` over the domain-separated message embedding the whole
+    canonical index encoding — binding the pointer, hash algorithm,
+    snapshot size/root/head, retain point, the complete covered entry set,
+    the proof and every hit bucket. A genuine sealed bundle from the
+    trusted key returns True; a structurally valid bundle signed by
+    another key, or whose signature, coverage material or hit sets have
+    been altered, returns False — all without raising. Input that is not a
+    :class:`SignedJsonSearchIndex` (or whose container fields have been
+    bypassed to wrong types) raises TypeError; nested structural
+    violations raise exactly the exceptions of :class:`JsonSearchIndex`
+    and :func:`verify_json_search_index` (TypeError or ValueError), and a
+    public key that is not 32 ``bytes`` raises ValueError (a non-``bytes``
+    key TypeError). The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedJsonSearchIndex):
+        raise TypeError("bundle must be a SignedJsonSearchIndex")
+    checked = SignedJsonSearchIndex(bundle.index, bundle.signature)
+    if not verify_json_search_index(checked.index):
+        return False
+    verification_key = _load_ed25519_public(public_key)
+    message = _signed_json_search_index_message(
+        encode_json_search_index(checked.index)
+    )
+    try:
+        verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True
 
 
 def verify_signed_range_search_receipt(bundle: Any, public_key: Any) -> bool:
@@ -11095,6 +11889,292 @@ def decode_signed_range_search_receipt(data: Any) -> SignedRangeSearchReceipt:
         raise ValueError("trailing bytes after the signed range search receipt")
     receipt = decode_range_search_receipt(receipt_blob)
     return SignedRangeSearchReceipt(receipt=receipt, signature=signature)
+
+
+def _encode_json_index_groups(groups: tuple) -> list[bytes]:
+    parts: list[bytes] = [
+        _encode_u64(len(groups), "groups count"),
+    ]
+    for group in groups:
+        parts.append(_encode_u64(group.kind, "group kind"))
+        parts.append(_encode_u64(len(group.buckets), "bucket count"))
+        for bucket in group.buckets:
+            parts.append(_encode_blob(bytes(bucket.key)))
+            parts.append(_encode_u64(len(bucket.hits), "bucket hits count"))
+            for index in bucket.hits:
+                parts.append(_encode_u64(index, "bucket hit"))
+    return parts
+
+
+def encode_json_search_index(index: Any) -> bytes:
+    """Encode a :class:`JsonSearchIndex` into its canonical binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/json-search-index/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed by
+    the raw bytes (a zero length is an all-zero u64). Fields appear
+    strictly in the order ``version`` (always 1), ``hash_name`` (UTF-8
+    blob), ``size``, ``root`` blob, ``head`` blob, ``retain_from``,
+    ``pointer`` (canonical RFC 6901 UTF-8 blob), the covered item count
+    and, per item, ``Entry.index`` plus the ``payload``,
+    ``previous_hash`` and ``entry_hash`` blobs, the shared proof node
+    count with one blob per proof digest, and finally the group count —
+    each group writing its scalar kind tag, its bucket count and, per
+    bucket, the key blob, the hit count and one u64 per ascending hit —
+    with nothing omitted, reordered or appended.
+
+    ``index`` must be a :class:`JsonSearchIndex` (anything else raises
+    TypeError); every field is re-validated exactly as the constructor
+    would, so an instance whose frozen fields were bypassed into an
+    illegal shape raises the same TypeError or ValueError, and a shared
+    proof whose node count does not fit the covered indices and ``size``
+    raises ValueError. Encoding is read-only and deterministic:
+    re-encoding a decoded index reproduces the original bytes exactly.
+    """
+    if not isinstance(index, JsonSearchIndex):
+        raise TypeError("index must be a JsonSearchIndex")
+    checked = JsonSearchIndex(
+        index.version,
+        index.hash_name,
+        index.size,
+        index.root,
+        index.head,
+        index.retain_from,
+        index.pointer,
+        index.items,
+        index.proof,
+        index.groups,
+    )
+    # The shared proof is exactly a full-range batch proof over the covered
+    # indices within the snapshot, so the same node-count rule applies.
+    _check_full_search_receipt_proof(checked)
+    parts = [
+        _JSON_SEARCH_INDEX_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(bytes(checked.head)),
+        _encode_u64(checked.retain_from, "retain_from"),
+        _encode_blob(checked.pointer.encode("utf-8")),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for digest in checked.proof:
+        parts.append(_encode_blob(bytes(digest)))
+    parts.extend(_encode_json_index_groups(checked.groups))
+    return b"".join(parts)
+
+
+def _decode_json_index_groups(
+    data: bytes, read_u64, read_blob
+) -> tuple[JsonSearchIndexGroup, ...]:
+    group_count = read_u64("groups count")
+    groups: list[JsonSearchIndexGroup] = []
+    for _ in range(group_count):
+        kind = read_u64("group kind")
+        bucket_count = read_u64("bucket count")
+        buckets: list[JsonSearchIndexBucket] = []
+        for _ in range(bucket_count):
+            key = read_blob("bucket key")
+            hit_count = read_u64("bucket hits count")
+            hits = tuple(read_u64("bucket hit") for _ in range(hit_count))
+            buckets.append(JsonSearchIndexBucket(key=key, hits=hits))
+        groups.append(JsonSearchIndexGroup(kind=kind, buckets=tuple(buckets)))
+    return tuple(groups)
+
+
+def decode_json_search_index(data: Any) -> JsonSearchIndex:
+    """Decode bytes produced by :func:`encode_json_search_index`.
+
+    ``data`` must be ``bytes`` (anything else raises TypeError). A bad
+    magic, a version other than 1, invalid UTF-8 in ``hash_name`` or
+    ``pointer``, an unknown hash algorithm or scalar kind tag, a
+    malformed bucket key (a non-canonical/non-finite number, non-UTF-8
+    string), truncation, trailing bytes, an oversized blob length,
+    digest-width mismatches, an inverted ``retain_from`` / ``size``,
+    items that do not cover ``[retain_from, size)`` in order, a
+    non-empty proof on an empty coverage, a hit outside the coverage, an
+    entry assigned to more than one bucket, or a shared proof whose node
+    count does not fit the covered indices and ``size`` all raise
+    ValueError. The decoded index's fields equal the originally encoded
+    ones and satisfy :func:`verify_json_search_index` whenever the
+    original did; a structurally valid index whose content does not
+    match still decodes and only fails verification. The call is
+    read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_JSON_SEARCH_INDEX_MAGIC):
+        raise ValueError("not an auditchain json-search-index encoding")
+    offset = len(_JSON_SEARCH_INDEX_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    head = read_blob("head")
+    retain_from = read_u64("retain_from")
+    raw_pointer = read_blob("pointer")
+    try:
+        pointer = raw_pointer.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("pointer is not valid UTF-8") from error
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    groups = _decode_json_index_groups(data, read_u64, read_blob)
+    if offset != len(data):
+        raise ValueError("trailing bytes after the json search index")
+    index = JsonSearchIndex(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        head=head,
+        retain_from=retain_from,
+        pointer=pointer,
+        items=tuple(items),
+        proof=proof,
+        groups=groups,
+    )
+    _check_full_search_receipt_proof(index)
+    return index
+
+
+def encode_signed_json_search_index(bundle: Any) -> bytes:
+    """Encode a :class:`SignedJsonSearchIndex` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-json-search-index/v1\\0"``; it then writes,
+    strictly in order, the envelope ``version`` (always 1) as an unsigned
+    8-byte big-endian integer, the index blob and the raw 64-byte
+    Ed25519 signature — nothing may be omitted, reordered or appended.
+    The index blob is a u64 byte length followed by the complete
+    canonical output of :func:`encode_json_search_index` over
+    ``bundle.index``; the signature follows verbatim, and the signed
+    message embeds exactly those index bytes.
+
+    ``bundle`` must be a :class:`SignedJsonSearchIndex` — anything else,
+    or a bundle whose container fields have been bypassed to wrong
+    types, raises TypeError; nested structural problems raise exactly
+    the exceptions of :func:`encode_json_search_index` (TypeError or
+    ValueError), and a signature that is not 64 bytes raises
+    ValueError. Encoding is deterministic: re-encoding a decoded bundle
+    reproduces the original bytes exactly, and a structurally valid
+    bundle whose signature does not match encodes just as well.
+    """
+    if not isinstance(bundle, SignedJsonSearchIndex):
+        raise TypeError("bundle must be a SignedJsonSearchIndex")
+    checked = SignedJsonSearchIndex(bundle.index, bundle.signature)
+    index_blob = encode_json_search_index(checked.index)
+    return b"".join((
+        _SIGNED_JSON_SEARCH_INDEX_MAGIC,
+        _encode_u64(_SIGNED_JSON_SEARCH_INDEX_VERSION, "version"),
+        _encode_blob(index_blob),
+        checked.signature,
+    ))
+
+
+def decode_signed_json_search_index(data: Any) -> SignedJsonSearchIndex:
+    """Decode bytes produced by :func:`encode_signed_json_search_index`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray``
+    and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-json-search-index/v1\\0"`` it must contain,
+    strictly in order, the u64 envelope version (only ``1`` is
+    supported), one length-prefixed index blob and exactly 64 raw
+    signature bytes, with no trailing bytes. The index blob is handed
+    whole to :func:`decode_json_search_index`, so every nested framing
+    and structural rule is hers. A bad magic or version, truncation, an
+    oversized blob length, trailing bytes, a signature that is not 64
+    bytes or an illegal nested encoding all raise ValueError.
+
+    The returned object is a frozen :class:`SignedJsonSearchIndex`
+    whose fields equal the originally encoded ones, and re-encoding
+    reproduces the original bytes exactly. A structurally sound
+    encoding whose signature simply does not verify still decodes;
+    :func:`verify_signed_json_search_index` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_JSON_SEARCH_INDEX_MAGIC):
+        raise ValueError(
+            "not an auditchain signed-json-search-index encoding"
+        )
+    offset = len(_SIGNED_JSON_SEARCH_INDEX_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_JSON_SEARCH_INDEX_VERSION:
+        raise ValueError(
+            f"unsupported signed-json-search-index version {version}"
+        )
+    index_blob = read_blob("index")
+    signature_end = offset + _ED25519_SIGNATURE_BYTES
+    if signature_end > len(data):
+        raise ValueError("truncated encoding: expected 64 bytes for signature")
+    signature = data[offset:signature_end]
+    offset = signature_end
+    if offset != len(data):
+        raise ValueError(
+            "trailing bytes after the signed json search index"
+        )
+    index = decode_json_search_index(index_blob)
+    return SignedJsonSearchIndex(index=index, signature=signature)
 
 
 def encode_prune_receipt(receipt: Any) -> bytes:

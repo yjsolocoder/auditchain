@@ -12,6 +12,7 @@ SignedAuditBatch /
 SignedAuditReceipt /
 EncryptedSearchReceipt /
 FullEncryptedSearchReceipt /
+FullEncryptedJsonSearchReceipt /
 SignedFullEncryptedSearchReceipt /
 FullSearchReceipt /
 SignedFullSearchReceipt /
@@ -37,6 +38,7 @@ entry_digest / decrypt_entry / verify_inclusion / verify_batch_inclusion /
 verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
 verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
+verify_full_encrypted_json_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
 verify_range_search_receipt /
@@ -70,6 +72,8 @@ verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
 encode_full_encrypted_search_receipt /
 decode_full_encrypted_search_receipt /
+encode_full_encrypted_json_search_receipt /
+decode_full_encrypted_json_search_receipt /
 encode_full_search_receipt / decode_full_search_receipt /
 encode_range_search_receipt / decode_range_search_receipt /
 encode_signed_range_search_receipt /
@@ -163,6 +167,7 @@ __all__ = [
     "EncryptedSearchReceipt",
     "Entry",
     "FullEncryptedSearchReceipt",
+    "FullEncryptedJsonSearchReceipt",
     "FullSearchReceipt",
     "InclusionProof",
     "IntegrityIssue",
@@ -221,6 +226,7 @@ __all__ = [
     "decode_continuation_chain_report",
     "decode_encrypted_search_receipt",
     "decode_full_encrypted_search_receipt",
+    "decode_full_encrypted_json_search_receipt",
     "decode_full_search_receipt",
     "decode_inclusion_proof",
     "decode_integrity_report",
@@ -288,6 +294,7 @@ __all__ = [
     "encode_continuation_chain_report",
     "encode_encrypted_search_receipt",
     "encode_full_encrypted_search_receipt",
+    "encode_full_encrypted_json_search_receipt",
     "encode_full_search_receipt",
     "encode_inclusion_proof",
     "encode_integrity_report",
@@ -381,6 +388,7 @@ __all__ = [
     "verify_continuation_chain",
     "verify_encrypted_search_receipt",
     "verify_full_encrypted_search_receipt",
+    "verify_full_encrypted_json_search_receipt",
     "verify_full_search_receipt",
     "verify_inclusion",
     "verify_json_multi_index",
@@ -509,6 +517,23 @@ _PREFIX_SEARCH_VERSION = 1
 # entries yields the complete hit set.
 _JSON_SEARCH_MAGIC = b"auditchain/json-search/v1\0"
 _JSON_SEARCH_VERSION = 1
+# Binary framing of encode_full_encrypted_json_search_receipt /
+# decode_full_encrypted_json_search_receipt: same u64/blob rules as the JSON
+# search receipt, persisting a keyed RFC 6901 JSON Pointer scalar-equality
+# query over encrypted entries: the receipt still carries every entry of the
+# searched half-open range (payloads sealed) with one shared compact batch
+# inclusion proof, plus the issuer-recorded ascending hit indices and a
+# keyed confirmation digest, so an offline verifier holding only the query
+# key re-derives the complete hit set itself and a wrong — but well-formed —
+# key is detected even when the hit set is empty.
+_FULL_ENCRYPTED_JSON_SEARCH_MAGIC = b"auditchain/full-encrypted-json-search/v1\0"
+_FULL_ENCRYPTED_JSON_SEARCH_VERSION = 1
+# HMAC domain of the FullEncryptedJsonSearchReceipt key_check field: binds
+# the query key to the receipt's hash algorithm, snapshot size and root,
+# canonical pointer, typed query value and searched range without recording
+# the key or any plaintext, so a wrong 32-byte key cannot produce a
+# passing verification — not even on a receipt with an empty hit set.
+_ENC_JSON_KEY_CHECK_DOMAIN = b"auditchain/encrypted-json-key-check/v1\0"
 # Binary framing of encode_signed_range_search_receipt /
 # decode_signed_range_search_receipt: same u64/blob rules, bundling a range
 # receipt blob with a 64-byte Ed25519 signature over a domain-separated
@@ -2998,6 +3023,222 @@ class JsonSearchReceipt:
             for entry in self.items
             if _json_entry_matches(entry.payload, tokens, self.value)
         )
+
+
+def _encrypted_json_key_check(
+    hash_name: str,
+    size: int,
+    root: bytes,
+    pointer: str,
+    value: Any,
+    start: int,
+    stop: int,
+    key: bytes,
+) -> bytes:
+    """Keyed confirmation digest of a FullEncryptedJsonSearchReceipt.
+
+    ``HMAC(key, D || B(hash_name) || U(size) || B(root) || B(pointer) ||
+    U(tag) || B(value) || U(start) || U(stop))`` with
+    ``D = b"auditchain/encrypted-json-key-check/v1\\0"``, ``U`` an unsigned
+    8-byte big-endian integer, ``B(x) = U(len(x)) || x`` and ``tag`` /
+    ``value`` the canonical typed scalar encoding of
+    :func:`_encode_json_value`. Only a holder of the query key can compute
+    it, yet it reveals neither the key nor any plaintext, so a receipt can
+    carry it publicly and a wrong 32-byte key is detected even when the
+    recorded hit set is empty.
+    """
+    value_tag, value_blob = _encode_json_value(value)
+    message = (
+        _ENC_JSON_KEY_CHECK_DOMAIN
+        + _encode_blob(hash_name.encode("utf-8"))
+        + _encode_u64(size, "size")
+        + _encode_blob(root)
+        + _encode_blob(pointer.encode("utf-8"))
+        + _encode_u64(value_tag, "value type tag")
+        + _encode_blob(value_blob)
+        + _encode_u64(start, "start")
+        + _encode_u64(stop, "stop")
+    )
+    return hmac.new(key, message, hash_name).digest()
+
+
+@dataclass(frozen=True)
+class FullEncryptedJsonSearchReceipt:
+    """Offline completeness receipt for a keyed JSON-field scalar search
+    over encrypted entries.
+
+    Issued by :meth:`AuditLog.full_encrypted_json_search_receipt` and
+    verified entirely offline by
+    :func:`verify_full_encrypted_json_search_receipt`, holding only the
+    query key:
+
+    - ``version``: receipt format version, always ``1``,
+    - ``hash_name``: hash algorithm of the log that issued the receipt,
+    - ``size``: number of entries in the snapshot the receipt refers to,
+    - ``root``: Merkle root of that snapshot,
+    - ``pointer``: the canonical RFC 6901 JSON Pointer (the empty string
+      addresses the whole document), re-derived at construction,
+    - ``value``: the scalar query, exactly one of ``str``, ``int``,
+      ``float`` (finite), ``bool`` or ``None``; JSON kinds are kept apart
+      and numbers compare by numeric value,
+    - ``start`` / ``stop``: the half-open absolute-index range the search
+      covered, satisfying ``0 <= start <= stop <= size``,
+    - ``items``: every :class:`Entry` of the searched range, one per
+      absolute index in strictly ascending order — exactly the indices
+      ``start, start + 1, ..., stop - 1``, so an incomplete coverage, a
+      duplicate or an out-of-order entry is rejected at construction.
+      Each entry's payload stays sealed exactly as stored (an encrypted
+      envelope, or a plain payload for entries appended without
+      encryption); the receipt never records the key or any plaintext,
+    - ``proof``: the single shared compact batch inclusion proof (as
+      produced by :meth:`AuditLog.batch_inclusion_proof`) covering all of
+      ``items`` within the snapshot,
+    - ``hits``: the absolute indices whose envelope the issuer's key
+      unseals to a strict UTF-8 JSON document whose addressed scalar
+      equals ``value``, in strictly ascending order with no duplicates,
+      each inside ``[start, stop)``,
+    - ``key_check``: a keyed HMAC confirmation
+      (:func:`_encrypted_json_key_check`) binding the query key to the
+      receipt's hash algorithm, snapshot, pointer, typed query value and
+      range. It records neither the key nor any plaintext, yet lets the
+      verifier detect a wrong — but well-formed — key even when the hit
+      set is empty.
+
+    Because the receipt carries the whole searched range, once the entries
+    are authenticated against the snapshot root, the verifier's own
+    unsealing of each envelope with the caller-supplied key, strict JSON
+    parse, pointer resolution and type-separated scalar comparison yields
+    the complete hit set, which must equal the recorded ``hits`` exactly —
+    a concealed or forged hit is a mismatch, not a silent omission, and an
+    empty hit set is attested by the authenticated entries themselves.
+    Plain entries, envelopes sealed under other keys, undecryptable or
+    non-JSON plaintexts, missing fields and non-scalar targets simply do
+    not hit. An empty range (and any empty snapshot) carries
+    ``items == ()``, ``proof == ()`` and ``hits == ()``.
+
+    Instances are immutable, may be built positionally and compare by all
+    twelve fields. The constructor fixes only types, widths, ordering,
+    coverage and ranges — whether the entry digests and the shared proof
+    actually rebuild ``root``, whether the recorded hits match what the
+    key unseals and whether ``key_check`` matches the supplied key is left
+    to :func:`verify_full_encrypted_json_search_receipt`, so a tampered
+    receipt is still constructible. Every binary field (``root``, each
+    entry's ``payload`` / ``previous_hash`` / ``entry_hash``, every
+    shared-proof node and ``key_check``) must be exact ``bytes``:
+    ``bytearray`` and ``memoryview`` are rejected rather than copied, so a
+    received receipt never silently aliases a mutable caller buffer.
+    """
+
+    version: int
+    hash_name: str
+    size: int
+    root: bytes
+    pointer: str
+    value: Any
+    start: int
+    stop: int
+    items: tuple
+    proof: tuple
+    hits: tuple
+    key_check: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.version, int) or isinstance(self.version, bool):
+            raise TypeError("version must be an integer")
+        if self.version != 1:
+            raise ValueError("version must be 1")
+        if not isinstance(self.hash_name, str):
+            raise TypeError("hash_name must be a string")
+        digest_size = _digest_size(self.hash_name)
+        if not isinstance(self.size, int) or isinstance(self.size, bool):
+            raise TypeError("size must be an integer")
+        if self.size < 0:
+            raise ValueError("size must be non-negative")
+        if self.size >= _U64_LIMIT:
+            raise ValueError("size must satisfy size < 2**64")
+        # root must be exact bytes: bytearray and memoryview are rejected
+        # rather than copied, so a received receipt never silently aliases a
+        # mutable caller buffer.
+        if not isinstance(self.root, bytes):
+            raise TypeError("root must be bytes")
+        if len(self.root) != digest_size:
+            raise ValueError(f"root must be {digest_size} bytes")
+        if not isinstance(self.pointer, str):
+            raise TypeError("pointer must be a string")
+        tokens = _parse_json_pointer(self.pointer)
+        canonical = _json_pointer_canonical(tokens)
+        if canonical != self.pointer:
+            object.__setattr__(self, "pointer", canonical)
+        _check_json_value(self.value)
+        for name in ("start", "stop"):
+            bound = getattr(self, name)
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not 0 <= self.start <= self.stop <= self.size:
+            raise ValueError(
+                f"range must satisfy 0 <= start <= stop <= size ({self.size})"
+            )
+        if not isinstance(self.items, tuple):
+            raise TypeError("items must be a tuple of Entry records")
+        previous_index = -1
+        for entry in self.items:
+            if not isinstance(entry, Entry):
+                raise TypeError("item must be an Entry")
+            if not isinstance(entry.index, int) or isinstance(entry.index, bool):
+                raise TypeError("entry.index must be an integer")
+            if entry.index < 0:
+                raise ValueError("entry.index must be non-negative")
+            for name in ("payload", "previous_hash", "entry_hash"):
+                if not isinstance(getattr(entry, name), bytes):
+                    raise TypeError(f"entry.{name} must be bytes")
+            if len(entry.previous_hash) != digest_size:
+                raise ValueError(f"entry.previous_hash must be {digest_size} bytes")
+            if len(entry.entry_hash) != digest_size:
+                raise ValueError(f"entry.entry_hash must be {digest_size} bytes")
+            if entry.index <= previous_index:
+                raise ValueError("item indices must be in strictly ascending order")
+            if not self.start <= entry.index < self.stop:
+                raise ValueError(
+                    f"entry.index {entry.index} must satisfy "
+                    f"start ({self.start}) <= index < stop ({self.stop})"
+                )
+            previous_index = entry.index
+        if len(self.items) != self.stop - self.start:
+            # Strictly ascending in-range indices only cover the range when
+            # there is exactly one entry per absolute index.
+            raise ValueError(
+                f"items must carry every entry of the range "
+                f"[{self.start}, {self.stop})"
+            )
+        if not isinstance(self.proof, tuple):
+            raise TypeError("proof must be a tuple of digests")
+        for node in self.proof:
+            if not isinstance(node, bytes):
+                raise TypeError("proof element must be bytes")
+            if len(node) != digest_size:
+                raise ValueError(f"proof element must be {digest_size} bytes")
+        if not self.items and self.proof:
+            raise ValueError("an empty range receipt must carry an empty proof")
+        if not isinstance(self.hits, tuple):
+            raise TypeError("hits must be a tuple of integers")
+        previous_hit = -1
+        for hit in self.hits:
+            if not isinstance(hit, int) or isinstance(hit, bool):
+                raise TypeError("hits must be non-bool integers")
+            if hit <= previous_hit:
+                raise ValueError("hits must be in strictly ascending order")
+            if not self.start <= hit < self.stop:
+                raise ValueError(
+                    f"hit index {hit} must satisfy "
+                    f"start ({self.start}) <= hit < stop ({self.stop})"
+                )
+            previous_hit = hit
+        # key_check must be exact bytes, exactly as root: it is a public
+        # keyed confirmation, never a buffer the caller may later mutate.
+        if not isinstance(self.key_check, bytes):
+            raise TypeError("key_check must be bytes")
+        if len(self.key_check) != digest_size:
+            raise ValueError(f"key_check must be {digest_size} bytes")
 
 
 @dataclass(frozen=True)
@@ -6555,6 +6796,68 @@ class AuditLog:
             )
         )
 
+    def find_encrypted_json(
+        self,
+        pointer: Any,
+        value: Any,
+        key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Absolute indices of encrypted entries whose unsealed JSON payload
+        has a scalar field equal to ``value``.
+
+        Every retained entry in the half-open range ``[start, stop)`` of
+        absolute indices (default ``[retain_from, len(log))``, exactly the
+        defaults and bounds of :meth:`find`) whose stored payload is an
+        AES-256-GCM envelope that authenticates under ``key`` is unsealed
+        with :func:`decrypt_entry`, and the recovered plaintext is then
+        treated exactly as :meth:`find_json` treats a stored payload: it
+        must decode as strict UTF-8 JSON (RFC 8259, with no repeated object
+        member names anywhere in the document), ``pointer`` must resolve
+        within it, and the addressed value must be a scalar equal to
+        ``value``. ``pointer`` follows RFC 6901 reference-token syntax (the
+        empty string addresses the whole document; ``~1`` -> ``/`` and
+        ``~0`` -> ``~``). ``value`` accepts ``str``, ``int``, ``float``
+        (must be finite), ``bool`` and ``None``; the JSON kinds are
+        compared separately, so ``True`` never equals ``1`` and the string
+        ``"1"`` never equals the number 1, while ints and floats compare by
+        numeric value.
+
+        An entry never hits when it is a plain (unencrypted) entry — plain
+        JSON never enters the result — when its envelope does not
+        authenticate under ``key`` (a valid 32-byte key that simply was not
+        the append key yields no hit rather than raising), or when the
+        unsealed plaintext is not strict UTF-8 JSON, repeats a member name,
+        misses the field or addresses a non-scalar. Hits come back as a
+        tuple of absolute indices in strictly ascending order. A
+        non-``str`` pointer, a non-``bytes`` key or a query value of any
+        other type raises TypeError; a malformed pointer, a non-finite
+        float query or a key that is not exactly 32 bytes raises
+        ValueError. Range type/value errors are exactly those of
+        :meth:`find`. The query is read-only: it never stores plaintext,
+        the key or parsed documents, and never changes entries, the head,
+        authentication state, the locator indexes, a Merkle root or any
+        proof.
+        """
+        tokens = _parse_json_pointer(pointer)
+        _check_json_value(value)
+        _check_key(key)
+        start, stop = self._resolve_find_range(start, stop)
+        matches: list[int] = []
+        for index in range(start, stop):
+            entry = self._entries[index - self._retain_from]
+            try:
+                plaintext = decrypt_entry(entry, key, hash_name=self._hash_name)
+            except ValueError:
+                # A plain entry, an envelope sealed under another key or a
+                # corrupted envelope is simply not a hit.
+                continue
+            found = _json_scalar_at(plaintext, tokens)
+            if found is not _JSON_MISSING and _json_scalar_matches(found, value):
+                matches.append(index)
+        return tuple(matches)
+
     def search_receipt(
         self,
         query: Any,
@@ -7123,6 +7426,101 @@ class AuditLog:
             stop=stop,
             items=items,
             proof=proof,
+        )
+
+    def full_encrypted_json_search_receipt(
+        self,
+        pointer: Any,
+        value: Any,
+        key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> FullEncryptedJsonSearchReceipt:
+        """Issue an offline :class:`FullEncryptedJsonSearchReceipt` proving
+        completeness for a keyed JSON-field scalar search over encrypted
+        entries.
+
+        Runs the same lookup as :meth:`find_encrypted_json` over the
+        half-open range ``[start, stop)`` of the snapshot of the first
+        ``size`` entries and freezes the outcome into a receipt that
+        :func:`verify_full_encrypted_json_search_receipt` can check without
+        holding the log — only the query key: the receipt records the hash
+        algorithm, the snapshot ``size`` and its Merkle ``root``, the
+        canonical ``pointer`` and the typed scalar ``value``, the searched
+        range, *every* entry of the range (payloads still sealed) with a
+        single shared compact batch inclusion proof covering all of them,
+        the ascending ``hits`` the supplied ``key`` actually unseals to a
+        matching JSON scalar, and a keyed ``key_check`` confirmation
+        binding the key to the snapshot, pointer, value and range without
+        recording the key or any plaintext.
+
+        ``pointer`` follows RFC 6901 (the empty string is the root); a
+        non-``str`` raises TypeError and a malformed pointer raises
+        ValueError. ``value`` must be ``str``, ``int``, ``float``
+        (finite), ``bool`` or ``None``; another type raises TypeError and a
+        non-finite float raises ValueError. ``key`` must be exactly 32
+        ``bytes`` — a non-bytes value raises TypeError and a wrong length
+        raises ValueError. ``size`` defaults to the current log length and
+        the snapshot must still be rebuildable (a prefix released by
+        :meth:`prune` is not). The range defaults to the retained segment
+        ``[retain_from, size)``; explicit bounds must be non-bool integers
+        satisfying ``retain_from <= start <= stop <= size``. Wrong types
+        raise TypeError, out-of-range values or an unrebuildable snapshot
+        ValueError. Plain entries and entries sealed under another key
+        never hit. An empty range — and any empty snapshot — yields
+        ``items == ()``, ``proof == ()`` and ``hits == ()``. The call is
+        read-only and may be repeated at will: entries, head,
+        authentication state, the encrypted locator index, Merkle roots
+        and proofs are left untouched, and a failed call raises before
+        anything observable changes.
+        """
+        tokens = _parse_json_pointer(pointer)
+        _check_json_value(value)
+        _check_key(key)
+        canonical = _json_pointer_canonical(tokens)
+        if size is not None and isinstance(size, bool):
+            raise TypeError("size must be an integer")
+        size = self._resolve_size(size)
+        first = self._retain_from
+        if start is None:
+            start = first
+        elif not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError("start must be an integer")
+        if stop is None:
+            stop = size
+        elif not isinstance(stop, int) or isinstance(stop, bool):
+            raise TypeError("stop must be an integer")
+        if not first <= start <= stop <= size:
+            raise ValueError(
+                f"range must satisfy retain_from ({first}) <= start <= stop "
+                f"<= size ({size})"
+            )
+        root = self.merkle_root(size)
+        items = tuple(self.entry(index) for index in range(start, stop))
+        if items:
+            _, proof = self.batch_inclusion_proof(
+                tuple(range(start, stop)), size
+            )
+        else:
+            proof = ()
+        hits = self.find_encrypted_json(canonical, value, key, start, stop)
+        key_check = _encrypted_json_key_check(
+            self._hash_name, size, root, canonical, value, start, stop, key
+        )
+        return FullEncryptedJsonSearchReceipt(
+            version=_FULL_ENCRYPTED_JSON_SEARCH_VERSION,
+            hash_name=self._hash_name,
+            size=size,
+            root=root,
+            pointer=canonical,
+            value=value,
+            start=start,
+            stop=stop,
+            items=items,
+            proof=proof,
+            hits=hits,
+            key_check=key_check,
         )
 
     def signed_json_search_index(
@@ -9584,6 +9982,131 @@ def verify_json_search_receipt(receipt: Any) -> bool:
         checked.proof,
         hash_name=checked.hash_name,
     )
+
+
+def verify_full_encrypted_json_search_receipt(receipt: Any, key: Any) -> bool:
+    """Verify a :class:`FullEncryptedJsonSearchReceipt` without holding the
+    log, using only the query key.
+
+    Recomputes the keyed ``key_check`` confirmation from the receipt's
+    authenticated context and ``key`` — a mismatch (a wrong 32-byte key, or
+    a tampered hash algorithm, snapshot, pointer, query value or range)
+    fails verification immediately, even when the recorded hit set is
+    empty. Then every listed entry's digest is recomputed from the entry's
+    fields and the single shared compact batch inclusion proof is
+    re-verified against the receipt's snapshot root via
+    :func:`verify_batch_inclusion`. Because the receipt carries every entry
+    of the searched range ``[start, stop)`` — the constructor rejects an
+    incomplete coverage, duplicates and out-of-order indices — unsealing
+    each envelope with ``key`` via :func:`decrypt_entry`, parsing the
+    recovered plaintext as strict UTF-8 JSON, resolving the pointer and
+    comparing the addressed scalar under the JSON kind rules yields the
+    complete hit set: verification returns True only when that recomputed
+    set equals the recorded ``hits`` exactly *and* the entries, proof and
+    root are genuine. A concealed hit, a forged hit and a forged empty
+    result are mismatches, never silent omissions.
+
+    A plain entry, an envelope sealed under another key, an undecryptable
+    envelope, a plaintext that is not strict JSON, a missing field or a
+    non-scalar target simply does not count as a hit and never fails
+    verification on its own. An empty range (``items == ()``,
+    ``proof == ()`` and ``hits == ()``) attests no content; an empty
+    snapshot (``size == 0``) additionally only accepts the canonical
+    empty-tree root. A structurally valid receipt whose entry content,
+    proof, root, recorded hits or key confirmation does not match returns
+    False rather than raising.
+
+    ``key`` must be exactly 32 ``bytes`` — a non-bytes value raises
+    TypeError and a wrong length raises ValueError. A receipt that is not
+    a :class:`FullEncryptedJsonSearchReceipt` raises TypeError; a receipt
+    whose frozen fields were bypassed into an illegal shape (wrong types,
+    an unknown hash algorithm, a malformed pointer, a non-finite numeric
+    query, an out-of-range range or size, digest-width mismatches,
+    non-ascending or incomplete items, illegal hit indices) raises the
+    same TypeError or ValueError construction would, and a proof node
+    count that does not fit the listed indices and ``size`` raises
+    ValueError as in :func:`verify_batch_inclusion`. The call is
+    read-only.
+    """
+    if not isinstance(receipt, FullEncryptedJsonSearchReceipt):
+        raise TypeError("receipt must be a FullEncryptedJsonSearchReceipt")
+    _check_key(key)
+    # Re-validate every field even for a receipt built with
+    # object.__setattr__ bypassing the frozen constructor, so structural
+    # corruption raises exactly as the constructor would.
+    checked = FullEncryptedJsonSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.pointer,
+        receipt.value,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+        receipt.hits,
+        receipt.key_check,
+    )
+    expected_check = _encrypted_json_key_check(
+        checked.hash_name,
+        checked.size,
+        checked.root,
+        checked.pointer,
+        checked.value,
+        checked.start,
+        checked.stop,
+        key,
+    )
+    if not hmac.compare_digest(expected_check, checked.key_check):
+        # A wrong key — or a tampered snapshot, pointer, value or range —
+        # is detected even when the recorded hit set is empty.
+        return False
+    if not checked.items:
+        if checked.size == 0:
+            return hmac.compare_digest(
+                checked.root, _hash_parts(checked.hash_name, _EMPTY_DOMAIN)
+            )
+        # An empty range of a non-empty snapshot attests no content; the
+        # recorded root cannot be checked without evidence, exactly as for
+        # an empty-range FullEncryptedSearchReceipt.
+        return True
+    entry_hashes: list[bytes] = []
+    for entry in checked.items:
+        recomputed = entry_digest(
+            entry.index,
+            entry.previous_hash,
+            entry.payload,
+            hash_name=checked.hash_name,
+        )
+        if not hmac.compare_digest(recomputed, entry.entry_hash):
+            return False
+        entry_hashes.append(entry.entry_hash)
+    indices = tuple(entry.index for entry in checked.items)
+    if not verify_batch_inclusion(
+        indices,
+        tuple(entry_hashes),
+        checked.size,
+        checked.root,
+        checked.proof,
+        hash_name=checked.hash_name,
+    ):
+        return False
+    tokens = _parse_json_pointer(checked.pointer)
+    hits: list[int] = []
+    for entry in checked.items:
+        try:
+            plaintext = decrypt_entry(entry, key, hash_name=checked.hash_name)
+        except ValueError:
+            # A plain entry, an envelope sealed under another key or any
+            # decryption failure is simply not a hit, never an error.
+            continue
+        found = _json_scalar_at(plaintext, tokens)
+        if found is not _JSON_MISSING and _json_scalar_matches(
+            found, checked.value
+        ):
+            hits.append(entry.index)
+    return tuple(hits) == checked.hits
 
 
 def verify_json_search_index(index: Any) -> bool:
@@ -12443,6 +12966,182 @@ def decode_json_search_receipt(data: Any) -> JsonSearchReceipt:
         stop=stop,
         items=tuple(items),
         proof=proof,
+    )
+    _check_full_search_receipt_proof(receipt)
+    return receipt
+
+
+def encode_full_encrypted_json_search_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`FullEncryptedJsonSearchReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/full-encrypted-json-search/v1\\0"``; every integer is an
+    unsigned 8-byte big-endian value and every blob is a u64 byte length
+    followed by the raw bytes (a zero length is an all-zero u64). Fields
+    appear strictly in the order ``version`` (always 1), ``hash_name``
+    (UTF-8 blob), ``size``, ``root`` blob, ``pointer`` (canonical RFC 6901
+    UTF-8 blob), the scalar ``value`` as a type tag u64 followed by one
+    blob (UTF-8 bytes for a string, canonical ASCII decimal for an integer,
+    ``repr`` ASCII for a float, and an empty blob for ``true``, ``false``
+    and ``null``, each distinguished by its own tag), ``start``, ``stop``,
+    item count, one item per listed entry — ``Entry.index``, ``payload``
+    blob (the sealed envelope written verbatim), ``previous_hash`` blob,
+    ``entry_hash`` blob — the shared proof node count followed by one blob
+    per proof digest, the hit-index count followed by one bare u64 per hit,
+    and finally the ``key_check`` confirmation blob, with nothing omitted,
+    reordered or appended. ``receipt`` must be a
+    :class:`FullEncryptedJsonSearchReceipt` (anything else raises
+    TypeError); every field is re-validated exactly as the constructor
+    would, so a receipt whose frozen fields were bypassed into an illegal
+    shape raises the same TypeError or ValueError, and a shared proof
+    whose node count does not fit the listed indices and ``size`` raises
+    ValueError. Encoding is read-only and deterministic: re-encoding a
+    decoded receipt reproduces the original bytes exactly, so a receipt
+    can be persisted and restored in another process and handed straight
+    to :func:`verify_full_encrypted_json_search_receipt`.
+    """
+    if not isinstance(receipt, FullEncryptedJsonSearchReceipt):
+        raise TypeError("receipt must be a FullEncryptedJsonSearchReceipt")
+    checked = FullEncryptedJsonSearchReceipt(
+        receipt.version,
+        receipt.hash_name,
+        receipt.size,
+        receipt.root,
+        receipt.pointer,
+        receipt.value,
+        receipt.start,
+        receipt.stop,
+        receipt.items,
+        receipt.proof,
+        receipt.hits,
+        receipt.key_check,
+    )
+    _check_full_search_receipt_proof(checked)
+    value_tag, value_blob = _encode_json_value(checked.value)
+    parts = [
+        _FULL_ENCRYPTED_JSON_SEARCH_MAGIC,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+        _encode_blob(checked.pointer.encode("utf-8")),
+        _encode_u64(value_tag, "value type tag"),
+        _encode_blob(value_blob),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.items), "items count"),
+    ]
+    for entry in checked.items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    parts.append(_encode_u64(len(checked.proof), "proof count"))
+    for digest in checked.proof:
+        parts.append(_encode_blob(bytes(digest)))
+    parts.append(_encode_u64(len(checked.hits), "hits count"))
+    for hit in checked.hits:
+        parts.append(_encode_u64(hit, "hit index"))
+    parts.append(_encode_blob(bytes(checked.key_check)))
+    return b"".join(parts)
+
+
+def decode_full_encrypted_json_search_receipt(
+    data: Any,
+) -> FullEncryptedJsonSearchReceipt:
+    """Decode bytes produced by
+    :func:`encode_full_encrypted_json_search_receipt`.
+
+    ``data`` must be ``bytes`` — ``bytearray``, ``memoryview`` and every
+    other type raise TypeError. A bad magic, a version other than 1,
+    invalid UTF-8 in ``hash_name``, ``pointer`` or a string value, an
+    unknown hash algorithm or value type tag, a malformed encoded number,
+    a non-canonical or non-finite one, truncation, trailing bytes, an
+    oversized blob length, digest-width mismatches, an out-of-range or
+    inverted search range, non-ascending, duplicate or out-of-range item
+    indices, an incomplete coverage of the searched range, a non-empty
+    proof on an empty range, a shared proof whose node count does not fit
+    the listed indices and ``size``, or duplicate, non-ascending or
+    out-of-range hit indices all raise ValueError. The decoded receipt is
+    frozen, its fields equal the originally encoded ones and re-encoding
+    it reproduces the original bytes exactly; it can be handed to
+    :func:`verify_full_encrypted_json_search_receipt` in another process.
+    A structurally valid receipt whose sealed content, proof, root,
+    recorded hits or key confirmation does not match still decodes and
+    only fails verification. The bytes are consumed exactly, with no
+    trailing data accepted. The call is read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_FULL_ENCRYPTED_JSON_SEARCH_MAGIC):
+        raise ValueError("not an auditchain full-encrypted-json-search encoding")
+    offset = len(_FULL_ENCRYPTED_JSON_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    raw_name = read_blob("hash_name")
+    try:
+        hash_name = raw_name.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("hash_name is not valid UTF-8") from error
+    size = read_u64("size")
+    root = read_blob("root")
+    raw_pointer = read_blob("pointer")
+    try:
+        pointer = raw_pointer.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("pointer is not valid UTF-8") from error
+    value_tag = read_u64("value type tag")
+    value_blob = read_blob("value")
+    value = _decode_json_value(value_tag, value_blob)
+    start = read_u64("start")
+    stop = read_u64("stop")
+    item_count = read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = read_u64("entry.index")
+        payload = read_blob("entry.payload")
+        previous_hash = read_blob("entry.previous_hash")
+        entry_hash = read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    proof_count = read_u64("proof count")
+    proof = tuple(read_blob("proof element") for _ in range(proof_count))
+    hit_count = read_u64("hits count")
+    hits = tuple(read_u64("hit index") for _ in range(hit_count))
+    key_check = read_blob("key_check")
+    if offset != len(data):
+        raise ValueError("trailing bytes after the receipt")
+    receipt = FullEncryptedJsonSearchReceipt(
+        version=version,
+        hash_name=hash_name,
+        size=size,
+        root=root,
+        pointer=pointer,
+        value=value,
+        start=start,
+        stop=stop,
+        items=tuple(items),
+        proof=proof,
+        hits=hits,
+        key_check=key_check,
     )
     _check_full_search_receipt_proof(receipt)
     return receipt

@@ -832,6 +832,97 @@ verify_signed_full_encrypted_search_receipt(restored, key, public_key)  # True�
   空树根）；两个入口均为只读且确定。本层不新增签名原文，签名仍是检查点那一
   份，既有线格式与旧接口不变
 
+#### 加密 JSON 条目的字段查询与完整离线回执
+
+`find_encrypted_json` 把 `find_json` 的 RFC 6901 标量字段语义带到
+AES-256-GCM 密文条目上：传入 JSON Pointer、JSON 标量值、32 字节查询密钥与
+可选的半开绝对索引区间，返回严格递增的命中索引。范围内每个条目先用查询密钥
+认证解封（`decrypt_entry`，AEAD AAD 仍绑定链上位置），**只有能用该密钥解密
+的封装条目**才参与；恢复出的明文再按严格 UTF-8 JSON（RFC 8259，任何层级
+重复成员名都拒绝、禁止 NaN/Infinity）解析、沿指针寻址并按 JSON 类型分别
+比较：字符串、布尔与 null 只匹配各自类型，整数与有限浮点按数值比较
+（`true` 不等于 1、`"1"` 不等于 1）。重复成员、非法 JSON、字段缺失、目标
+非标量、数组下标非法/越界以及其他密钥的封装都不命中；**明文 JSON 条目不进入
+结果**。一把合法但从未使用过的 32 字节密钥返回 `()` 而不抛异常。
+
+```python
+hits = log.find_encrypted_json("/a", 1, key)               # 范围默认 [retain_from, len)
+log.find_encrypted_json("/b/c", "x", key, 1, 4)            # 半开区间 [1, 4)
+log.find_encrypted_json("", None, key)                     # 根为标量 null 的密文条目
+log.find_encrypted_json("/a~1b/c~0d", 7, key)              # ~1 -> '/', ~0 -> '~'
+```
+
+`pointer` 非 `str`、`key` 非精确 `bytes`、查询值不是 str/int/有限
+float/bool/None、区间或 `size` 类型错抛 `TypeError`；指针语法非法、浮点查询
+非有限、密钥不是 32 字节、区间越界（沿用 `find` 的
+`retain_from <= start <= stop <= len(log)` 规则）抛 `ValueError`。查询只读、
+不存储明文或密钥，不改条目、链头、认证状态、密文定位索引、Merkle 根或证明。
+
+`full_encrypted_json_search_receipt` 签发绑定快照与范围的
+`FullEncryptedJsonSearchReceipt`，覆盖范围内**每一个**条目（payload 仍
+密封）、一份覆盖全部条目的共享紧凑批量包含证明、签发方记录的升序命中集
+`hits`，以及一段**不泄露密钥的键控确认信息** `confirmation`：
+
+```
+receipt = log.full_encrypted_json_search_receipt("/a", 1, key)
+receipt.hits                            # 签发方解封后重算的升序命中索引
+verify_full_encrypted_json_search_receipt(receipt, key)      # True：仅凭查询密钥离线验真
+verify_full_encrypted_json_search_receipt(receipt, wrong_key)  # False：连空结果都不接受
+```
+
+回执为冻结的
+`FullEncryptedJsonSearchReceipt(version=1, hash_name, size, root, pointer,
+value, start, stop, items, proof, hits, confirmation)`，可位置构造、按全部
+十二个字段相等。离线核验仅凭查询密钥，依次确认：
+
+- 逐条重算 `entry_digest`（密文完整性）与密文链位置/连续性——范围从 0
+  开始时首条前驱必须是摘要宽度的全零创世值，其后每条 `previous_hash`
+  必须等于前一条 `entry_hash`；
+- 共享批量包含证明（`verify_batch_inclusion`）把全部条目认证到快照
+  `root`（即确认快照 `size` 与 Merkle 根；空快照只认规范空树根）；
+- 以传入密钥逐条解封，按上述严格 JSON 与指针/标量语义重算**完整**命中集，
+  必须与 `hits` 逐项一致——空结果同样证明范围内确实无命中；
+- 重算键控确认 MAC 并与 `confirmation` 常量时间比对。
+
+确认信息为
+`HMAC(key, b"auditchain/encrypted-json-confirm/v1\\0" || size || root ||
+B(pointer) || tag || B(value) || start || stop || count || link_0 || …)`，
+每个 `link_i = H("auditchain/encrypted-json-chain-link/v1" || u64(index) ||
+previous_hash || entry_hash)` 绑定该条密文链位置与完整性；它不含密钥也不
+含任何明文，但只有查询密钥能复现，因此**一把错误的合法密钥即使面对零命中
+回执也返回 `False`**。条目、证明、指针、查询值、命中集或任一字节密文被改，
+均在上述某一步返回 `False`（结构非法则抛异常）。空范围与空快照照常签发与
+核验；范围默认 `[retain_from, size)`、`size` 默认当前长度，越界或快照已
+裁剪抛 `ValueError`，类型规则与签发入口一致；非本回执类型抛 `TypeError`。
+
+回执可编码为稳定 bytes，落盘跨进程恢复后逐字节重编码一致：
+
+```python
+data = encode_full_encrypted_json_search_receipt(receipt)
+restored = decode_full_encrypted_json_search_receipt(data)
+restored == receipt                                            # True
+encode_full_encrypted_json_search_receipt(restored) == data    # True
+verify_full_encrypted_json_search_receipt(restored, key)       # True
+```
+
+字节流以魔数 `b"auditchain/full-encrypted-json-search/v1\0"`（含 NUL 结尾）
+开头，随后严格按字段顺序写恒为 1 的 `version`、`hash_name`（UTF-8 blob）、
+`size`、`root` blob、`pointer`（规范化 RFC 6901 UTF-8 blob）、标量 `value`
+的类型标签 u64 加 blob（与 `encode_json_search_receipt` 同一拼写：字符串为
+UTF-8、整数为规范十进制 ASCII、浮点为 `repr` ASCII、true/false/null 为空
+blob 并各自独立标签）、`start`、`stop`、条目计数；每条写 `Entry.index` 与
+`payload`（密封封装原样）/`previous_hash`/`entry_hash` 三个 blob；再写共享
+证明节点计数与各摘要 blob、命中计数与每个命中的**裸 u64 索引**，最后写
+`confirmation` blob。整数均为 8 字节无符号大端，blob 为 u64 长度前缀加原始
+字节。编码端只接受 `FullEncryptedJsonSearchReceipt` 并复验全部字段与证明
+节点数（类型错抛 `TypeError`，结构/节点数/溢出错抛 `ValueError`）；解码端
+只接受精确 `bytes`（拒绝 `bytearray`/`memoryview`，抛 `TypeError`），魔数或
+版本不符、非法 UTF-8、未知算法或值标签、数值拼写非法或非有限、截断、尾随、
+长度越界、范围或顺序冲突、覆盖不全、摘要宽度或证明节点数不符、命中重复/乱序
+/越界、确认信息宽度不符均按具体问题抛 `ValueError`；结构合法但内容、证明、
+根、命中或确认不匹配的回执照常往返，仅核验返回 `False`。本层不新增任何签名
+原文，既有的查找、回执、索引与各线编解码行为全部不变。
+
 ### 命中型检索回执的只读诊断
 
 `verify_search_receipt` / `verify_encrypted_search_receipt` 只回答真假；本次补上

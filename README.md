@@ -475,6 +475,74 @@ verify_signed_json_search_index(restored, public_key)    # True
 非法、`size` 越界或指向已裁剪不可重建快照、私钥长度不对抛 `ValueError`。签发
 只读且可重复，失败不改变条目、链头、认证、裁剪状态或既有索引。
 
+### 多指针可持久化组合索引（Ed25519）
+
+`signed_json_multi_index(pointers, private_key, size=None)` 在单指针索引基线上
+扩展为**一次冻结多个 RFC 6901 指针**：`pointers` 为非空 `tuple`，元素是规范
+RFC 6901 字符串且按字符串顺序**严格递增、不重复**。返回不可变
+`SignedJsonMultiIndex(index, signature)`，其中
+`JsonMultiIndex(version=1, hash_name, size, root, head, retain_from, pointers,
+items, proof, groups)` 与单指针索引绑定同样的摘要算法、`size` 处快照 Merkle
+根与链头，覆盖同样的 `[retain_from, size)`（`size` 默认当前日志长度且快照须
+可重建）；`items` 仍携带覆盖范围内**每一个** `Entry` 与一份共享紧凑批量包含
+证明，`groups` 则与 `pointers` **按位置一一对应**，每个元素就是该指针的完整
+标量分组（缺省为 `()`），分桶与排序规则与单指针索引完全相同。非 JSON、缺字段
+、对象/数组及密文在每个指针下都不命中。
+
+```python
+pointers = ("/a", "/b/c", "/z")
+bundle = log.signed_json_multi_index(pointers, seed)
+bundle.index.root == log.merkle_root()
+bundle.find("/a", 1)        # 与 log.find_json("/a", 1) 完全一致
+bundle.find("/z", 5, 0, 3)  # 半开区间 [0, 3)，规则同 find_json
+bundle.pointers             # ('/a', '/b/c', '/z')
+```
+
+`JsonMultiIndex.find(pointer, value, start=None, stop=None)` 只接受制品绑定的
+指针：查询语义、`value` 类型与非有限浮点规则、半开区间默认值与边界、严格升序
+绝对索引 tuple 均与 `find_json` 相同；`pointer` 非 `str` 抛 `TypeError`、
+非法语法或**未被本索引覆盖**抛 `ValueError`。
+
+`verify_json_multi_index(index)` 无需持有日志，重算每个 `entry_digest`、核对
+共享批量包含证明，并**逐指针**对已认证条目自行做严格 JSON 解析与 RFC 6901
+解析，要求每个指针的完整标量分区与其分组逐一吻合；少列（隐藏命中）、多列（
+伪造命中或伪造空结果）、错配指针（少一个/多一个/顺序不符/张冠李戴）、篡改
+payload/证明/根/链头都返回 `False`，结构非法才抛 `TypeError`/`ValueError`。
+`verify_signed_json_multi_index(bundle, public_key)` 额外用预信任的 32 字节
+Ed25519 公钥核验签名，签名原文绑定全部指针及各指针命中集；签名者/公钥不符或
+任何内容被篡改返回 `False` 而不抛异常。
+
+组合索引有独立的规范字节编解码，u64/blob 规则与单指针索引一致：索引魔数
+`b"auditchain/json-multi-index/v1\0"`，在 `retain_from` 之后先写指针计数，
+再按严格递增顺序逐个写规范 RFC 6901 UTF-8 指针 blob，随后是覆盖条目与共享
+证明，最后**每个指针各写一段分组**（复用单指针的分组、桶、命中编码）；签名包
+魔数为 `b"auditchain/signed-json-multi-index/v1\0"`，后接 `version`、索引
+blob 与恰好 64 字节签名，签名原文为
+`D || 0x01 || B(encode_json_multi_index(index))`（
+`D = b"auditchain/signed-json-multi-index/v1\0"`）。
+
+```python
+from auditchain import (
+    encode_json_multi_index,
+    decode_json_multi_index,
+    encode_signed_json_multi_index,
+    decode_signed_json_multi_index,
+    verify_signed_json_multi_index,
+)
+
+blob = encode_signed_json_multi_index(bundle)
+restored = decode_signed_json_multi_index(blob)
+encode_signed_json_multi_index(restored) == blob        # True：逐字节往返
+verify_signed_json_multi_index(restored, public_key)    # True
+```
+
+错误约定：`pointers` 非 tuple、`private_key`/查询 `value`/区间为错误类型抛
+`TypeError`；指针非法、重复或乱序、非有限浮点、私钥长度错误、`size` 越界或
+快照不可重建抛 `ValueError`；解码的格式、版本、范围、摘要与签名长度错误也抛
+`ValueError`（非 `bytes` 抛 `TypeError`）；结构合法但证据或签名不匹配只返回
+`False`。新索引不改变 `append`、`encrypt`、裁剪、既有快照或任何既有格式与
+公开行为。
+
 ### 加密追加（AES-256-GCM）
 
 `encrypt(payload, key, nonce=None)` 与 `append` 的链式结构完全相同，但

@@ -12337,6 +12337,77 @@ def _check_full_search_receipt_proof(receipt: FullSearchReceipt) -> None:
         )
 
 
+# Shared segments of the FullSearchReceipt, FullEncryptedSearchReceipt and
+# FullEncryptedJsonSearchReceipt wire formats: each encoding states the
+# common head (magic, version, hash_name, size, root), the searched range,
+# the listed entries, the shared proof and the hit indices exactly once, so
+# the boundary rules (u64 integers, length-prefixed blobs, truncation and
+# trailing-data rejection) live in a single place next to _CodecReader.
+
+
+def _encode_full_search_head(magic: bytes, checked: Any) -> list:
+    return [
+        magic,
+        _encode_u64(checked.version, "version"),
+        _encode_blob(checked.hash_name.encode("utf-8")),
+        _encode_u64(checked.size, "size"),
+        _encode_blob(bytes(checked.root)),
+    ]
+
+
+def _encode_full_search_range(checked: Any) -> list:
+    return [
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+    ]
+
+
+def _encode_full_search_items(items: tuple) -> list:
+    parts = [_encode_u64(len(items), "items count")]
+    for entry in items:
+        parts.append(_encode_u64(entry.index, "entry.index"))
+        parts.append(_encode_blob(bytes(entry.payload)))
+        parts.append(_encode_blob(bytes(entry.previous_hash)))
+        parts.append(_encode_blob(bytes(entry.entry_hash)))
+    return parts
+
+
+def _encode_full_search_proof(proof: tuple) -> list:
+    parts = [_encode_u64(len(proof), "proof count")]
+    for digest in proof:
+        parts.append(_encode_blob(bytes(digest)))
+    return parts
+
+
+def _encode_full_search_hits(hits: tuple) -> list:
+    parts = [_encode_u64(len(hits), "hits count")]
+    for hit in hits:
+        parts.append(_encode_u64(hit, "hit index"))
+    return parts
+
+
+def _read_full_search_items(reader: _CodecReader) -> tuple:
+    item_count = reader.read_u64("items count")
+    items = []
+    for _ in range(item_count):
+        index = reader.read_u64("entry.index")
+        payload = reader.read_blob("entry.payload")
+        previous_hash = reader.read_blob("entry.previous_hash")
+        entry_hash = reader.read_blob("entry.entry_hash")
+        items.append(Entry(index, payload, previous_hash, entry_hash))
+    return tuple(items)
+
+
+def _read_full_search_proof(reader: _CodecReader) -> tuple:
+    proof_count = reader.read_u64("proof count")
+    return tuple(reader.read_blob("proof element") for _ in range(proof_count))
+
+
+def _read_full_search_hits(reader: _CodecReader) -> tuple:
+    hit_count = reader.read_u64("hits count")
+    return tuple(reader.read_u64("hit index") for _ in range(hit_count))
+
+
 def encode_full_search_receipt(receipt: Any) -> bytes:
     """Encode a :class:`FullSearchReceipt` into its canonical binary form.
 
@@ -12373,25 +12444,11 @@ def encode_full_search_receipt(receipt: Any) -> bytes:
         receipt.proof,
     )
     _check_full_search_receipt_proof(checked)
-    parts = [
-        _FULL_SEARCH_MAGIC,
-        _encode_u64(checked.version, "version"),
-        _encode_blob(checked.hash_name.encode("utf-8")),
-        _encode_u64(checked.size, "size"),
-        _encode_blob(bytes(checked.root)),
-        _encode_blob(checked.query),
-        _encode_u64(checked.start, "start"),
-        _encode_u64(checked.stop, "stop"),
-        _encode_u64(len(checked.items), "items count"),
-    ]
-    for entry in checked.items:
-        parts.append(_encode_u64(entry.index, "entry.index"))
-        parts.append(_encode_blob(bytes(entry.payload)))
-        parts.append(_encode_blob(bytes(entry.previous_hash)))
-        parts.append(_encode_blob(bytes(entry.entry_hash)))
-    parts.append(_encode_u64(len(checked.proof), "proof count"))
-    for digest in checked.proof:
-        parts.append(_encode_blob(bytes(digest)))
+    parts = _encode_full_search_head(_FULL_SEARCH_MAGIC, checked)
+    parts.append(_encode_blob(checked.query))
+    parts += _encode_full_search_range(checked)
+    parts += _encode_full_search_items(checked.items)
+    parts += _encode_full_search_proof(checked.proof)
     return b"".join(parts)
 
 
@@ -12411,54 +12468,17 @@ def decode_full_search_receipt(data: Any) -> FullSearchReceipt:
     structurally valid receipt whose content does not match still decodes
     and only fails verification. The call is read-only.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_FULL_SEARCH_MAGIC):
-        raise ValueError("not an auditchain full-search encoding")
-    offset = len(_FULL_SEARCH_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    size = read_u64("size")
-    root = read_blob("root")
-    query = read_blob("query")
-    start = read_u64("start")
-    stop = read_u64("stop")
-    item_count = read_u64("items count")
-    items = []
-    for _ in range(item_count):
-        index = read_u64("entry.index")
-        payload = read_blob("entry.payload")
-        previous_hash = read_blob("entry.previous_hash")
-        entry_hash = read_blob("entry.entry_hash")
-        items.append(Entry(index, payload, previous_hash, entry_hash))
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    if offset != len(data):
-        raise ValueError("trailing bytes after the receipt")
+    reader = _CodecReader(data, _FULL_SEARCH_MAGIC, "full-search")
+    version = reader.read_u64("version")
+    hash_name = reader.read_hash_name()
+    size = reader.read_u64("size")
+    root = reader.read_blob("root")
+    query = reader.read_blob("query")
+    start = reader.read_u64("start")
+    stop = reader.read_u64("stop")
+    items = _read_full_search_items(reader)
+    proof = _read_full_search_proof(reader)
+    reader.expect_end("receipt")
     receipt = FullSearchReceipt(
         version=version,
         hash_name=hash_name,
@@ -12467,7 +12487,7 @@ def decode_full_search_receipt(data: Any) -> FullSearchReceipt:
         query=query,
         start=start,
         stop=stop,
-        items=tuple(items),
+        items=items,
         proof=proof,
     )
     _check_full_search_receipt_proof(receipt)
@@ -12515,28 +12535,12 @@ def encode_full_encrypted_search_receipt(receipt: Any) -> bytes:
         receipt.hits,
     )
     _check_full_search_receipt_proof(checked)
-    parts = [
-        _FULL_ENCRYPTED_SEARCH_MAGIC,
-        _encode_u64(checked.version, "version"),
-        _encode_blob(checked.hash_name.encode("utf-8")),
-        _encode_u64(checked.size, "size"),
-        _encode_blob(bytes(checked.root)),
-        _encode_blob(checked.query),
-        _encode_u64(checked.start, "start"),
-        _encode_u64(checked.stop, "stop"),
-        _encode_u64(len(checked.items), "items count"),
-    ]
-    for entry in checked.items:
-        parts.append(_encode_u64(entry.index, "entry.index"))
-        parts.append(_encode_blob(bytes(entry.payload)))
-        parts.append(_encode_blob(bytes(entry.previous_hash)))
-        parts.append(_encode_blob(bytes(entry.entry_hash)))
-    parts.append(_encode_u64(len(checked.proof), "proof count"))
-    for digest in checked.proof:
-        parts.append(_encode_blob(bytes(digest)))
-    parts.append(_encode_u64(len(checked.hits), "hits count"))
-    for hit in checked.hits:
-        parts.append(_encode_u64(hit, "hit index"))
+    parts = _encode_full_search_head(_FULL_ENCRYPTED_SEARCH_MAGIC, checked)
+    parts.append(_encode_blob(checked.query))
+    parts += _encode_full_search_range(checked)
+    parts += _encode_full_search_items(checked.items)
+    parts += _encode_full_search_proof(checked.proof)
+    parts += _encode_full_search_hits(checked.hits)
     return b"".join(parts)
 
 
@@ -12561,56 +12565,20 @@ def decode_full_encrypted_search_receipt(data: Any) -> FullEncryptedSearchReceip
     consumed exactly, with no trailing data accepted. The call is
     read-only.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_FULL_ENCRYPTED_SEARCH_MAGIC):
-        raise ValueError("not an auditchain full-encrypted-search encoding")
-    offset = len(_FULL_ENCRYPTED_SEARCH_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    size = read_u64("size")
-    root = read_blob("root")
-    query = read_blob("query")
-    start = read_u64("start")
-    stop = read_u64("stop")
-    item_count = read_u64("items count")
-    items = []
-    for _ in range(item_count):
-        index = read_u64("entry.index")
-        payload = read_blob("entry.payload")
-        previous_hash = read_blob("entry.previous_hash")
-        entry_hash = read_blob("entry.entry_hash")
-        items.append(Entry(index, payload, previous_hash, entry_hash))
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    hit_count = read_u64("hits count")
-    hits = tuple(read_u64("hit index") for _ in range(hit_count))
-    if offset != len(data):
-        raise ValueError("trailing bytes after the receipt")
+    reader = _CodecReader(
+        data, _FULL_ENCRYPTED_SEARCH_MAGIC, "full-encrypted-search"
+    )
+    version = reader.read_u64("version")
+    hash_name = reader.read_hash_name()
+    size = reader.read_u64("size")
+    root = reader.read_blob("root")
+    query = reader.read_blob("query")
+    start = reader.read_u64("start")
+    stop = reader.read_u64("stop")
+    items = _read_full_search_items(reader)
+    proof = _read_full_search_proof(reader)
+    hits = _read_full_search_hits(reader)
+    reader.expect_end("receipt")
     receipt = FullEncryptedSearchReceipt(
         version=version,
         hash_name=hash_name,
@@ -12619,7 +12587,7 @@ def decode_full_encrypted_search_receipt(data: Any) -> FullEncryptedSearchReceip
         query=query,
         start=start,
         stop=stop,
-        items=tuple(items),
+        items=items,
         proof=proof,
         hits=hits,
     )
@@ -12677,30 +12645,14 @@ def encode_full_encrypted_json_search_receipt(receipt: Any) -> bytes:
     )
     _check_full_search_receipt_proof(checked)
     value_tag, value_blob = _encode_json_value(checked.value)
-    parts = [
-        _FULL_ENCRYPTED_JSON_SEARCH_MAGIC,
-        _encode_u64(checked.version, "version"),
-        _encode_blob(checked.hash_name.encode("utf-8")),
-        _encode_u64(checked.size, "size"),
-        _encode_blob(bytes(checked.root)),
-        _encode_blob(checked.pointer.encode("utf-8")),
-        _encode_u64(value_tag, "value type tag"),
-        _encode_blob(value_blob),
-        _encode_u64(checked.start, "start"),
-        _encode_u64(checked.stop, "stop"),
-        _encode_u64(len(checked.items), "items count"),
-    ]
-    for entry in checked.items:
-        parts.append(_encode_u64(entry.index, "entry.index"))
-        parts.append(_encode_blob(bytes(entry.payload)))
-        parts.append(_encode_blob(bytes(entry.previous_hash)))
-        parts.append(_encode_blob(bytes(entry.entry_hash)))
-    parts.append(_encode_u64(len(checked.proof), "proof count"))
-    for digest in checked.proof:
-        parts.append(_encode_blob(bytes(digest)))
-    parts.append(_encode_u64(len(checked.hits), "hits count"))
-    for hit in checked.hits:
-        parts.append(_encode_u64(hit, "hit index"))
+    parts = _encode_full_search_head(_FULL_ENCRYPTED_JSON_SEARCH_MAGIC, checked)
+    parts.append(_encode_blob(checked.pointer.encode("utf-8")))
+    parts.append(_encode_u64(value_tag, "value type tag"))
+    parts.append(_encode_blob(value_blob))
+    parts += _encode_full_search_range(checked)
+    parts += _encode_full_search_items(checked.items)
+    parts += _encode_full_search_proof(checked.proof)
+    parts += _encode_full_search_hits(checked.hits)
     parts.append(_encode_blob(bytes(checked.confirmation)))
     return b"".join(parts)
 
@@ -12731,66 +12683,28 @@ def decode_full_encrypted_json_search_receipt(
     verification. The bytes are consumed exactly, with no trailing data
     accepted. The call is read-only.
     """
-    if not isinstance(data, bytes):
-        raise TypeError("data must be bytes")
-    if not data.startswith(_FULL_ENCRYPTED_JSON_SEARCH_MAGIC):
-        raise ValueError(
-            "not an auditchain full-encrypted-json-search encoding"
-        )
-    offset = len(_FULL_ENCRYPTED_JSON_SEARCH_MAGIC)
-
-    def read_u64(name: str) -> int:
-        nonlocal offset
-        end = offset + _U64_BYTES
-        if end > len(data):
-            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
-        value = int.from_bytes(data[offset:end], "big")
-        offset = end
-        return value
-
-    def read_blob(name: str) -> bytes:
-        nonlocal offset
-        length = read_u64(f"{name} length")
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"truncated encoding: {name} is {length} bytes")
-        blob = data[offset:end]
-        offset = end
-        return blob
-
-    version = read_u64("version")
-    raw_name = read_blob("hash_name")
-    try:
-        hash_name = raw_name.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("hash_name is not valid UTF-8") from error
-    size = read_u64("size")
-    root = read_blob("root")
-    raw_pointer = read_blob("pointer")
+    reader = _CodecReader(
+        data, _FULL_ENCRYPTED_JSON_SEARCH_MAGIC, "full-encrypted-json-search"
+    )
+    version = reader.read_u64("version")
+    hash_name = reader.read_hash_name()
+    size = reader.read_u64("size")
+    root = reader.read_blob("root")
+    raw_pointer = reader.read_blob("pointer")
     try:
         pointer = raw_pointer.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError("pointer is not valid UTF-8") from error
-    value_tag = read_u64("value type tag")
-    value_blob = read_blob("value")
+    value_tag = reader.read_u64("value type tag")
+    value_blob = reader.read_blob("value")
     value = _decode_json_value(value_tag, value_blob)
-    start = read_u64("start")
-    stop = read_u64("stop")
-    item_count = read_u64("items count")
-    items = []
-    for _ in range(item_count):
-        index = read_u64("entry.index")
-        payload = read_blob("entry.payload")
-        previous_hash = read_blob("entry.previous_hash")
-        entry_hash = read_blob("entry.entry_hash")
-        items.append(Entry(index, payload, previous_hash, entry_hash))
-    proof_count = read_u64("proof count")
-    proof = tuple(read_blob("proof element") for _ in range(proof_count))
-    hit_count = read_u64("hits count")
-    hits = tuple(read_u64("hit index") for _ in range(hit_count))
-    confirmation = read_blob("confirmation")
-    if offset != len(data):
-        raise ValueError("trailing bytes after the receipt")
+    start = reader.read_u64("start")
+    stop = reader.read_u64("stop")
+    items = _read_full_search_items(reader)
+    proof = _read_full_search_proof(reader)
+    hits = _read_full_search_hits(reader)
+    confirmation = reader.read_blob("confirmation")
+    reader.expect_end("receipt")
     receipt = FullEncryptedJsonSearchReceipt(
         version=version,
         hash_name=hash_name,
@@ -12800,7 +12714,7 @@ def decode_full_encrypted_json_search_receipt(
         value=value,
         start=start,
         stop=stop,
-        items=tuple(items),
+        items=items,
         proof=proof,
         hits=hits,
         confirmation=confirmation,

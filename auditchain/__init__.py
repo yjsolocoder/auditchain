@@ -10178,19 +10178,26 @@ def verify_json_search_index(index: Any) -> bool:
     that the recorded groups and buckets reproduce the *complete*
     partition: each hit index must carry exactly the claimed scalar kind
     and value, every resolved scalar must be listed, and no index may be
-    listed twice. A concealed hit, a forged or misassigned bucket entry,
-    a tampered payload/proof/root or a dropped covered entry is therefore
-    a structural or content failure, never a silent mismatch.
+    listed twice. The declared chain ``head`` is also checked against
+    the authenticated snapshot content: a non-empty coverage must
+    declare the entry hash of its last item (absolute index
+    ``size - 1``), and an empty snapshot only the digest-width zero
+    head. A concealed hit, a forged or misassigned bucket entry,
+    a tampered payload/proof/root/head or a dropped covered entry is
+    therefore a structural or content failure, never a silent mismatch.
 
     An empty coverage (``items == ()``) with ``size == 0`` additionally
-    accepts only the canonical empty-tree root and carries no groups; an
-    empty retained segment of a non-empty snapshot (``retain_from ==
-    size`` after a prune) attests no content and likewise carries no
-    groups. Structurally valid data whose digests, proof, root or buckets
-    do not match returns False rather than raising. Input that is not a
+    accepts only the canonical empty-tree root and the digest-width zero
+    head, and carries no groups; an empty retained segment of a
+    non-empty snapshot (``retain_from == size`` after a prune) attests
+    no content and likewise carries no groups — its head cannot be
+    checked without evidence and is not required to be. Structurally
+    valid data whose digests, proof, root, head or buckets do not match
+    returns False rather than raising. Input that is not a
     :class:`JsonSearchIndex` raises TypeError; an instance whose frozen
     fields were bypassed into an illegal shape raises the same
-    TypeError or ValueError the constructor would. The call is read-only.
+    TypeError or ValueError the constructor would. The call is
+    read-only.
     """
     if not isinstance(index, JsonSearchIndex):
         raise TypeError("index must be a JsonSearchIndex")
@@ -10213,10 +10220,18 @@ def verify_json_search_index(index: Any) -> bool:
             return hmac.compare_digest(
                 checked.root,
                 _hash_parts(checked.hash_name, _EMPTY_DOMAIN),
+            ) and hmac.compare_digest(
+                checked.head, bytes(_digest_size(checked.hash_name))
             )
         # An empty retained segment of a non-empty snapshot attests no
-        # content; the recorded root cannot be checked without evidence.
+        # content; the recorded root and head cannot be checked without
+        # evidence.
         return True
+    # The declared chain head must be the entry hash of the snapshot's
+    # last record — the final covered item, whose absolute index the
+    # constructor already pinned to ``size - 1``.
+    if not hmac.compare_digest(checked.head, checked.items[-1].entry_hash):
+        return False
     entry_hashes: list[bytes] = []
     for entry in checked.items:
         recomputed = entry_digest(
@@ -10272,7 +10287,9 @@ def verify_signed_json_search_index(bundle: Any, public_key: Any) -> bool:
     Confirms the whole sealed artifact offline, with no :class:`AuditLog`:
     :func:`verify_json_search_index` recomputes every covered entry digest,
     re-verifies the shared compact batch inclusion proof against the
-    snapshot root and checks the complete hit-bucket partition, and the
+    snapshot root, checks the declared chain head against the
+    authenticated snapshot content and checks the complete hit-bucket
+    partition, and the
     bundle's 64-byte Ed25519 signature is checked with the 32-byte
     ``public_key`` over the domain-separated message embedding the whole
     canonical index encoding — binding the pointer, hash algorithm,
@@ -10316,17 +10333,24 @@ def verify_json_multi_index(index: Any) -> bool:
     recorded groups and buckets reproduce that pointer's *complete*
     partition: each hit index must carry exactly the claimed scalar kind
     and value, every resolved scalar must be listed, and no index may be
-    listed twice within one pointer's groups. A concealed hit, a forged
+    listed twice within one pointer's groups. The declared chain
+    ``head`` is also checked against the authenticated snapshot content:
+    a non-empty coverage must declare the entry hash of its last item
+    (absolute index ``size - 1``), and an empty snapshot only the
+    digest-width zero head. A concealed hit, a forged
     or misassigned bucket entry, a missing, extra or mismatched pointer,
-    a tampered payload/proof/root or a dropped covered entry is
+    a tampered payload/proof/root/head or a dropped covered entry is
     therefore a structural or content failure, never a silent mismatch.
 
     An empty coverage (``items == ()``) with ``size == 0`` additionally
-    accepts only the canonical empty-tree root and carries no groups for
-    any pointer; an empty retained segment of a non-empty snapshot
+    accepts only the canonical empty-tree root and the digest-width zero
+    head, and carries no groups for any pointer; an empty retained
+    segment of a non-empty snapshot
     (``retain_from == size`` after a prune) attests no content and
-    likewise carries no groups. Structurally valid data whose digests,
-    proof, root or buckets do not match returns False rather than
+    likewise carries no groups — its head cannot be checked without
+    evidence and is not required to be. Structurally valid data whose
+    digests, proof, root, head or buckets do not match returns False
+    rather than
     raising. Input that is not a :class:`JsonMultiIndex` raises
     TypeError; an instance whose frozen fields were bypassed into an
     illegal shape raises the same TypeError or ValueError the
@@ -10353,10 +10377,18 @@ def verify_json_multi_index(index: Any) -> bool:
             return hmac.compare_digest(
                 checked.root,
                 _hash_parts(checked.hash_name, _EMPTY_DOMAIN),
+            ) and hmac.compare_digest(
+                checked.head, bytes(_digest_size(checked.hash_name))
             )
         # An empty retained segment of a non-empty snapshot attests no
-        # content; the recorded root cannot be checked without evidence.
+        # content; the recorded root and head cannot be checked without
+        # evidence.
         return True
+    # The declared chain head must be the entry hash of the snapshot's
+    # last record — the final covered item, whose absolute index the
+    # constructor already pinned to ``size - 1``.
+    if not hmac.compare_digest(checked.head, checked.items[-1].entry_hash):
+        return False
     entry_hashes: list[bytes] = []
     for entry in checked.items:
         recomputed = entry_digest(
@@ -10417,7 +10449,9 @@ def verify_signed_json_multi_index(bundle: Any, public_key: Any) -> bool:
     Confirms the whole sealed artifact offline, with no :class:`AuditLog`:
     :func:`verify_json_multi_index` recomputes every covered entry digest,
     re-verifies the shared compact batch inclusion proof against the
-    snapshot root and checks every bound pointer's complete hit-bucket
+    snapshot root, checks the declared chain head against the
+    authenticated snapshot content and checks every bound pointer's
+    complete hit-bucket
     partition, and the bundle's 64-byte Ed25519 signature is checked with
     the 32-byte ``public_key`` over the domain-separated message embedding
     the whole canonical index encoding — binding the ordered pointer

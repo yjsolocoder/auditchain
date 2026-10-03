@@ -15,7 +15,9 @@ from auditchain import (
     JsonSearchIndexBucket,
     JsonSearchIndexGroup,
     SignedJsonSearchIndex,
+    decode_json_search_index,
     decode_signed_json_search_index,
+    encode_json_search_index,
     encode_signed_json_search_index,
     verify_json_search_index,
     verify_signed_json_search_index,
@@ -558,6 +560,157 @@ class SignedJsonSearchIndexHitSetTamperTest(unittest.TestCase):
                 self.index.proof,
                 (groups[0], groups[0]),
             )
+
+
+class SignedJsonSearchIndexHeadConsistencyTest(unittest.TestCase):
+    """The declared chain head must match the authenticated snapshot."""
+
+    def _with_head(self, index, head):
+        return JsonSearchIndex(
+            index.version,
+            index.hash_name,
+            index.size,
+            index.root,
+            head,
+            index.retain_from,
+            index.pointer,
+            index.items,
+            index.proof,
+            index.groups,
+        )
+
+    def _resign(self, index, seed=SEED_A):
+        # Sign the tampered index with the trusted key over the documented
+        # domain-separated message (D || 0x01 || u64be(len) || blob), so
+        # only the content inconsistency itself can fail verification.
+        blob = encode_json_search_index(index)
+        message = (
+            b"auditchain/signed-json-search-index/v1\0"
+            + b"\x01"
+            + len(blob).to_bytes(8, "big")
+            + blob
+        )
+        signature = Ed25519PrivateKey.from_private_bytes(seed).sign(message)
+        return SignedJsonSearchIndex(index, signature)
+
+    def test_wrong_head_fails_unsigned_verification(self):
+        index = make_log().signed_json_search_index("/a", SEED_A).index
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        self.assertFalse(verify_json_search_index(bad))
+
+    def test_wrong_head_fails_signed_verification_with_valid_signature(self):
+        index = make_log().signed_json_search_index("/a", SEED_A).index
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        bundle = self._resign(bad)
+        # The signature is genuine and from the trusted key, yet the
+        # declared head contradicts the authenticated snapshot content.
+        self.assertFalse(
+            verify_signed_json_search_index(bundle, public_key(SEED_A))
+        )
+
+    def test_wrong_head_still_constructs_and_round_trips(self):
+        index = make_log().signed_json_search_index("/a", SEED_A).index
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        blob = encode_json_search_index(bad)
+        self.assertEqual(decode_json_search_index(blob), bad)
+        self.assertEqual(encode_json_search_index(decode_json_search_index(blob)), blob)
+
+    def test_head_type_and_width_errors_unchanged(self):
+        index = make_log().signed_json_search_index("/a", SEED_A).index
+        with self.assertRaises(TypeError):
+            self._with_head(index, "not bytes")
+        with self.assertRaises(ValueError):
+            self._with_head(index, b"\x00")
+
+    def test_historical_snapshot_head_is_last_covered_entry(self):
+        log = make_log()
+        bundle = log.signed_json_search_index("/a", SEED_A, size=4)
+        index = bundle.index
+        # The historical head is entry 3's hash, not the current log head.
+        self.assertEqual(index.head, index.items[-1].entry_hash)
+        self.assertNotEqual(index.head, log.head)
+        # The frozen snapshot still verifies after appends and prunes.
+        log.append(j({"a": 99}))
+        log.prune(2, log.seal(2))
+        public = public_key(SEED_A)
+        self.assertTrue(verify_json_search_index(index))
+        self.assertTrue(verify_signed_json_search_index(bundle, public))
+        # A head naming the wrong record fails offline.
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        self.assertFalse(verify_json_search_index(bad))
+        self.assertFalse(
+            verify_signed_json_search_index(self._resign(bad), public)
+        )
+
+    def test_pruned_log_with_retained_entries_checks_head(self):
+        log = make_log()
+        log.prune(2, log.seal(2))
+        index = log.signed_json_search_index("/a", SEED_A).index
+        self.assertEqual(index.retain_from, 2)
+        self.assertEqual(index.head, index.items[-1].entry_hash)
+        self.assertTrue(verify_json_search_index(index))
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        self.assertFalse(verify_json_search_index(bad))
+
+    def test_empty_coverage_keeps_accepting_structure(self):
+        log = make_log()
+        log.prune(len(log), log.seal(len(log)))
+        bundle = log.signed_json_search_index("/a", SEED_A)
+        index = bundle.index
+        self.assertEqual(index.items, ())
+        self.assertGreater(index.size, 0)
+        self.assertEqual(index.retain_from, index.size)
+        # No last-entry evidence remains; the empty coverage attests no
+        # content and is still accepted without a head check.
+        self.assertTrue(verify_json_search_index(index))
+        self.assertTrue(
+            verify_signed_json_search_index(bundle, public_key(SEED_A))
+        )
+
+    def test_empty_snapshot_requires_zero_head(self):
+        bundle = AuditLog().signed_json_search_index("/a", SEED_A)
+        index = bundle.index
+        self.assertEqual(index.size, 0)
+        self.assertEqual(index.head, bytes(len(index.head)))
+        self.assertTrue(verify_json_search_index(index))
+        self.assertTrue(
+            verify_signed_json_search_index(bundle, public_key(SEED_A))
+        )
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        self.assertFalse(verify_json_search_index(bad))
+        self.assertFalse(
+            verify_signed_json_search_index(
+                self._resign(bad), public_key(SEED_A)
+            )
+        )
+
+    def test_head_consistency_other_hash_algorithm(self):
+        log = AuditLog(hash_name="sha512")
+        for value in (1, 2, 3):
+            log.append(j({"a": value}))
+        bundle = log.signed_json_search_index("/a", SEED_A)
+        index = bundle.index
+        self.assertTrue(verify_json_search_index(index))
+        self.assertTrue(
+            verify_signed_json_search_index(bundle, public_key(SEED_A))
+        )
+        bad = self._with_head(index, bytes([0xA5]) * len(index.head))
+        self.assertFalse(verify_json_search_index(bad))
+        self.assertFalse(
+            verify_signed_json_search_index(
+                self._resign(bad), public_key(SEED_A)
+            )
+        )
+        # An empty sha512 snapshot likewise only accepts the zero head.
+        empty = AuditLog(hash_name="sha512").signed_json_search_index(
+            "/a", SEED_A
+        ).index
+        self.assertTrue(verify_json_search_index(empty))
+        self.assertFalse(
+            verify_json_search_index(
+                self._with_head(empty, bytes([0xA5]) * len(empty.head))
+            )
+        )
 
 
 class SignedJsonSearchIndexDeterminismTest(unittest.TestCase):

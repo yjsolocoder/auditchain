@@ -3419,9 +3419,10 @@ class JsonSearchIndex:
 
     Instances are immutable, may be built positionally and compare by all
     ten fields. The constructor validates types, widths, ranges, ordering
-    and bucket structure; whether the entry digests, the shared proof and
-    the bucket partition actually match the authenticated content is left
-    to :func:`verify_signed_json_search_index`, so a tampered index is
+    and bucket structure; whether the entry digests, the shared proof,
+    the declared chain head and the bucket partition actually match the
+    authenticated content is left to
+    :func:`verify_signed_json_search_index`, so a tampered index is
     still constructible and round-trips.
     """
 
@@ -3727,9 +3728,9 @@ class JsonMultiIndex:
 
     Instances are immutable, may be built positionally and compare by all
     ten fields. The constructor validates types, widths, ranges, pointer
-    ordering and per-pointer bucket structure; whether the entry digests,
-    the shared proof and the bucket partitions actually match the
-    authenticated content is left to
+    ordering and per-pointer bucket structure; whether the entry
+    digests, the shared proof, the declared chain head and the bucket
+    partitions actually match the authenticated content is left to
     :func:`verify_json_multi_index`, so a tampered index is still
     constructible and round-trips.
     """
@@ -10167,6 +10168,39 @@ def verify_json_search_receipt(receipt: Any) -> bool:
     )
 
 
+def _json_index_head_matches_snapshot(checked: Any) -> bool:
+    """Check the declared chain head against the authenticated snapshot.
+
+    Shared by :func:`verify_json_search_index` and
+    :func:`verify_json_multi_index` after the structural re-validation of
+    the container, so widths are already pinned to the hash algorithm.
+
+    A non-empty coverage carries the last record of the snapshot (the
+    entry at absolute index ``size - 1``) among ``items``; the declared
+    head must equal that authenticated entry's digest — including for a
+    historical snapshot or a retained segment, never the current, later
+    chain head. For an empty snapshot (``size == 0``) the only head that
+    fits is the digest-width zero value, paired with the canonical
+    empty-tree root. An empty *coverage* of a non-empty snapshot
+    (``retain_from == size`` after a prune) carries no last-entry
+    evidence — the released records cannot be reconstructed — so its
+    equal-width head cannot be judged here and is accepted structurally,
+    exactly as its root cannot.
+    """
+    if checked.items:
+        return hmac.compare_digest(
+            checked.head, checked.items[-1].entry_hash
+        )
+    if checked.size == 0:
+        return hmac.compare_digest(
+            checked.head, bytes(len(checked.head))
+        )
+    # retain_from == size > 0: an empty retained segment after a prune
+    # attests no content; the historical head cannot be checked without
+    # the released last entry.
+    return True
+
+
 def verify_json_search_index(index: Any) -> bool:
     """Verify an unsigned :class:`JsonSearchIndex` without holding the log.
 
@@ -10178,16 +10212,24 @@ def verify_json_search_index(index: Any) -> bool:
     that the recorded groups and buckets reproduce the *complete*
     partition: each hit index must carry exactly the claimed scalar kind
     and value, every resolved scalar must be listed, and no index may be
-    listed twice. A concealed hit, a forged or misassigned bucket entry,
-    a tampered payload/proof/root or a dropped covered entry is therefore
-    a structural or content failure, never a silent mismatch.
+    listed twice. Finally it binds the declared chain ``head`` to the
+    authenticated snapshot: when the coverage is non-empty the last
+    covered entry is the snapshot's last record (absolute index
+    ``size - 1``), so ``head`` must equal that entry's digest — a
+    historical snapshot keeps its historical head, never the current
+    chain head. A concealed hit, a forged or misassigned bucket entry,
+    a tampered payload/proof/root/head or a dropped covered entry is
+    therefore a structural or content failure, never a silent mismatch.
 
     An empty coverage (``items == ()``) with ``size == 0`` additionally
-    accepts only the canonical empty-tree root and carries no groups; an
-    empty retained segment of a non-empty snapshot (``retain_from ==
-    size`` after a prune) attests no content and likewise carries no
-    groups. Structurally valid data whose digests, proof, root or buckets
-    do not match returns False rather than raising. Input that is not a
+    accepts only the canonical empty-tree root together with the
+    digest-width zero chain head and carries no groups; an empty retained
+    segment of a non-empty snapshot (``retain_from == size`` after a
+    prune) attests no content: the released last entry cannot be
+    reconstructed, so its root and head cannot be checked and the
+    structurally valid artifact carries no groups. Structurally valid
+    data whose digests, head, proof, root or buckets do not match
+    returns False rather than raising. Input that is not a
     :class:`JsonSearchIndex` raises TypeError; an instance whose frozen
     fields were bypassed into an illegal shape raises the same
     TypeError or ValueError the constructor would. The call is read-only.
@@ -10210,13 +10252,20 @@ def verify_json_search_index(index: Any) -> bool:
         if checked.groups:
             return False
         if checked.size == 0:
+            # The empty snapshot only fits the canonical empty-tree root
+            # and the digest-width zero chain head.
             return hmac.compare_digest(
                 checked.root,
                 _hash_parts(checked.hash_name, _EMPTY_DOMAIN),
+            ) and hmac.compare_digest(
+                checked.head, bytes(_digest_size(checked.hash_name))
             )
         # An empty retained segment of a non-empty snapshot attests no
-        # content; the recorded root cannot be checked without evidence.
+        # content; the recorded root and head cannot be checked without
+        # evidence of the released last entry.
         return True
+    if not _json_index_head_matches_snapshot(checked):
+        return False
     entry_hashes: list[bytes] = []
     for entry in checked.items:
         recomputed = entry_digest(
@@ -10279,8 +10328,14 @@ def verify_signed_json_search_index(bundle: Any, public_key: Any) -> bool:
     snapshot size/root/head, retain point, the complete covered entry set,
     the proof and every hit bucket. A genuine sealed bundle from the
     trusted key returns True; a structurally valid bundle signed by
-    another key, or whose signature, coverage material or hit sets have
-    been altered, returns False — all without raising. Input that is not a
+    another key, or whose signature, coverage material, head or hit sets
+    have been altered, returns False — all without raising. Content
+    consistency is never inferred from signature authenticity: the head
+    must match the authenticated snapshot per
+    :func:`verify_json_search_index`, so a valid signature from the
+    trusted key over an index whose equal-width head contradicts its
+    covered last entry (or the empty-snapshot zero head) still returns
+    False. Input that is not a
     :class:`SignedJsonSearchIndex` (or whose container fields have been
     bypassed to wrong types) raises TypeError; nested structural
     violations raise exactly the exceptions of :class:`JsonSearchIndex`
@@ -10316,21 +10371,29 @@ def verify_json_multi_index(index: Any) -> bool:
     recorded groups and buckets reproduce that pointer's *complete*
     partition: each hit index must carry exactly the claimed scalar kind
     and value, every resolved scalar must be listed, and no index may be
-    listed twice within one pointer's groups. A concealed hit, a forged
-    or misassigned bucket entry, a missing, extra or mismatched pointer,
-    a tampered payload/proof/root or a dropped covered entry is
-    therefore a structural or content failure, never a silent mismatch.
+    listed twice within one pointer's groups. Finally it binds the
+    declared chain ``head`` to the authenticated snapshot exactly like
+    :func:`verify_json_search_index`: when the coverage is non-empty the
+    last covered entry is the snapshot's last record (absolute index
+    ``size - 1``), so ``head`` must equal that entry's digest — a
+    historical snapshot keeps its historical head, never the current
+    chain head. A concealed hit, a forged or misassigned bucket entry, a
+    missing, extra or mismatched pointer, a tampered
+    payload/proof/root/head or a dropped covered entry is therefore a
+    structural or content failure, never a silent mismatch.
 
     An empty coverage (``items == ()``) with ``size == 0`` additionally
-    accepts only the canonical empty-tree root and carries no groups for
-    any pointer; an empty retained segment of a non-empty snapshot
-    (``retain_from == size`` after a prune) attests no content and
-    likewise carries no groups. Structurally valid data whose digests,
-    proof, root or buckets do not match returns False rather than
-    raising. Input that is not a :class:`JsonMultiIndex` raises
-    TypeError; an instance whose frozen fields were bypassed into an
-    illegal shape raises the same TypeError or ValueError the
-    constructor would. The call is read-only.
+    accepts only the canonical empty-tree root together with the
+    digest-width zero chain head and carries no groups for any pointer;
+    an empty retained segment of a non-empty snapshot (``retain_from ==
+    size`` after a prune) attests no content: the released last entry
+    cannot be reconstructed, so its root and head cannot be checked and
+    the structurally valid artifact carries no groups. Structurally
+    valid data whose digests, head, proof, root or buckets do not match
+    returns False rather than raising. Input that is not a
+    :class:`JsonMultiIndex` raises TypeError; an instance whose frozen
+    fields were bypassed into an illegal shape raises the same
+    TypeError or ValueError the constructor would. The call is read-only.
     """
     if not isinstance(index, JsonMultiIndex):
         raise TypeError("index must be a JsonMultiIndex")
@@ -10350,13 +10413,20 @@ def verify_json_multi_index(index: Any) -> bool:
         if any(pointer_groups for pointer_groups in checked.groups):
             return False
         if checked.size == 0:
+            # The empty snapshot only fits the canonical empty-tree root
+            # and the digest-width zero chain head.
             return hmac.compare_digest(
                 checked.root,
                 _hash_parts(checked.hash_name, _EMPTY_DOMAIN),
+            ) and hmac.compare_digest(
+                checked.head, bytes(_digest_size(checked.hash_name))
             )
         # An empty retained segment of a non-empty snapshot attests no
-        # content; the recorded root cannot be checked without evidence.
+        # content; the recorded root and head cannot be checked without
+        # evidence of the released last entry.
         return True
+    if not _json_index_head_matches_snapshot(checked):
+        return False
     entry_hashes: list[bytes] = []
     for entry in checked.items:
         recomputed = entry_digest(
@@ -10426,7 +10496,12 @@ def verify_signed_json_multi_index(bundle: Any, public_key: Any) -> bool:
     genuine sealed bundle from the trusted key returns True; a
     structurally valid bundle signed by another key, or whose signature,
     coverage material, pointers or hit sets have been altered, returns
-    False — all without raising. Input that is not a
+    False — all without raising. As with the single-pointer bundle, a
+    valid signature from the trusted key cannot substitute for content
+    consistency: a head contradicting the authenticated snapshot (or the
+    empty-snapshot zero head) is rejected per
+    :func:`verify_json_multi_index` even when the signature itself
+    verifies. Input that is not a
     :class:`SignedJsonMultiIndex` (or whose container fields have been
     bypassed to wrong types) raises TypeError; nested structural
     violations raise exactly the exceptions of :class:`JsonMultiIndex`

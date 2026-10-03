@@ -428,10 +428,17 @@ bundle.find(1, 0, 1)    # (0,)：半开区间、默认 [retain_from, size)，规
 `verify_signed_json_search_index(bundle, public_key)` 重算每个 `entry_digest`、
 核对批量包含证明，并自行对已认证条目做严格 JSON 解析与指针解析，要求其完整标量
 分区与签名桶逐一吻合——少一条命中（隐藏）、多列一条（伪造）、错配桶或篡改
-payload/证明/根/链头都无法通过，全过程无需 `AuditLog`。无签名的
-`verify_json_search_index(index)` 做除验签外的同样检查。`find` 的 `value` 只
-接受 `str`、`int`、有限 `float`、`bool`、`None`（否则 `TypeError`，非有限
-float 抛 `ValueError`）；区间越界抛 `ValueError`、区间类型错误抛 `TypeError`。
+payload/证明/根/链头都无法通过，全过程无需 `AuditLog`。核验还把声明链头与已认证
+快照对应起来：覆盖非空时末条即绝对索引 `size-1`，`head` 必须等于该条
+`entry_hash`（历史快照用历史链头，不能用日志当前链头）；`size == 0` 的空快照只
+接受规范空树根**与**同宽全零链头；`retain_from == size > 0` 的空覆盖是裁剪后
+无末条证据的结构合法制品，其 `root`/`head` 均无证据可核，仍按结构合法接受。无
+签名的 `verify_json_search_index(index)` 做除验签外的同样检查；等宽但错误的链头
+属于核验失败（返回 `False`，不抛异常），构造与编解码仍允许其往返。签名真实不等于
+内容一致：即使签名有效且来自预信任公钥，链头与快照矛盾的签名包也返回 `False`。
+`find` 的 `value` 只接受 `str`、`int`、有限 `float`、`bool`、`None`（否则
+`TypeError`，非有限 float 抛 `ValueError`）；区间越界抛 `ValueError`、区间类型
+错误抛 `TypeError`。
 
 ```python
 verify_signed_json_search_index(bundle, public_key)      # True
@@ -508,9 +515,13 @@ bundle.pointers             # ('/a', '/b/c', '/z')
 解析，要求每个指针的完整标量分区与其分组逐一吻合；少列（隐藏命中）、多列（
 伪造命中或伪造空结果）、错配指针（少一个/多一个/顺序不符/张冠李戴）、篡改
 payload/证明/根/链头都返回 `False`，结构非法才抛 `TypeError`/`ValueError`。
-`verify_signed_json_multi_index(bundle, public_key)` 额外用预信任的 32 字节
-Ed25519 公钥核验签名，签名原文绑定全部指针及各指针命中集；签名者/公钥不符或
-任何内容被篡改返回 `False` 而不抛异常。
+链头判定与单指针索引一致：覆盖非空时 `head` 必须等于末条（绝对索引
+`size-1`）的 `entry_hash`，历史快照按历史链头核对；`size == 0` 只接受规范
+空树根与同宽全零链头；`retain_from == size > 0` 的空覆盖无末条证据，结构合法
+即接受。`verify_signed_json_multi_index(bundle, public_key)` 额外用预信任的
+32 字节 Ed25519 公钥核验签名，签名原文绑定全部指针及各指针命中集；签名者/公钥
+不符或任何内容（含与快照矛盾的链头）被篡改返回 `False` 而不抛异常——即使签名
+本身有效且来自预信任公钥，也不能把签名真实性当作链头一致性。
 
 组合索引有独立的规范字节编解码，u64/blob 规则与单指针索引一致：索引魔数
 `b"auditchain/json-multi-index/v1\0"`，在 `retain_from` 之后先写指针计数，

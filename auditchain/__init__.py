@@ -3680,6 +3680,28 @@ def _json_groups_find_all(
     return tuple(merged)
 
 
+def _intersect_ascending_tuples(
+    left: tuple[int, ...], right: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Intersect two strictly ascending, duplicate-free index tuples.
+
+    Shared core of :meth:`JsonMultiIndex.find_all`; the merge walk keeps
+    the result strictly ascending and duplicate free.
+    """
+    i = j = 0
+    shared: list[int] = []
+    while i < len(left) and j < len(right):
+        if left[i] == right[j]:
+            shared.append(left[i])
+            i += 1
+            j += 1
+        elif left[i] < right[j]:
+            i += 1
+        else:
+            j += 1
+    return tuple(shared)
+
+
 @dataclass(frozen=True)
 class JsonMultiIndex:
     """Persistent, offline-verifiable multi-pointer JSON retrieval index.
@@ -3914,6 +3936,77 @@ class JsonMultiIndex:
         merged = _json_groups_find_all(self.groups[position], value)
         return tuple(index for index in merged if start <= index < stop)
 
+    def find_all(
+        self,
+        conditions: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Answer several find_json equality conditions in one lookup.
+
+        ``conditions`` is a tuple of ``(pointer, value)`` pairs, each
+        following exactly the rules of :meth:`find`: the pointer must be a
+        canonical RFC 6901 spelling bound by this index and ``value`` a
+        JSON scalar (``str``, ``int``, finite ``float``, ``bool`` or
+        ``None``) with the same kind-separated comparison — strings,
+        booleans and null match only their own kind while ints and floats
+        compare by numeric value. The conditions need no ordering and a
+        pointer may repeat; only entries satisfying *every* condition
+        within the half-open ``[start, stop)`` range are returned, as a
+        tuple of absolute indices in strictly ascending order without
+        duplicates (``()`` when nothing matches). Repeating an identical
+        condition never changes the result, and mutually exclusive
+        conditions on one pointer yield ``()``. An empty ``conditions``
+        tuple imposes no field constraint and returns every index in the
+        range.
+
+        Non-JSON, encrypted, missing-field and non-scalar targets never
+        satisfy the corresponding condition, exactly as for :meth:`find`.
+        A non-tuple ``conditions`` or condition, a wrong-typed pointer or
+        value, or a wrong-typed range bound raises TypeError; a condition
+        tuple whose length is not two, a malformed pointer, a pointer the
+        index was not built for, a non-finite float, or an out-of-range or
+        reversed range raises ValueError. Every condition and the range
+        are validated before any lookup, so such an error is reported
+        even when an earlier condition already has no hit or the range is
+        empty. The lookup is read-only and never mutates the index.
+        """
+        if not isinstance(conditions, tuple):
+            raise TypeError(
+                "conditions must be a tuple of (pointer, value) pairs"
+            )
+        resolved: list[tuple[int, Any]] = []
+        for condition in conditions:
+            if not isinstance(condition, tuple):
+                raise TypeError("each condition must be a (pointer, value) tuple")
+            if len(condition) != 2:
+                raise ValueError("each condition must have exactly two items")
+            pointer, value = condition
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            _check_json_value(value)
+            resolved.append((position, value))
+        start, stop = self._range_bounds(start, stop)
+        if not resolved:
+            return tuple(range(start, stop))
+        result: tuple[int, ...] | None = None
+        for position, value in resolved:
+            merged = _json_groups_find_all(self.groups[position], value)
+            hits = tuple(index for index in merged if start <= index < stop)
+            if result is None:
+                result = hits
+            else:
+                result = _intersect_ascending_tuples(result, hits)
+            if not result:
+                break
+        return tuple(() if result is None else result)
+
 
 @dataclass(frozen=True)
 class SignedJsonMultiIndex:
@@ -3964,6 +4057,15 @@ class SignedJsonMultiIndex:
     ) -> tuple[int, ...]:
         """Find on the bundled :class:`JsonMultiIndex`; semantics identical."""
         return self.index.find(pointer, value, start, stop)
+
+    def find_all(
+        self,
+        conditions: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Multi-condition find on the bundled index; semantics identical."""
+        return self.index.find_all(conditions, start, stop)
 
 
 @dataclass(frozen=True)

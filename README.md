@@ -530,6 +530,41 @@ bundle.find_all((("/a", 1),), 0, 3)            # 半开区间规则同 find
 性仍由既有离线核验入口确认。查询只读，成功或失败都不改变索引、签名或重编码
 字节，不引入任何新的格式或回执。
 
+`JsonMultiIndex.find_where(expression, start=None, stop=None)` 在同一冻结快照
+上支持任意嵌套的布尔查询。表达式是 tuple 树：叶子为 `("eq", pointer, value)`
+，沿用 `find` 的 RFC 6901 指针、索引覆盖与标量等值规则（整数与浮点按数值比较
+，布尔、字符串、null 与数字各自分开）；组合为 `("and", children)`、
+`("or", children)` 或 `("not", child)`，`children` 是子表达式 tuple，可递归
+嵌套。`and` 取交集、`or` 取并集、`not` 对**本次查询范围**内的全部索引取补集；
+空 `and` 返回整个范围，空 `or` 返回 `()`，双重否定恢复原结果，重复分支不增加
+重复命中。非 JSON、密文、缺字段和非标量目标都不匹配 `eq`（因而命中该叶子的
+否定），缺字段不会被当成 `null`。
+
+```python
+bundle.find_where(("eq", "/a", 1))                       # 等同 find("/a", 1)
+bundle.find_where(("and", (("eq", "/a", 1),
+                           ("eq", "/b", "x"))))          # 等同 find_all
+bundle.find_where(("or", (("eq", "/a", 1),
+                          ("eq", "/z", 9))))             # 并集
+bundle.find_where(("not", ("eq", "/a", 1)))              # 范围内补集
+bundle.find_where(                                       # 任意嵌套
+    ("or", (("and", (("eq", "/a", 1), ("eq", "/b", "x"))),
+            ("eq", "/z", 9))))
+bundle.find_where(("and", ()))                           # 整个范围
+bundle.find_where(("or", ()))                            # ()
+bundle.find_where(("not", ("eq", "/a", 1)), 0, 3)        # 补集限定 [0, 3)
+```
+
+范围默认覆盖 `[retain_from, size)`，显式端点沿用既有半开区间规则，空范围返回
+`()`。节点或 `children` 非 tuple、操作符或指针非字符串、值不属于现有标量类型
+、端点不是非布尔整数且非 `None` 时抛 `TypeError`；空节点、未知操作符、节点
+长度不符、指针语法非法或未被覆盖、浮点数非有限、范围越界或逆序时抛
+`ValueError`。**表达式整树与范围先完整校验再求值**，按节点先于子节点、子节点
+从左到右的顺序报告首错，范围最后检查——空范围或已确定的逻辑结果（如空 `or`
+、互斥条件）都不会掩盖无效分支中的错误。`SignedJsonMultiIndex.find_where` 委托
+内部索引，两种对象结果一致，可直接查询字节格式解码后的制品；查询不代表验签
+成功，且只读、不改变索引/签名/重编码字节，不引入任何新的持久化格式。
+
 `verify_json_multi_index(index)` 无需持有日志，重算每个 `entry_digest`、核对
 共享批量包含证明，并**逐指针**对已认证条目自行做严格 JSON 解析与 RFC 6901
 解析，要求每个指针的完整标量分区与其分组逐一吻合；少列（隐藏命中）、多列（

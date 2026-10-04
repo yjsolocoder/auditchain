@@ -3767,6 +3767,55 @@ def _intersect_ascending_tuples(
     return tuple(shared)
 
 
+def _union_ascending_tuples(
+    left: tuple[int, ...], right: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Union two strictly ascending, duplicate-free index tuples.
+
+    Used by :meth:`JsonMultiIndex.find_where` for ``or``; the merge walk
+    keeps the result strictly ascending and drops a value appearing in
+    both inputs, so repeated branches add no duplicate hits.
+    """
+    i = j = 0
+    merged: list[int] = []
+    while i < len(left) or j < len(right):
+        if j >= len(right) or (i < len(left) and left[i] < right[j]):
+            merged.append(left[i])
+            i += 1
+        elif i >= len(left) or right[j] < left[i]:
+            merged.append(right[j])
+            j += 1
+        else:
+            merged.append(left[i])
+            i += 1
+            j += 1
+    return tuple(merged)
+
+
+def _subtract_ascending_tuples(
+    universe: tuple[int, ...], removed: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Remove ``removed`` indices from the strictly ascending ``universe``.
+
+    Used by :meth:`JsonMultiIndex.find_where` for ``not``; both inputs are
+    strictly ascending and the result keeps the universe's order.
+    """
+    j = 0
+    kept: list[int] = []
+    for index in universe:
+        while j < len(removed) and removed[j] < index:
+            j += 1
+        if j < len(removed) and removed[j] == index:
+            j += 1
+            continue
+        kept.append(index)
+    return tuple(kept)
+
+
+# Operators accepted by JsonMultiIndex.find_where tuple expressions.
+_JSON_WHERE_OPERATORS = frozenset({"eq", "and", "or", "not"})
+
+
 @dataclass(frozen=True)
 class JsonMultiIndex:
     """Persistent, offline-verifiable multi-pointer JSON retrieval index.
@@ -4072,6 +4121,129 @@ class JsonMultiIndex:
                 break
         return tuple(() if result is None else result)
 
+    def _validate_where_expression(self, expression: Any) -> None:
+        """Validate a :meth:`find_where` expression without executing it.
+
+        The whole tree is walked node by node, so an invalid branch is
+        reported even when a logically determined result (an empty ``or``,
+        a failed ``eq``) or an empty query range would make it irrelevant.
+        Errors surface node-before-children and children left to right:
+        the node tuple itself, its operator string/name, its arity, then
+        each subtree in order; ``eq`` validates its pointer (parse,
+        canonical spelling and index coverage) before its value.
+        """
+
+        def visit(node: Any) -> None:
+            if not isinstance(node, tuple):
+                raise TypeError("expression node must be a tuple")
+            if not node:
+                raise ValueError("expression node must be non-empty")
+            operator = node[0]
+            if not isinstance(operator, str):
+                raise TypeError("operator must be a string")
+            if operator not in _JSON_WHERE_OPERATORS:
+                raise ValueError(f"unknown operator {operator!r}")
+            if operator == "eq":
+                if len(node) != 3:
+                    raise ValueError("an 'eq' node must have exactly three items")
+                pointer = node[1]
+                tokens = _parse_json_pointer(pointer)
+                canonical = _json_pointer_canonical(tokens)
+                if canonical not in self.pointers:
+                    raise ValueError(
+                        f"pointer {canonical!r} is not covered by this index"
+                    )
+                _check_json_value(node[2])
+                return
+            if len(node) != 2:
+                raise ValueError(
+                    f"a {operator!r} node must have exactly two items"
+                )
+            children = node[1]
+            if not isinstance(children, tuple):
+                if operator == "not":
+                    raise TypeError("the 'not' child must be a tuple node")
+                raise TypeError("children must be a tuple of expression nodes")
+            if operator == "not":
+                # The child is the single node itself: ("not", child); an
+                # empty tuple is not a node and is rejected by visit().
+                visit(children)
+                return
+            for child in children:
+                visit(child)
+
+        visit(expression)
+
+    def find_where(
+        self,
+        expression: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Answer a nested boolean query from the frozen index.
+
+        ``expression`` is a tuple tree. Leaves are ``("eq", pointer,
+        value)`` and follow exactly the rules of :meth:`find`: the pointer
+        must be a canonical RFC 6901 spelling bound by this index and
+        ``value`` a JSON scalar (``str``, int, finite ``float``, ``bool``
+        or ``None``) with kind-separated equality (strings, booleans and
+        null match only their own kind; ints and floats compare by numeric
+        value). Combinators are ``("and", children)``, ``("or",
+        children)`` and ``("not", child)``, where ``children`` is a tuple
+        of child expression tuples and nesting is arbitrary. ``and``
+        intersects and ``or`` unions the child hit sets; ``not`` takes the
+        complement against every index in the query range. An empty
+        ``and`` returns the whole range and an empty ``or`` returns
+        ``()``; double negation restores the original result and a
+        repeated branch adds no duplicate hit. Non-JSON, encrypted,
+        missing-field and non-scalar targets never match ``eq`` (so they
+        do match its negation); a missing field is never treated as
+        ``null``.
+
+        The half-open ``[start, stop)`` range defaults to
+        ``[retain_from, size)`` and follows exactly the bounds and types
+        of :meth:`find`; an empty range yields ``()``. The expression tree
+        and the range are validated in full before evaluation — node
+        before children and children left to right, range last — so an
+        empty range or an already determined logical result never masks an
+        invalid branch: a non-tuple node or children tuple, a non-string
+        operator or pointer, a value outside the scalar types, or a
+        non-bool-integer / non-``None`` bound raises TypeError; an empty
+        node, unknown operator, wrong node length, malformed or uncovered
+        pointer, non-finite float, or out-of-range/reversed range raises
+        ValueError. The lookup is read-only and never mutates the index.
+        """
+        self._validate_where_expression(expression)
+        start, stop = self._range_bounds(start, stop)
+        universe = tuple(range(start, stop))
+
+        def evaluate(node: tuple) -> tuple[int, ...]:
+            operator = node[0]
+            if operator == "eq":
+                _, pointer, value = node
+                position = self.pointers.index(
+                    _json_pointer_canonical(_parse_json_pointer(pointer))
+                )
+                merged = _json_groups_find_all(self.groups[position], value)
+                return tuple(index for index in merged if start <= index < stop)
+            if operator == "not":
+                return _subtract_ascending_tuples(universe, evaluate(node[1]))
+            children = node[1]
+            if not children:
+                return universe if operator == "and" else ()
+            result = evaluate(children[0])
+            if operator == "and":
+                for child in children[1:]:
+                    result = _intersect_ascending_tuples(result, evaluate(child))
+                    if not result:
+                        break
+            else:
+                for child in children[1:]:
+                    result = _union_ascending_tuples(result, evaluate(child))
+            return result
+
+        return evaluate(expression)
+
 
 @dataclass(frozen=True)
 class SignedJsonMultiIndex:
@@ -4131,6 +4303,15 @@ class SignedJsonMultiIndex:
     ) -> tuple[int, ...]:
         """Multi-condition find on the bundled index; semantics identical."""
         return self.index.find_all(conditions, start, stop)
+
+    def find_where(
+        self,
+        expression: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> tuple[int, ...]:
+        """Nested boolean query on the bundled index; semantics identical."""
+        return self.index.find_where(expression, start, stop)
 
 
 @dataclass(frozen=True)

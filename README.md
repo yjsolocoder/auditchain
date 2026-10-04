@@ -992,6 +992,46 @@ RFC 6901 标量语义下的完整命中集、键控确认 MAC）、检查点签�
 核验入口，不新增签名原文或线格式，也不携带解密明文或任何密钥；既有的查询、
 签名原文、编解码、索引、保留策略及命令行行为全部不变。
 
+`encode_signed_full_encrypted_json_search_receipt(bundle)` /
+`decode_signed_full_encrypted_json_search_receipt(data)` 把整个可信完整加密
+JSON 检索签名包序列化为规范二进制并原样还原，使其可落盘、跨进程传输后继续
+凭查询密钥与预置信任的 Ed25519 公钥离线验真，且不引入任何新的签名原文：
+
+```python
+from auditchain import (
+    encode_signed_full_encrypted_json_search_receipt,
+    decode_signed_full_encrypted_json_search_receipt,
+)
+
+data = encode_signed_full_encrypted_json_search_receipt(bundle)       # bytes，可写文件/发网络
+restored = decode_signed_full_encrypted_json_search_receipt(data)     # 冻结 SignedFullEncryptedJsonSearchReceipt
+restored == bundle                                                    # True：字段相等
+encode_signed_full_encrypted_json_search_receipt(restored) == data    # True：重复/解码后重编码逐字节相同
+verify_signed_full_encrypted_json_search_receipt(restored, key, public_key)  # True：无需持有日志
+```
+
+字节流以魔数
+`b"auditchain/signed-full-encrypted-json-search/v1\0"`（含 NUL 结尾）开头，
+随后**严格依次**写 `version`（恒为 `1`，8 字节无符号大端，即 `U(1)`）、
+receipt blob（`B(R)`）、checkpoint blob（`B(C)`），顺序固定、禁止换序与
+尾随；两个 blob 均为 u64 字节长度前缀加原始字节，内容依次就是既有
+`encode_full_encrypted_json_search_receipt` 与 `encode_signed_root` 输出的
+完整规范字节，`U` / `B` 规则与既有框架完全一致。解码精确消费两个 blob 且
+禁止尾随，分别原样交给 `decode_full_encrypted_json_search_receipt` 与
+`decode_signed_root`。`encode_signed_full_encrypted_json_search_receipt` 只
+接受 `SignedFullEncryptedJsonSearchReceipt`（其余类型抛 `TypeError`，绕过
+冻结限制篡改的容器字段也重新检查；嵌套取值或结构非法、证明节点数量错误，或
+两部分算法名、尺寸、根不一致抛 `ValueError`），
+`decode_signed_full_encrypted_json_search_receipt` 只接受精确的 `bytes`
+（含拒绝 `bytearray` / `memoryview`，抛 `TypeError`）；错误魔数、版本、
+截断、长度越界、尾随内容、任一嵌套编码非法或两部分快照不一致抛
+`ValueError`；结构合法但密文、证明、命中集、确认信息或签名被改动的包仍可
+往返，`verify_signed_full_encrypted_json_search_receipt` 返回 `False`，合法
+但错误（长度合法）的查询密钥或公钥同样返回 `False`，包括空结果。空快照、
+空范围、零命中、仍可重建的历史快照、裁剪后的保留范围以及既有固定长度摘要
+算法均可往返；两个入口均只读、不接收密钥、不自动读写文件，既有查询、签发、
+核验、其他编解码、索引、保留策略及命令行行为不变。
+
 ### 命中型检索回执的只读诊断
 
 `verify_search_receipt` / `verify_encrypted_search_receipt` 只回答真假；本次补上
@@ -5958,6 +5998,29 @@ python3 -m auditchain
   `ValueError`；解码对象字段相等、冻结且重编码逐字节相同，空范围与空快照
   照常往返与核验（判定口径照旧），结构合法但签名、内容或命中不匹配仍可
   往返（验包返回 `False`）；两个入口均为只读且确定
+- `encode_signed_full_encrypted_json_search_receipt(bundle)` /
+  `decode_signed_full_encrypted_json_search_receipt(data)` — 可信完整加密
+  JSON 检索回执签名包的规范二进制编码与解码，使
+  `SignedFullEncryptedJsonSearchReceipt` 可落盘、跨进程传输后继续凭查询
+  密钥与预置信任的 Ed25519 公钥离线验真，且不新增签名原文、不接收密钥、
+  不自动读写文件：字节流以魔数
+  `b"auditchain/signed-full-encrypted-json-search/v1\0"`（含 NUL 结尾）
+  开头，严格依次写 version=1（u64）、receipt blob、checkpoint blob，顺序
+  固定、禁止换序与尾随；每个 blob 为 u64 字节长度前缀加原始字节，内容分别
+  是既有 `encode_full_encrypted_json_search_receipt` 与
+  `encode_signed_root` 的完整规范字节，解码精确消费两个 blob 并分别交给
+  既有解码器。前者只接受 `SignedFullEncryptedJsonSearchReceipt`（容器
+  字段类型错或非该容器抛 `TypeError`，嵌套取值或结构非法、证明节点数量
+  错误，或两部分算法名、尺寸、根不一致抛 `ValueError`，绕过冻结限制
+  破坏的对象也重新检查），后者只接受精确的 `bytes`（拒绝 `bytearray` /
+  `memoryview`，抛 `TypeError`）；错误魔数、版本、截断、长度越界、尾随
+  内容、任一嵌套编码非法或两部分快照不一致抛 `ValueError`；解码对象字段
+  相等、冻结且重编码逐字节相同，空快照、空范围、零命中、仍可重建的历史
+  快照、裁剪后的保留范围及既有固定长度摘要算法照常往返，结构合法但密文、
+  证明、命中集、确认信息或签名被改仍可往返（
+  `verify_signed_full_encrypted_json_search_receipt` 返回 `False`，长度
+  合法但错误的查询密钥或公钥同样返回 `False`，包括空结果）；两个入口均为
+  只读且确定
 - `encode_signed_consistency(receipt)` / `decode_signed_consistency(data)` —
   可信跨快照一致性凭据的规范二进制编码与解码，使 `SignedConsistency` 可落盘、
   跨进程恢复后继续凭预置信任的 Ed25519 公钥离线验真，且不新增签名原文：魔数

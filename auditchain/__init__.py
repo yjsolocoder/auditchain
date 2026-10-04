@@ -97,6 +97,8 @@ encode_signed_audit_batch / decode_signed_audit_batch /
 encode_signed_audit_receipt / decode_signed_audit_receipt /
 encode_signed_search_receipt / decode_signed_search_receipt /
 encode_signed_full_search_receipt / decode_signed_full_search_receipt /
+encode_signed_full_encrypted_json_search_receipt /
+decode_signed_full_encrypted_json_search_receipt /
 encode_signed_full_encrypted_search_receipt /
 decode_signed_full_encrypted_search_receipt /
 encode_signed_auth_audit_continuation /
@@ -253,6 +255,7 @@ __all__ = [
     "decode_signed_auth_bundle",
     "decode_signed_consistency",
     "decode_signed_encrypted_search_receipt",
+    "decode_signed_full_encrypted_json_search_receipt",
     "decode_signed_full_encrypted_search_receipt",
     "decode_signed_full_search_receipt",
     "decode_signed_json_multi_index",
@@ -321,6 +324,7 @@ __all__ = [
     "encode_signed_auth_bundle",
     "encode_signed_consistency",
     "encode_signed_encrypted_search_receipt",
+    "encode_signed_full_encrypted_json_search_receipt",
     "encode_signed_full_encrypted_search_receipt",
     "encode_signed_full_search_receipt",
     "encode_signed_json_multi_index",
@@ -734,6 +738,17 @@ _SIGNED_FULL_ENCRYPTED_SEARCH_MAGIC = (
     b"auditchain/signed-full-encrypted-search/v1\0"
 )
 _SIGNED_FULL_ENCRYPTED_SEARCH_VERSION = 1
+
+# Binary framing of
+# encode_signed_full_encrypted_json_search_receipt /
+# decode_signed_full_encrypted_json_search_receipt: a fixed magic, then the
+# envelope version as a u64 and two u64-length-prefixed blobs holding the
+# complete canonical encode_full_encrypted_json_search_receipt and
+# encode_signed_root bytes, in that order and with nothing else.
+_SIGNED_FULL_ENCRYPTED_JSON_SEARCH_MAGIC = (
+    b"auditchain/signed-full-encrypted-json-search/v1\0"
+)
+_SIGNED_FULL_ENCRYPTED_JSON_SEARCH_VERSION = 1
 
 # Binary framing of encode_signed_consistency / decode_signed_consistency:
 # a fixed magic, then the envelope version as a u64, two u64-length-prefixed
@@ -17888,6 +17903,137 @@ def decode_signed_full_encrypted_search_receipt(
     receipt = decode_full_encrypted_search_receipt(receipt_blob)
     checkpoint = decode_signed_root(checkpoint_blob)
     return SignedFullEncryptedSearchReceipt(
+        receipt=receipt, checkpoint=checkpoint
+    )
+
+
+def encode_signed_full_encrypted_json_search_receipt(
+    bundle: Any,
+) -> bytes:
+    """Encode a :class:`SignedFullEncryptedJsonSearchReceipt` into canonical
+    binary form.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-full-encrypted-json-search/v1\\0"``; it then
+    writes, strictly in order, the envelope ``version`` (always 1) as an
+    unsigned 8-byte big-endian integer, the receipt blob and the
+    checkpoint blob — nothing may be omitted, reordered or appended. Each
+    blob is a u64 byte length followed by the raw bytes: the receipt blob
+    is the complete canonical output of
+    :func:`encode_full_encrypted_json_search_receipt` over
+    ``bundle.receipt`` and the checkpoint blob is the complete canonical
+    output of :func:`encode_signed_root` over ``bundle.checkpoint``. No
+    new signing message is introduced: encoding is read-only, takes no
+    keys and only re-uses the existing canonical encodings.
+
+    ``bundle`` must be a :class:`SignedFullEncryptedJsonSearchReceipt` —
+    anything else, or a bundle whose container fields have been bypassed
+    to wrong types, raises TypeError; nested structural problems raise
+    exactly the exceptions of
+    :func:`encode_full_encrypted_json_search_receipt` and
+    :func:`encode_signed_root` (TypeError or ValueError), and a pair
+    describing two different snapshots raises ValueError before any bytes
+    are emitted. Encoding is deterministic: re-encoding a decoded bundle
+    reproduces the original bytes exactly, and a structurally valid
+    bundle whose ciphertext, proof, hit set, confirmation or signature
+    does not match encodes just as well; verification is left to
+    :func:`verify_signed_full_encrypted_json_search_receipt`.
+    """
+    if not isinstance(bundle, SignedFullEncryptedJsonSearchReceipt):
+        raise TypeError(
+            "bundle must be a SignedFullEncryptedJsonSearchReceipt"
+        )
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would and a pair describing two
+    # different snapshots raises its ValueError before any bytes are emitted.
+    checked = SignedFullEncryptedJsonSearchReceipt(
+        bundle.receipt, bundle.checkpoint
+    )
+    receipt_blob = encode_full_encrypted_json_search_receipt(checked.receipt)
+    checkpoint_blob = encode_signed_root(checked.checkpoint)
+    return b"".join((
+        _SIGNED_FULL_ENCRYPTED_JSON_SEARCH_MAGIC,
+        _encode_u64(_SIGNED_FULL_ENCRYPTED_JSON_SEARCH_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        _encode_blob(checkpoint_blob),
+    ))
+
+
+def decode_signed_full_encrypted_json_search_receipt(
+    data: Any,
+) -> SignedFullEncryptedJsonSearchReceipt:
+    """Decode bytes produced by
+    :func:`encode_signed_full_encrypted_json_search_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-full-encrypted-json-search/v1\\0"`` it must
+    contain, strictly in order, the u64 envelope version (only ``1`` is
+    supported), one length-prefixed receipt blob and one
+    length-prefixed checkpoint blob, with no trailing bytes. Each blob is
+    handed whole to the existing decoder —
+    :func:`decode_full_encrypted_json_search_receipt` and
+    :func:`decode_signed_root` respectively — so every nested framing and
+    structural rule is theirs. A bad magic or version, truncation, an
+    oversized blob length, trailing bytes or an illegal nested encoding
+    raises ValueError, as does a decoded pair whose receipt and
+    checkpoint do not describe the same snapshot.
+
+    The returned object is a frozen
+    :class:`SignedFullEncryptedJsonSearchReceipt` whose fields equal the
+    originally encoded ones, and re-encoding reproduces the original
+    bytes exactly. Decoding takes no keys and never reads or writes
+    files. A structurally sound encoding whose ciphertext, proof, hit
+    set, confirmation or signature simply does not match still decodes;
+    :func:`verify_signed_full_encrypted_json_search_receipt` reports
+    False with the query key and a pre-trusted public key.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_FULL_ENCRYPTED_JSON_SEARCH_MAGIC):
+        raise ValueError(
+            "not an auditchain signed-full-encrypted-json-search encoding"
+        )
+    offset = len(_SIGNED_FULL_ENCRYPTED_JSON_SEARCH_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_FULL_ENCRYPTED_JSON_SEARCH_VERSION:
+        raise ValueError(
+            "unsupported signed-full-encrypted-json-search version "
+            f"{version}"
+        )
+    receipt_blob = read_blob("receipt")
+    checkpoint_blob = read_blob("checkpoint")
+    if offset != len(data):
+        raise ValueError(
+            "trailing bytes after the signed full encrypted JSON search "
+            "receipt"
+        )
+    # Decode both nested blobs with their existing decoders; their own magic,
+    # version, truncation/trailing-byte and structural checks apply verbatim.
+    receipt = decode_full_encrypted_json_search_receipt(receipt_blob)
+    checkpoint = decode_signed_root(checkpoint_blob)
+    return SignedFullEncryptedJsonSearchReceipt(
         receipt=receipt, checkpoint=checkpoint
     )
 

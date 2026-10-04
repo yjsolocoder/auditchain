@@ -950,6 +950,48 @@ blob 并各自独立标签）、`start`、`stop`、条目计数；每条写 `Ent
 根、命中或确认不匹配的回执照常往返，仅核验返回 `False`。本层不新增任何签名
 原文，既有的查找、回执、索引与各线编解码行为全部不变。
 
+#### 完整加密 JSON 回执的可信签名交付
+
+`signed_full_encrypted_json_search_receipt` 在一个不可变的
+`SignedFullEncryptedJsonSearchReceipt` 内存交付包里同时给出同参数的
+`full_encrypted_json_search_receipt` 完整回执（`receipt`）与
+`sign_root` 快照检查点（`checkpoint`），让接收方仅凭查询密钥和**预先信任的
+32 字节 Ed25519 公钥**即可离线确认结果完整且快照可信，无需持有日志：
+
+```python
+bundle = log.signed_full_encrypted_json_search_receipt("/a", 1, key, seed)
+bundle.receipt == log.full_encrypted_json_search_receipt("/a", 1, key)   # True
+bundle.checkpoint == log.sign_root(seed)                                  # True
+verify_signed_full_encrypted_json_search_receipt(bundle, key, public_key)      # True
+verify_signed_full_encrypted_json_search_receipt(bundle, key, other_pubkey)    # False：未信任公钥
+verify_signed_full_encrypted_json_search_receipt(bundle, wrong_key, public_key)  # False：查询密钥不符
+log.signed_full_encrypted_json_search_receipt("/a", 1, key, seed, 1, 3, size=3)
+```
+
+签名默认覆盖当前长度（`size` 默认当前日志长度）与保留段（范围默认
+`[retain_from, size)`），可对仍可重建的历史快照（之后追加不影响旧包）与裁剪后
+的保留范围签发；越界或快照已随 `prune` 释放抛 `ValueError`。`pointer`、查询
+`value` 与嵌套对象沿用 `full_encrypted_json_search_receipt` 的既有校验
+（类型错 `TypeError`；指针语法、数值或结构非法 `ValueError`）；`start`、
+`stop`、`size` 含布尔值在内的类型错抛 `TypeError`，越界抛 `ValueError`。
+查询密钥与 Ed25519 私钥/公钥均只接受精确 `bytes`（拒绝
+`bytearray`/`memoryview`）：类型错抛 `TypeError`，长度非 32 字节抛
+`ValueError`。构造交付包时两部分的 `hash_name`、`size`、`root` 必须一致，
+字段类型错抛 `TypeError`，快照不一致抛 `ValueError`。
+
+`verify_signed_full_encrypted_json_search_receipt(bundle, key, public_key)`
+完全离线，依次确认完整回执核验
+（`verify_full_encrypted_json_search_receipt`：密文链、共享证明、严格
+RFC 6901 标量语义下的完整命中集、键控确认 MAC）、检查点签名验证
+（`verify_signed_root`）以及两部分快照一致，三者全成立才返回 `True`。结构
+合法但密文、摘要、证明、命中集、确认信息或签名不匹配，或以合法但错误的查询
+密钥/公钥核验均返回 `False`（零命中、空范围、空快照也一样——确认信息只有
+签发方查询密钥能复现）；绕过冻结限制把不同快照的两部分拼成包同样返回
+`False`。非本交付包类型（或被绕过的容器字段类型错）抛 `TypeError`；嵌套
+结构非法抛构造器同款 `TypeError`/`ValueError`。本层只新增内存签名包与离线
+核验入口，不新增签名原文或线格式，也不携带解密明文或任何密钥；既有的查询、
+签名原文、编解码、索引、保留策略及命令行行为全部不变。
+
 ### 命中型检索回执的只读诊断
 
 `verify_search_receipt` / `verify_encrypted_search_receipt` 只回答真假；本次补上

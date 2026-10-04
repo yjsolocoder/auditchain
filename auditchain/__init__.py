@@ -13,6 +13,7 @@ SignedAuditReceipt /
 EncryptedSearchReceipt /
 FullEncryptedSearchReceipt /
 FullEncryptedJsonSearchReceipt /
+SignedFullEncryptedJsonSearchReceipt /
 SignedFullEncryptedSearchReceipt /
 FullSearchReceipt /
 SignedFullSearchReceipt /
@@ -39,6 +40,7 @@ verify_consistency / verify_auth / verify_auth_batch / verify_auth_stage /
 verify_audit_receipt /
 verify_audit_batch / verify_full_encrypted_search_receipt /
 verify_full_encrypted_json_search_receipt /
+verify_signed_full_encrypted_json_search_receipt /
 verify_signed_full_encrypted_search_receipt /
 verify_full_search_receipt /
 verify_range_search_receipt /
@@ -197,6 +199,7 @@ __all__ = [
     "SignedAuthBundle",
     "SignedConsistency",
     "SignedEncryptedSearchReceipt",
+    "SignedFullEncryptedJsonSearchReceipt",
     "SignedFullEncryptedSearchReceipt",
     "SignedFullSearchReceipt",
     "SignedJsonMultiIndex",
@@ -408,6 +411,7 @@ __all__ = [
     "verify_signed_auth_bundle",
     "verify_signed_consistency",
     "verify_signed_encrypted_search_receipt",
+    "verify_signed_full_encrypted_json_search_receipt",
     "verify_signed_full_encrypted_search_receipt",
     "verify_signed_full_search_receipt",
     "verify_signed_json_multi_index",
@@ -4924,6 +4928,59 @@ class SignedFullEncryptedSearchReceipt:
 
 
 @dataclass(frozen=True)
+class SignedFullEncryptedJsonSearchReceipt:
+    """Complete RFC 6901 JSON-field scalar-search receipt over AES-256-GCM
+    encrypted entries, sealed by a pre-trusted Ed25519 key.
+
+    Bundles the :class:`FullEncryptedJsonSearchReceipt` of
+    :meth:`AuditLog.full_encrypted_json_search_receipt` with the
+    :class:`SignedRoot` checkpoint of :meth:`AuditLog.sign_root`, so an
+    offline receiver holding only the 32-byte query key and a pre-trusted
+    32-byte Ed25519 public key can confirm in one artifact that every entry
+    of the complete searched range with its shared compact batch inclusion
+    proof, the issuer-recorded complete hit set and the keyed confirmation,
+    together with the snapshot Merkle root and chain head, were all issued
+    by the log holder — without holding the :class:`AuditLog`:
+
+    - ``receipt``: the :class:`FullEncryptedJsonSearchReceipt` produced by
+      :meth:`AuditLog.full_encrypted_json_search_receipt`,
+    - ``checkpoint``: the :class:`SignedRoot` produced by
+      :meth:`AuditLog.sign_root` for the same rebuildable snapshot.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. ``receipt`` must be a :class:`FullEncryptedJsonSearchReceipt`
+    and ``checkpoint`` a :class:`SignedRoot` — a field of the wrong type
+    raises TypeError — and the two must describe the same snapshot: equal
+    ``hash_name``, ``size`` and ``root``, or the bundle could never attest
+    one rebuildable snapshot; a mismatch raises ValueError. The receipt's
+    own structural contract is left to
+    :class:`FullEncryptedJsonSearchReceipt`, and whether the checkpoint
+    signature is genuine is left to
+    :func:`verify_signed_full_encrypted_json_search_receipt`.
+    """
+
+    receipt: FullEncryptedJsonSearchReceipt
+    checkpoint: SignedRoot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, FullEncryptedJsonSearchReceipt):
+            raise TypeError(
+                "receipt must be a FullEncryptedJsonSearchReceipt"
+            )
+        if not isinstance(self.checkpoint, SignedRoot):
+            raise TypeError("checkpoint must be a SignedRoot")
+        if (
+            self.receipt.hash_name != self.checkpoint.hash_name
+            or self.receipt.size != self.checkpoint.size
+            or self.receipt.root != self.checkpoint.root
+        ):
+            raise ValueError(
+                "receipt and checkpoint must describe the same snapshot "
+                "(hash_name, size and root must be equal)"
+            )
+
+
+@dataclass(frozen=True)
 class SignedFullSearchReceipt:
     """Complete content-search receipt sealed by a pre-trusted Ed25519 key.
 
@@ -8890,6 +8947,53 @@ class AuditLog:
         )
         checkpoint = self.sign_root(private_key, size)
         return SignedFullEncryptedSearchReceipt(
+            receipt=receipt, checkpoint=checkpoint
+        )
+
+    def signed_full_encrypted_json_search_receipt(
+        self,
+        pointer: Any,
+        value: Any,
+        key: Any,
+        private_key: Any,
+        start: int | None = None,
+        stop: int | None = None,
+        size: int | None = None,
+    ) -> SignedFullEncryptedJsonSearchReceipt:
+        """Issue a :class:`SignedFullEncryptedJsonSearchReceipt`: a complete
+        RFC 6901 JSON-field scalar-search receipt over AES-256-GCM encrypted
+        entries, sealed by a pre-trusted Ed25519 key.
+
+        Convenience for the read-only sequence ``receipt =
+        full_encrypted_json_search_receipt(pointer, value, key, start, stop,
+        size)`` followed by ``checkpoint = sign_root(private_key, size)``
+        (the range defaulting to the retained segment and ``size`` to the
+        current log length, exactly as
+        :meth:`full_encrypted_json_search_receipt`), bundled as one
+        :class:`SignedFullEncryptedJsonSearchReceipt`. The receipt lets an
+        offline receiver holding the query key re-verify every entry of the
+        complete searched range, the shared compact batch proof, the
+        complete hit set and the keyed confirmation against the snapshot
+        Merkle root, and the checkpoint lets the same receiver confirm —
+        using only a pre-trusted 32-byte Ed25519 public key — that the root
+        and chain head were issued by the log holder; no new signing
+        message is introduced, the checkpoint signs exactly the
+        :meth:`sign_root` message. The call is read-only and repeatable: it
+        never changes entries, head, authentication state, the encrypted
+        locator index, Merkle roots or proofs, the same log state and seed
+        yield byte-for-byte the same bundle, and a failure (an invalid
+        pointer, value, key, range, seed or size) raises before the bundle
+        is constructed, leaving all state unchanged and never signing
+        anything new.
+        """
+        # Validate and build the receipt first, exactly as the public method
+        # does; sign_root() is read-only as well, so either failure leaves the
+        # log untouched and nothing new is ever signed.
+        receipt = self.full_encrypted_json_search_receipt(
+            pointer, value, key, start, stop, size
+        )
+        checkpoint = self.sign_root(private_key, size)
+        return SignedFullEncryptedJsonSearchReceipt(
             receipt=receipt, checkpoint=checkpoint
         )
 
@@ -15835,6 +15939,94 @@ def verify_signed_full_encrypted_search_receipt(
     ):
         return False
     if not verify_full_encrypted_search_receipt(receipt, key):
+        return False
+    return verify_signed_root(checkpoint, public_key)
+
+
+def verify_signed_full_encrypted_json_search_receipt(
+    bundle: Any, key: Any, public_key: Any
+) -> bool:
+    """Verify a :class:`SignedFullEncryptedJsonSearchReceipt` against the
+    query key and a pre-trusted Ed25519 key.
+
+    Confirms all three claims of the sealed bundle without holding the log:
+    :func:`verify_full_encrypted_json_search_receipt` recomputes every
+    entry digest in the complete searched range, re-verifies the shared
+    compact batch proof against the receipt's snapshot root, unseals each
+    envelope with the 32-byte ``key`` to reproduce the complete ascending
+    hit set under the strict RFC 6901 JSON-field scalar rules and
+    recomputes the keyed confirmation MAC, :func:`verify_signed_root`
+    verifies the checkpoint signature with the 32-byte ``public_key``, and
+    the two parts are required to describe the same snapshot — equal
+    ``hash_name``, ``size`` and ``root``. A genuine sealed bundle from the
+    trusted key returns True; a structurally valid bundle signed by another
+    key, whose parts disagree (including a bundle whose frozen fields were
+    bypassed to pair parts of different snapshots), whose entries,
+    ciphertexts, digests, proofs, pointer, query value, recorded hits,
+    confirmation or signature have been altered, or verified with a key or
+    public key that is not the issuer's returns False — all without
+    raising. Zero-hit searches, empty ranges and empty snapshots verify
+    exactly like any other genuine bundle, and a legitimate but wrong
+    32-byte query key still fails them because the confirmation can only be
+    reproduced with the issuer's key. Input that is not a
+    :class:`SignedFullEncryptedJsonSearchReceipt` (or whose container
+    fields have been bypassed to wrong types) raises TypeError; nested
+    structural violations raise exactly the exceptions of
+    :class:`FullEncryptedJsonSearchReceipt` and :func:`verify_signed_root`
+    (TypeError or ValueError), a query key or public key that is not
+    exact ``bytes`` raises TypeError (``bytearray`` and ``memoryview`` are
+    rejected rather than copied), and one that is not 32 bytes raises
+    ValueError. The call is read-only and never mutates the bundle.
+    """
+    if not isinstance(bundle, SignedFullEncryptedJsonSearchReceipt):
+        raise TypeError(
+            "bundle must be a SignedFullEncryptedJsonSearchReceipt"
+        )
+    # Re-validate the container fields even for an instance whose fields were
+    # set bypassing the frozen constructor, so container-type corruption
+    # raises TypeError exactly as the constructor would.
+    if not isinstance(bundle.receipt, FullEncryptedJsonSearchReceipt):
+        raise TypeError(
+            "receipt must be a FullEncryptedJsonSearchReceipt"
+        )
+    if not isinstance(bundle.checkpoint, SignedRoot):
+        raise TypeError("checkpoint must be a SignedRoot")
+    _check_key(key)
+    # Re-validate the nested structures as their own constructors would, so a
+    # bypassed field raises exactly the constructor's TypeError or ValueError
+    # rather than being reported as False.
+    receipt = FullEncryptedJsonSearchReceipt(
+        bundle.receipt.version,
+        bundle.receipt.hash_name,
+        bundle.receipt.size,
+        bundle.receipt.root,
+        bundle.receipt.pointer,
+        bundle.receipt.value,
+        bundle.receipt.start,
+        bundle.receipt.stop,
+        bundle.receipt.items,
+        bundle.receipt.proof,
+        bundle.receipt.hits,
+        bundle.receipt.confirmation,
+    )
+    checkpoint = SignedRoot(
+        bundle.checkpoint.version,
+        bundle.checkpoint.hash_name,
+        bundle.checkpoint.size,
+        bundle.checkpoint.root,
+        bundle.checkpoint.head,
+        bundle.checkpoint.signature,
+    )
+    # The two parts must describe the same snapshot; a bundle — including one
+    # whose frozen constructor was bypassed — whose parts disagree is a
+    # mismatch, not a structural error.
+    if (
+        receipt.hash_name != checkpoint.hash_name
+        or receipt.size != checkpoint.size
+        or receipt.root != checkpoint.root
+    ):
+        return False
+    if not verify_full_encrypted_json_search_receipt(receipt, key):
         return False
     return verify_signed_root(checkpoint, public_key)
 

@@ -1561,25 +1561,33 @@ def _json_reject_constant(value: str) -> Any:
     raise ValueError(f"{value} is not valid JSON")
 
 
-def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
-    """Resolve parsed pointer tokens against strict UTF-8 JSON bytes.
+def _json_load_strict_document(payload: bytes) -> Any:
+    """Parse strict UTF-8 JSON bytes once, or return ``_JSON_MISSING``.
 
-    Returns the addressed scalar, or the ``_JSON_MISSING`` sentinel when
-    the payload is not strict UTF-8 JSON, repeats an object member name at
-    any depth, carries a non-finite number, the pointer traverses a missing
-    member/element or a non-container, indexes an array with a non-numeric
-    (``-`` included), leading-zero or out-of-range token, or the addressed
-    value is an object or array rather than a scalar.
+    The document is rejected (``_JSON_MISSING``) when the payload is not
+    valid UTF-8, is not valid JSON, repeats an object member name at any
+    depth or carries a non-finite number.
     """
     try:
         text = payload.decode("utf-8")
-        document = json.loads(
+        return json.loads(
             text,
             object_pairs_hook=_json_reject_duplicates,
             parse_constant=_json_reject_constant,
         )
     except (UnicodeDecodeError, ValueError):
         return _JSON_MISSING
+
+
+def _json_scalar_in_document(document: Any, tokens: tuple[str, ...]) -> Any:
+    """Resolve parsed pointer tokens against an already-parsed document.
+
+    Returns the addressed scalar, or the ``_JSON_MISSING`` sentinel when
+    the pointer traverses a missing member/element or a non-container,
+    indexes an array with a non-numeric (``-`` included), leading-zero or
+    out-of-range token, or the addressed value is an object or array
+    rather than a scalar.
+    """
     current = document
     for token in tokens:
         if isinstance(current, dict):
@@ -1605,6 +1613,22 @@ def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
     if current is None or isinstance(current, (str, bool, int, float)):
         return current
     return _JSON_MISSING
+
+
+def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
+    """Resolve parsed pointer tokens against strict UTF-8 JSON bytes.
+
+    Returns the addressed scalar, or the ``_JSON_MISSING`` sentinel when
+    the payload is not strict UTF-8 JSON, repeats an object member name at
+    any depth, carries a non-finite number, the pointer traverses a missing
+    member/element or a non-container, indexes an array with a non-numeric
+    (``-`` included), leading-zero or out-of-range token, or the addressed
+    value is an object or array rather than a scalar.
+    """
+    document = _json_load_strict_document(payload)
+    if document is _JSON_MISSING:
+        return _JSON_MISSING
+    return _json_scalar_in_document(document, tokens)
 
 
 def _json_scalar_matches(found: Any, value: Any) -> bool:
@@ -1649,6 +1673,28 @@ def _json_entry_scalar(payload: bytes, tokens: tuple[str, ...]) -> Any:
     if payload.startswith(_ENC_MAGIC):
         return _JSON_MISSING
     return _json_scalar_at(payload, tokens)
+
+
+def _json_entry_scalars(
+    payload: bytes, token_sets: tuple[tuple[str, ...], ...]
+) -> list[Any]:
+    """Every bound pointer's addressed scalar from one stored payload.
+
+    Applies the exact resolution rules of :func:`_json_entry_scalar` to
+    each token tuple — an AES-256-GCM envelope is never parsed — but
+    decodes and parses the payload at most once for the whole pointer
+    tuple, so binding more pointers never re-parses the entry. Returns one
+    scalar (or ``_JSON_MISSING``) per token tuple, aligned by position.
+    """
+    missing = [_JSON_MISSING] * len(token_sets)
+    if payload.startswith(_ENC_MAGIC):
+        return missing
+    document = _json_load_strict_document(payload)
+    if document is _JSON_MISSING:
+        return missing
+    return [
+        _json_scalar_in_document(document, tokens) for tokens in token_sets
+    ]
 
 
 def _encrypted_json_entry_matches(
@@ -1859,18 +1905,19 @@ def _parse_json_pointer_tuple(pointers: Any) -> tuple[tuple[str, ...], ...]:
     return tuple(parsed)
 
 
-def _json_multi_groups_for_tokens(
-    items: tuple["Entry", ...], token_sets: tuple[tuple[str, ...], ...]
+def _json_multi_groups_for_pairs(
+    pairs: Any,
 ) -> tuple[JsonSearchIndexGroup, ...]:
-    """Reproduce one pointer's ordered hit groups from covered entries.
+    """One pointer's ordered hit groups from resolved (index, scalar) pairs.
 
-    Mirrors :func:`_build_json_search_index`'s grouping exactly; each group
-    is empty (``groups == ()``) when no covered entry resolves to a
-    queryable scalar for that pointer.
+    ``pairs`` yields ``(absolute_index, scalar)`` for the covered entries
+    in ascending index order, the scalar already resolved for that pointer
+    (``_JSON_MISSING`` and non-finite floats are skipped). This is exactly
+    the grouping half of :func:`_build_json_search_index`; the group tuple
+    is empty when no covered entry resolves to a queryable scalar.
     """
     collected: dict[int, dict[bytes, list[int]]] = {}
-    for entry in items:
-        scalar = _json_entry_scalar(entry.payload, token_sets)
+    for index, scalar in pairs:
         if scalar is _JSON_MISSING:
             continue
         if isinstance(scalar, float) and not math.isfinite(scalar):
@@ -1878,7 +1925,7 @@ def _json_multi_groups_for_tokens(
             continue
         kind = _json_index_tag_of_scalar(scalar)
         key = _json_index_key_of_scalar(kind, scalar)
-        collected.setdefault(kind, {}).setdefault(key, []).append(entry.index)
+        collected.setdefault(kind, {}).setdefault(key, []).append(index)
     groups: list[JsonSearchIndexGroup] = []
     for kind in sorted(collected):
         keyed = collected[kind]
@@ -1909,7 +1956,9 @@ def _build_json_multi_index(
     and rebuildable by the caller; all state is read from the log without
     mutating it. The covered entries, shared batch inclusion proof,
     snapshot root and chain head are computed exactly once and shared by
-    every bound pointer's hit groups.
+    every bound pointer's hit groups, and each covered entry's payload is
+    parsed at most once for the whole pointer tuple — binding more
+    pointers never re-parses an entry.
     """
     first = log._retain_from
     if size == 0:
@@ -1928,8 +1977,17 @@ def _build_json_multi_index(
     pointers = tuple(
         _json_pointer_canonical(tokens) for tokens in token_sets
     )
+    # Resolve every bound pointer against each entry from a single strict
+    # parse of its payload, then group each pointer's column independently.
+    resolved = [
+        _json_entry_scalars(entry.payload, token_sets) for entry in items
+    ]
+    indices = [entry.index for entry in items]
     groups = tuple(
-        _json_multi_groups_for_tokens(items, tokens) for tokens in token_sets
+        _json_multi_groups_for_pairs(
+            zip(indices, (scalars[position] for scalars in resolved))
+        )
+        for position in range(len(token_sets))
     )
     return JsonMultiIndex(
         version=_JSON_MULTI_INDEX_VERSION,
@@ -10514,12 +10572,20 @@ def verify_json_multi_index(index: Any) -> bool:
         return False
     # For every bound pointer, reproduce the complete scalar partition
     # from the authenticated entries and require it to equal the recorded
-    # groups exactly.
-    for pointer, pointer_groups in zip(checked.pointers, checked.groups):
-        tokens = _parse_json_pointer(pointer)
+    # groups exactly. Every entry's payload is parsed at most once for the
+    # whole pointer tuple; each pointer's partition is still recomputed
+    # and checked independently of the others.
+    token_sets = tuple(
+        _parse_json_pointer(pointer) for pointer in checked.pointers
+    )
+    resolved = [
+        _json_entry_scalars(entry.payload, token_sets)
+        for entry in checked.items
+    ]
+    for position, pointer_groups in enumerate(checked.groups):
         expected: dict[tuple[int, bytes], list[int]] = {}
-        for entry in checked.items:
-            scalar = _json_entry_scalar(entry.payload, tokens)
+        for entry, scalars in zip(checked.items, resolved):
+            scalar = scalars[position]
             if scalar is _JSON_MISSING:
                 continue
             if isinstance(scalar, float) and not math.isfinite(scalar):

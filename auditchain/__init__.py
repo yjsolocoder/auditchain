@@ -280,6 +280,7 @@ __all__ = [
     "decode_stage_rotated_anchor_set",
     "decode_stage_verifier",
     "decode_verifier",
+    "decode_where_receipt",
     "decrypt_entry",
     "dump_auth",
     "dump_hybrid",
@@ -350,6 +351,7 @@ __all__ = [
     "encode_stage_rotated_anchor_set",
     "encode_stage_verifier",
     "encode_verifier",
+    "encode_where_receipt",
     "entry_digest",
     "inspect_anchor_set",
     "inspect_anchored_continuations",
@@ -632,6 +634,42 @@ _SIGNED_JSON_MULTI_INDEX_DOMAIN = (
 # condition in order, then start, stop and the ascending hit u64s.
 _MULTI_QUERY_RECEIPT_MAGIC = b"auditchain/multi-query-receipt/v1\0"
 _MULTI_QUERY_RECEIPT_VERSION = 1
+# Offline boolean-query receipt of SignedJsonMultiIndex.where_receipt /
+# verify_where_receipt. Like the multi-query receipt, it carries no new
+# signature: it bundles the whole signed multi index (whose own signature
+# authenticates every index field) with the find_where expression tree, the
+# resolved half-open range and the claimed complete hit tuple, so an offline
+# receiver re-evaluates the expression over the authenticated index and
+# confirms the hits are exactly the complete result. The binary framing of
+# encode_where_receipt / decode_where_receipt is the usual one: a fixed
+# magic, the envelope version as a u64, a u64-length-prefixed blob holding
+# the complete canonical encode_signed_json_multi_index bytes, the
+# expression tree (one node tag per node — leaves carry their pointer blob
+# and scalar value exactly as a find_all condition value does, and/or carry
+# a child count and their children in order, not carries its one child),
+# then start, stop and the ascending hit u64s.
+_WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
+_WHERE_RECEIPT_VERSION = 1
+# Expression node tags of the where-receipt expression tree: the five leaf
+# operators in their find_where spelling order, then the three combinations.
+_WHERE_TAG_EQ = 0
+_WHERE_TAG_LT = 1
+_WHERE_TAG_LE = 2
+_WHERE_TAG_GT = 3
+_WHERE_TAG_GE = 4
+_WHERE_TAG_AND = 5
+_WHERE_TAG_OR = 6
+_WHERE_TAG_NOT = 7
+_WHERE_LEAF_OPERATORS = {
+    "eq": _WHERE_TAG_EQ,
+    "lt": _WHERE_TAG_LT,
+    "le": _WHERE_TAG_LE,
+    "gt": _WHERE_TAG_GT,
+    "ge": _WHERE_TAG_GE,
+}
+_WHERE_TAG_OPERATORS = {
+    tag: operator for operator, tag in _WHERE_LEAF_OPERATORS.items()
+}
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -15431,6 +15469,231 @@ def decode_multi_query_receipt(data: Any) -> MultiQueryReceipt:
     return MultiQueryReceipt(
         bundle=bundle,
         conditions=tuple(conditions),
+        start=start,
+        stop=stop,
+        hits=hits,
+    )
+
+
+def _encode_where_scalar(value: Any) -> bytes:
+    """Encode one validated find_where leaf scalar deterministically.
+
+    Uses the same kind tags and canonical spellings as
+    :func:`_encode_json_condition_value` — strings keep their UTF-8
+    bytes, integers their canonical ASCII decimal spelling (arbitrary
+    precision), floats their canonical ``repr`` spelling and
+    booleans/null the empty blob — except that a float is spelled
+    exactly as ``repr(value)``, so a negative zero keeps its sign
+    instead of being normalized to the index bucket key. Assumes
+    ``value`` already passed :func:`_check_json_value` or
+    :func:`_check_json_threshold`.
+    """
+    kind = _json_index_tag_of_scalar(value)
+    if kind == _JSON_TAG_FLOAT:
+        key = repr(value).encode("ascii")
+    else:
+        key = _json_index_key_of_scalar(kind, value)
+    return _encode_u64(kind, "expression value tag") + _encode_blob(key)
+
+
+def _encode_where_expression(expression: tuple) -> bytes:
+    """Encode one validated find_where expression node deterministically.
+
+    Writes the node's operator tag as a u64; a leaf then carries its
+    pointer UTF-8 blob and its scalar value exactly as
+    :func:`_encode_where_scalar` writes it (so strings keep their
+    UTF-8 bytes, integers their canonical ASCII decimal spelling at
+    arbitrary precision, floats their canonical ``repr`` spelling —
+    negative zero included — and booleans/null the empty blob), an
+    ``and`` / ``or`` node carries its child count followed by every child
+    in order, and a ``not`` node carries its one child. Assumes
+    ``expression`` already passed
+    :meth:`JsonMultiIndex._resolve_where_expression`.
+    """
+    operator = expression[0]
+    if operator in _WHERE_LEAF_OPERATORS:
+        return b"".join((
+            _encode_u64(_WHERE_LEAF_OPERATORS[operator], "expression tag"),
+            _encode_blob(expression[1].encode("utf-8")),
+            _encode_where_scalar(expression[2]),
+        ))
+    if operator == "and" or operator == "or":
+        tag = _WHERE_TAG_AND if operator == "and" else _WHERE_TAG_OR
+        children = expression[1]
+        parts = [
+            _encode_u64(tag, "expression tag"),
+            _encode_u64(len(children), "children count"),
+        ]
+        for child in children:
+            parts.append(_encode_where_expression(child))
+        return b"".join(parts)
+    # "not" carries its one child.
+    return _encode_u64(_WHERE_TAG_NOT, "expression tag") + (
+        _encode_where_expression(expression[1])
+    )
+
+
+def encode_where_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`WhereReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/where-receipt/v1\\0"``; every integer is an unsigned
+    8-byte big-endian value and every blob is a u64 byte length followed
+    by the raw bytes. Fields appear strictly in the order ``version``
+    (always 1), the ``bundle`` blob (the complete canonical output of
+    :func:`encode_signed_json_multi_index`), the ``expression`` tree —
+    per node a u64 operator tag, then for ``eq`` / ``lt`` / ``le`` /
+    ``gt`` / ``ge`` leaves the pointer UTF-8 blob and the scalar value
+    (its kind tag plus its canonical value blob, preserving strings,
+    arbitrary-precision integers, floats, booleans and null exactly),
+    for ``and`` / ``or`` the child count and every child in order, and
+    for ``not`` the one child — then ``start``, ``stop``, the hit count
+    and one u64 per strictly ascending hit, with nothing omitted,
+    reordered, merged or appended: nested structure, child order and
+    repeated branches are preserved exactly.
+
+    ``receipt`` must be a :class:`WhereReceipt` (anything else raises
+    TypeError); every field is re-validated exactly as the constructor
+    would, so an instance whose frozen fields were bypassed into an
+    illegal shape raises the same TypeError or ValueError, and nested
+    bundle problems raise exactly the exceptions of
+    :func:`encode_signed_json_multi_index`. Encoding is read-only and
+    deterministic: re-encoding a decoded receipt reproduces the original
+    bytes exactly, and a structurally valid receipt whose claim fails
+    verification encodes just as well.
+    """
+    if not isinstance(receipt, WhereReceipt):
+        raise TypeError("receipt must be a WhereReceipt")
+    checked = WhereReceipt(
+        receipt.bundle,
+        receipt.expression,
+        receipt.start,
+        receipt.stop,
+        receipt.hits,
+    )
+    parts = [
+        _WHERE_RECEIPT_MAGIC,
+        _encode_u64(_WHERE_RECEIPT_VERSION, "version"),
+        _encode_blob(encode_signed_json_multi_index(checked.bundle)),
+        _encode_where_expression(checked.expression),
+        _encode_u64(checked.start, "start"),
+        _encode_u64(checked.stop, "stop"),
+        _encode_u64(len(checked.hits), "hits count"),
+    ]
+    for hit in checked.hits:
+        parts.append(_encode_u64(hit, "hit"))
+    return b"".join(parts)
+
+
+def decode_where_receipt(data: Any) -> WhereReceipt:
+    """Decode bytes produced by :func:`encode_where_receipt`.
+
+    ``data`` must be exact ``bytes`` (anything else, including
+    ``bytearray`` and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/where-receipt/v1\\0"`` it must contain, strictly in
+    order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed signed-index bundle blob (handed whole to
+    :func:`decode_signed_json_multi_index`, so every nested framing and
+    structural rule is hers), the expression tree (per node a u64
+    operator tag; a leaf's pointer blob, value tag and value blob; an
+    ``and`` / ``or`` child count with exactly that many children; a
+    ``not`` with exactly one child), ``start``, ``stop``, the hit count
+    and one u64 per hit, with no trailing bytes. A bad magic or version,
+    truncation, an oversized blob length, trailing bytes, invalid UTF-8
+    in a pointer or string value, an unknown node or value tag, a
+    non-canonical integer or float spelling, a non-finite float, a
+    non-empty boolean/null value blob, a non-numeric comparison
+    threshold, a count that does not match its items, an illegal
+    expression node or range (exactly as
+    :meth:`JsonMultiIndex.find_where` reports them) and an out-of-range,
+    duplicated or misordered hit all raise ValueError.
+
+    The returned object is a frozen :class:`WhereReceipt` whose fields
+    equal the originally encoded ones — nested structure, child order,
+    repeated branches, scalar types and arbitrary-precision integers
+    included — and re-encoding reproduces the original bytes exactly. A
+    structurally sound receipt whose claim simply does not verify still
+    decodes; :func:`verify_where_receipt` reports False. The call is
+    read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_WHERE_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain where-receipt encoding")
+    offset = len(_WHERE_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    def read_expression(position: str) -> tuple:
+        tag = read_u64(f"{position} tag")
+        if tag in _WHERE_TAG_OPERATORS:
+            operator = _WHERE_TAG_OPERATORS[tag]
+            raw_pointer = read_blob(f"{position} pointer")
+            try:
+                pointer = raw_pointer.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} pointer is not valid UTF-8"
+                ) from error
+            value_tag = read_u64(f"{position} value tag")
+            key = read_blob(f"{position} value")
+            if tag != _WHERE_TAG_EQ and value_tag not in (
+                _JSON_TAG_INTEGER,
+                _JSON_TAG_FLOAT,
+            ):
+                raise ValueError(
+                    f'a "{operator}" threshold must be an integer or a float'
+                )
+            return (
+                operator,
+                pointer,
+                _decode_json_condition_value(value_tag, key),
+            )
+        if tag == _WHERE_TAG_AND or tag == _WHERE_TAG_OR:
+            operator = "and" if tag == _WHERE_TAG_AND else "or"
+            child_count = read_u64(f"{position} children count")
+            return (
+                operator,
+                tuple(
+                    read_expression(f"{position} child {index}")
+                    for index in range(child_count)
+                ),
+            )
+        if tag == _WHERE_TAG_NOT:
+            return ("not", read_expression(f"{position} child"))
+        raise ValueError(f"unknown expression node tag {tag}")
+
+    version = read_u64("version")
+    if version != _WHERE_RECEIPT_VERSION:
+        raise ValueError(f"unsupported where-receipt version {version}")
+    bundle = decode_signed_json_multi_index(read_blob("bundle"))
+    expression = read_expression("expression")
+    start = read_u64("start")
+    stop = read_u64("stop")
+    hit_count = read_u64("hits count")
+    hits = tuple(read_u64("hit") for _ in range(hit_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the where receipt")
+    return WhereReceipt(
+        bundle=bundle,
+        expression=expression,
         start=start,
         stop=stop,
         hits=hits,

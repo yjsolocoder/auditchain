@@ -859,6 +859,56 @@ verify_signed_full_encrypted_search_receipt(restored, key, public_key)  # True�
   空树根）；两个入口均为只读且确定。本层不新增签名原文，签名仍是检查点那一
   份，既有线格式与旧接口不变
 
+#### 按解密后明文前缀的查询与完整离线回执
+
+`find_encrypted_prefix` 把 `find_prefix` 的前缀语义带到密文条目上：传入前缀、
+32 字节查询密钥与可选的半开绝对索引区间（默认覆盖保留段
+`[retain_from, len(log))`），对范围内每个条目用查询密钥尝试解封，明文满足
+`plaintext.startswith(prefix)`（Python 原生 `bytes` 语义）者命中，返回严格
+升序的绝对索引 tuple。前缀接受 `bytes` 或 `str`（后者按 UTF-8 转换），其他
+类型抛 `TypeError`；普通条目、异钥封装与解密失败均不命中也不抛错；空前缀
+命中所有能以该密钥成功解密的条目（包括空明文），无命中返回空元组：
+
+```python
+log.find_encrypted_prefix(b"sec", key)   # (0, 3)：明文以 b"sec" 开头的密文条目
+log.find_encrypted_prefix("sec", key)    # str 按 UTF-8 规范化，结果相同
+log.find_encrypted_prefix(b"", key)      # 该密钥能解开的全部条目（含空明文）
+log.find_encrypted_prefix(b"sec", wrong_key)  # ()：合法但错误的密钥不命中、不抛错
+# log.find_encrypted_prefix(1, key)      # TypeError：前缀只接受 bytes 或 str
+```
+
+`encrypted_prefix_receipt(prefix, key, start=None, stop=None, size=None)` 把同一
+查询固化成冻结的
+`EncryptedPrefixReceipt(version=1, hash_name, size, root, prefix, start, stop,
+items, proof, hits)`：公开字段语义与 `FullEncryptedSearchReceipt` 完全一致，
+仅以规范化 `prefix` 取代等值 `query`——记录被搜范围内**每一个**条目（payload
+仍密封）、一份覆盖全部条目的共享紧凑批量证明与签发方当场解封比对得出的升序
+命中索引，保留原始 payload，不记录密钥或解密所得明文。`size` 默认当前长度，
+范围默认 `[retain_from, size)`；空范围与空快照照常签发，条目、证明与命中都是
+空元组：
+
+```python
+receipt = log.encrypted_prefix_receipt(b"sec", key)   # 范围默认保留段，size 默认当前长度
+receipt.prefix                                        # b"sec"：str 按 UTF-8 规范化
+verify_encrypted_prefix_receipt(receipt, key)         # True：无需持有日志即可离线核验
+verify_encrypted_prefix_receipt(receipt, wrong_key)   # False：记录了命中时错误密钥无法复现
+log.encrypted_prefix_receipt(b"sec", key, 1, 3, size=3)  # 半开范围 [1, 3) + 前 3 条快照
+```
+
+`verify_encrypted_prefix_receipt(receipt, key)` 无需日志：逐条重算
+`entry_digest`、用共享批量证明（`verify_batch_inclusion`）核对快照根（空快照
+只认规范空树根），再以传入密钥逐条尝试解封并对明文做 `startswith` 比较，重算
+出的完整命中集与回执记录的 `hits` 逐项一致且真实性成立才返回 `True`；结构
+合法但内容、证明、根或命中集不符返回 `False` 不抛异常。错误密钥使解密失败，
+不直接报错：重算为空且记录也为空时，真实性通过仍返回 `True`。非空快照的纯
+空范围回执不携带可核对证据，只验证结构；空快照还须匹配规范空树根。前缀或
+密钥类型错误、非回执核验参数、字段类型错误均抛 `TypeError`；密钥限 32 字节
+`bytes`，长度错误抛 `ValueError`；显式范围与尺寸限非 `bool` 整数，类型错抛
+`TypeError`，越界、逆序、不可重建快照抛 `ValueError`；缺失、重复、乱序条目
+及非法命中索引、未知算法、错误摘要宽度或证明节点数在构造与核验两端都抛
+`ValueError`。两个入口均只读，追加或裁剪不影响既有回执的离线核验；本层不
+新增签名包装或序列化格式，既有公开行为全部不变。
+
 #### 加密 JSON 条目的字段查询与完整离线回执
 
 `find_encrypted_json` 把 `find_json` 的 RFC 6901 标量字段语义带到

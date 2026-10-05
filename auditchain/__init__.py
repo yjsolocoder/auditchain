@@ -221,6 +221,7 @@ __all__ = [
     "StageAnchorSet",
     "StageVerifier",
     "Verifier",
+    "WhereReceipt",
     "GENESIS_HASH",
     "decode_anchored_continuations",
     "decode_anchor_set",
@@ -437,6 +438,7 @@ __all__ = [
     "verify_signed_verifier",
     "verify_stage_continuation_chain",
     "verify_stage_rotated_chain",
+    "verify_where_receipt",
 ]
 
 GENESIS_HASH = bytes(32)
@@ -4637,6 +4639,51 @@ class SignedJsonMultiIndex:
             hits=hits,
         )
 
+    def where_receipt(
+        self,
+        expression: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> "WhereReceipt":
+        """Issue an offline completeness receipt for one find_where query.
+
+        Runs the nested boolean query exactly like :meth:`find_where` —
+        ``expression`` is a tuple tree of ``("eq", pointer, value)`` and
+        ``("lt" | "le" | "gt" | "ge", pointer, threshold)`` leaves
+        combined by ``("and", children)``, ``("or", children)`` and
+        ``("not", child)`` nodes following the rules of :meth:`find_where`,
+        the half-open ``[start, stop)`` range defaults to the whole
+        retained segment ``[retain_from, size)``, an empty ``and`` matches
+        the whole range, an empty ``or`` matches nothing, ``not``
+        complements against every index of the range, and an empty range
+        or a query without matches yields ``()`` — and packages this
+        bundle, the expression, the *resolved* range bounds and the
+        strictly ascending duplicate-free absolute hit indices as an
+        immutable :class:`WhereReceipt`. An offline receiver holding only
+        a pre-trusted 32-byte Ed25519 public key confirms with
+        :func:`verify_where_receipt` that the bundled signed index is
+        genuine and that ``hits`` is exactly the complete result of the
+        expression over that range.
+
+        The expression and the range are validated with exactly the
+        exception types and ordering of :meth:`find_where` — a node's own
+        errors before its children's, children from left to right, the
+        range last — so an empty range or an already determined
+        intermediate result never masks an invalid branch. Issuing a
+        receipt needs neither the log nor a private key and does not
+        assert that this bundle's signature verifies; the call is
+        read-only and never mutates the bundle.
+        """
+        hits = self.index.find_where(expression, start, stop)
+        resolved_start, resolved_stop = self.index._range_bounds(start, stop)
+        return WhereReceipt(
+            bundle=self,
+            expression=expression,
+            start=resolved_start,
+            stop=resolved_stop,
+            hits=hits,
+        )
+
 
 @dataclass(frozen=True)
 class MultiQueryReceipt:
@@ -4717,6 +4764,96 @@ class MultiQueryReceipt:
                     f"pointer {canonical!r} is not covered by this index"
                 )
             _check_json_value(value)
+        for name in ("start", "stop"):
+            bound = getattr(self, name)
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not index.retain_from <= self.start <= self.stop <= index.size:
+            raise ValueError(
+                f"range must satisfy retain_from ({index.retain_from}) "
+                f"<= start <= stop <= size ({index.size})"
+            )
+        if not isinstance(self.hits, tuple):
+            raise TypeError("hits must be a tuple of integers")
+        previous: int | None = None
+        for hit in self.hits:
+            if not isinstance(hit, int) or isinstance(hit, bool):
+                raise TypeError("hits must be non-bool integers")
+            if not self.start <= hit < self.stop:
+                raise ValueError(
+                    f"hit {hit} must satisfy start ({self.start}) "
+                    f"<= hit < stop ({self.stop})"
+                )
+            if previous is not None and hit <= previous:
+                raise ValueError(
+                    "hits must be strictly ascending with no duplicates"
+                )
+            previous = hit
+
+
+@dataclass(frozen=True)
+class WhereReceipt:
+    """Offline completeness receipt for one boolean-expression index query.
+
+    Issued by :meth:`SignedJsonMultiIndex.where_receipt` and verified
+    entirely offline by :func:`verify_where_receipt`, it bundles:
+
+    - ``bundle``: the :class:`SignedJsonMultiIndex` the query ran
+      against — its own Ed25519 signature already authenticates the
+      whole index, so the receipt itself carries no new signature and
+      the expression is not separately authenticated,
+    - ``expression``: the find_where expression, a tuple tree of
+      ``("eq", pointer, value)`` and ``("lt" | "le" | "gt" | "ge",
+      pointer, threshold)`` leaves combined by ``("and", children)``,
+      ``("or", children)`` and ``("not", child)`` nodes,
+    - ``start`` / ``stop``: the resolved half-open query range within
+      the bundled index's covered segment,
+    - ``hits``: the claimed complete result — absolute indices in
+      strictly ascending order without duplicates, each inside
+      ``[start, stop)`` (``()`` for an empty range or no match).
+
+    Instances are immutable, may be built positionally and compare by
+    all five fields. The constructor validates the bundle's container
+    and nested index structure, the whole expression (with exactly the
+    exception types and ordering of :meth:`JsonMultiIndex.find_where` —
+    a node's own errors before its children's, children from left to
+    right), the range bounds against the index's covered segment and
+    the hit tuple's types, ordering and bounds; whether the bundle's
+    evidence and signature are genuine and whether ``hits`` is the
+    complete result is left to :func:`verify_where_receipt`, so a
+    structurally valid receipt whose claim is wrong still constructs.
+    """
+
+    bundle: SignedJsonMultiIndex
+    expression: tuple
+    start: int
+    stop: int
+    hits: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bundle, SignedJsonMultiIndex):
+            raise TypeError("bundle must be a SignedJsonMultiIndex")
+        # Re-validate the bundle container and the nested index exactly
+        # as their own constructors would, so a field bypassed into an
+        # illegal shape raises the same TypeError or ValueError here.
+        bundle = SignedJsonMultiIndex(self.bundle.index, self.bundle.signature)
+        index = JsonMultiIndex(
+            bundle.index.version,
+            bundle.index.hash_name,
+            bundle.index.size,
+            bundle.index.root,
+            bundle.index.head,
+            bundle.index.retain_from,
+            bundle.index.pointers,
+            bundle.index.items,
+            bundle.index.proof,
+            bundle.index.groups,
+        )
+        # Expression and range follow JsonMultiIndex.find_where exactly:
+        # the whole expression is validated before the range — a node's
+        # own errors before its children's, children from left to right —
+        # so an empty range never masks an illegal branch.
+        index._resolve_where_expression(self.expression)
         for name in ("start", "stop"):
             bound = getattr(self, name)
             if not isinstance(bound, int) or isinstance(bound, bool):
@@ -11653,6 +11790,58 @@ def verify_multi_query_receipt(receipt: Any, public_key: Any) -> bool:
         return False
     expected = checked.bundle.find_all(
         checked.conditions, checked.start, checked.stop
+    )
+    return expected == checked.hits
+
+
+def verify_where_receipt(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`WhereReceipt` against a pre-trusted key.
+
+    Confirms both halves of the offline claim without holding the log:
+    :func:`verify_signed_json_multi_index` re-checks the bundled index's
+    whole evidence (every covered entry digest, the shared batch
+    inclusion proof against the snapshot root, the chain head and every
+    pointer's complete hit-bucket partition) together with its Ed25519
+    signature under the 32-byte ``public_key``, and the receipt's
+    ``hits`` are then compared against the complete result of
+    re-evaluating the receipt's ``expression`` over the authenticated
+    index within ``[start, stop)``. A genuine receipt from the trusted
+    key returns True; a structurally valid receipt whose bundle was
+    signed by another key, whose signature or index evidence does not
+    match, or whose hit tuple misses a match (under-report) or lists a
+    non-match (over-report) returns False — all without raising. The
+    expression itself carries no signature: editing it (and the range)
+    still verifies whenever the declared hits remain exactly the
+    complete result of the edited query.
+
+    Input that is not a :class:`WhereReceipt` raises TypeError, as does
+    a non-``bytes`` ``public_key``; a 32-byte-violating key raises
+    ValueError. Every structural rule of :class:`WhereReceipt` (the
+    expression and range exactly as :meth:`JsonMultiIndex.find_where`,
+    ascending in-range hits) is re-validated before any signature
+    check, so an illegal node, range or hit tuple raises its TypeError
+    or ValueError even when the signature would fail — a signature
+    mismatch never masks a structural error, and an empty range or
+    early miss never masks a later illegal branch. The call is
+    read-only and never mutates the receipt.
+    """
+    if not isinstance(receipt, WhereReceipt):
+        raise TypeError("receipt must be a WhereReceipt")
+    # Re-validate the whole receipt structure exactly as the constructor
+    # would — before any signature check — so a bypassed field raises
+    # the same TypeError or ValueError rather than reporting False.
+    checked = WhereReceipt(
+        receipt.bundle,
+        receipt.expression,
+        receipt.start,
+        receipt.stop,
+        receipt.hits,
+    )
+    _load_ed25519_public(public_key)
+    if not verify_signed_json_multi_index(checked.bundle, public_key):
+        return False
+    expected = checked.bundle.find_where(
+        checked.expression, checked.start, checked.stop
     )
     return expected == checked.hits
 

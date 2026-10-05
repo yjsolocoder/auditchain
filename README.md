@@ -771,6 +771,73 @@ UTF-8、未知算法、截断、尾随、长度越界、范围或顺序非法、
 回执往返后记录的根同样不参与比对。本层不新增任何签名原文，签名封装见下一
 小节，既有查找、检索回执与各线格式全部不变。
 
+#### 按解密后明文前缀定位加密条目
+
+`find_encrypted_prefix(prefix, key, start=None, stop=None)` 是
+`find_prefix` 的解密对应物：不比较密封 envelope，而是持追加时的 AES 密钥
+把范围内每个保留条目逐条解封，对**恢复出的明文**做
+`plaintext.startswith(prefix)`（Python 原生 `bytes` 语义），返回严格升序
+的绝对索引 tuple，无命中为 `()`。`prefix` 接受 `bytes` 或 `str`（后者按
+UTF-8 规范化），其他类型抛 `TypeError`；空前缀命中所有能用该密钥成功解密
+的条目，**包括空明文**。普通条目、异钥封装与任何解密失败都不命中，合法但
+错误的密钥返回 `()` 而不抛错；前缀无法经等值定位索引查找，本查询扫描并
+解封整个范围，且只读——不改写封装、`Entry` 摘要、链、定位索引或 Merkle
+结果，也不保存明文或密钥。范围默认值、半开边界与异常规则与
+`find_encrypted` 完全相同：
+
+```python
+log.encrypt("hello world", key, nonce=b"0" * 12)
+log.encrypt("help", key, nonce=b"1" * 12)
+log.encrypt(b"", key, nonce=b"2" * 12)
+log.find_encrypted_prefix("hel", key)        # (0, 1)：严格升序
+log.find_encrypted_prefix(b"", key)          # (0, 1, 2)：空前缀含空明文
+log.find_encrypted_prefix("hello", key)      # (0,)：字节 startswith
+log.find_encrypted_prefix("hel", wrong_key)  # ()：解密失败不抛错
+```
+
+#### 按解密后明文前缀的完整离线回执（全覆盖）
+
+`encrypted_prefix_receipt(prefix, key, start=None, stop=None, size=None)`
+把上述明文前缀查询固化为冻结的
+`EncryptedPrefixReceipt(version=1, hash_name, size, root, prefix, start,
+stop, items, proof, hits)`：字段语义与 `FullEncryptedSearchReceipt` 完全
+对应，仅以规范化 `prefix` 取代 `query`、以字节 `startswith` 取代逐字节
+等值——携带被搜范围 `[start, stop)` 内**每一个** `Entry`（按绝对索引
+严格升序、恰为 `start .. stop-1` 各一份，payload 保持密封原样）、一份
+覆盖它们的共享紧凑批量包含证明，以及签发方当场解封比对得出的升序命中
+索引。回执**不记录密钥，也不记录解密所得明文**。
+
+```python
+receipt = log.encrypted_prefix_receipt("hel", key)  # 范围默认 [retain_from, size)
+receipt.prefix                                      # b"hel"：str 按 UTF-8 规范化
+[e.index for e in receipt.items]                    # 范围内逐条列出（含普通/异钥条目）
+receipt.hits                                        # 签发方记录的命中索引（升序 tuple）
+verify_encrypted_prefix_receipt(receipt, key)       # True：离线解封 + 前缀比较 + 命中集一致
+verify_encrypted_prefix_receipt(receipt, wrong_key) # False：记录了命中时错误密钥无法复现
+log.encrypted_prefix_receipt("hel", key, 1, 3, size=3)  # 半开范围 [1, 3) + 前 3 条快照
+```
+
+`size` 默认当前长度，范围默认 `[retain_from, size)`；显式范围与尺寸须为
+非 bool 整数，满足 `retain_from <= start <= stop <= size` 与
+`0 <= size <= len(log)`，裁剪导致快照不可重建抛 `ValueError`。前缀或密钥
+类型错误抛 `TypeError`，密钥长度不符抛 `ValueError`。构造与核验两端都
+拒绝缺失、重复、乱序条目及非法命中索引；未知算法、错误摘要宽度、证明节点
+数与所列条目及 `size` 不相称均抛 `ValueError`。空范围的条目、证明与命中
+均为空元组。
+
+离线核验 `verify_encrypted_prefix_receipt(receipt, key)` 无需持有日志：
+逐条重算 `entry_digest`、用共享批量证明（`verify_batch_inclusion`）核对
+快照 `root`，再以传入密钥逐条尝试解封，对成功恢复的明文做字节
+`startswith` 比较，重算出的完整命中集与记录的 `hits` 逐项一致**且**
+真实性成立才返回 `True`；内容、证明、根或命中集不符一律返回 `False` 而
+不抛异常。普通条目、异钥封装与解密失败都不算命中：错误密钥下重算集恒为
+空，因此记录也为空时真实性通过仍返回 `True`，记录了非空命中时则返回
+`False`。**非空快照的纯空范围只验证结构**（无证据可核对记录的根）；空
+快照（`size == 0`）还须匹配规范空树根，根不符返回 `False`。非回执参数或
+字段类型错误抛 `TypeError`。追加或裁剪不影响既有回执的离线核验；签发与
+核验均只读。本次不新增该回执的签名包装或序列化格式，其他各线查找、回执
+与格式保持不变。
+
 #### 完整加密检索回执的可信签名封装（Ed25519）
 
 `signed_full_encrypted_search_receipt` 在一个不可变
@@ -4720,6 +4787,22 @@ python3 -m auditchain
   证据、记录的根不参与比对，空快照只接受规范空树根；规范二进制编解码由
   `encode_full_encrypted_search_receipt` /
   `decode_full_encrypted_search_receipt` 提供
+- `EncryptedPrefixReceipt(version, hash_name, size, root, prefix, start,
+  stop, items, proof, hits)` — 不可变的按解密后明文前缀检索的完整回执，
+  公开字段语义与 `FullEncryptedSearchReceipt` 完全对应，仅以规范化
+  `prefix` 取代 `query`、以恢复明文的字节 `startswith` 取代逐字节等值：
+  把算法、快照尺寸与 Merkle 根、规范化前缀（`bytes` 或 `str`，后者按
+  UTF-8 规范化后存储）、半开范围 `[start, stop)`、该范围内每一个仍密封
+  的 `Entry`（严格升序、恰为 `start .. stop-1` 各一份，覆盖不全、重复或
+  乱序均非法）、一份共享紧凑批量证明与签发方当场解封比对记录的升序命中
+  索引绑成一件制品，按全部十个字段相等、支持位置构造；`prefix` 以外的
+  二进制字段只接受精确的 `bytes`，`bytearray` / `memoryview` 抛
+  `TypeError`。空前缀命中所有能用查询密钥成功解密的条目（含空明文），
+  普通条目、异钥封装与解密失败均不命中，回执不记录密钥或解密所得明文。
+  类型非法抛 `TypeError`，版本、范围、未知算法、摘要宽度、条目结构、
+  覆盖或命中索引非法（含空范围携带非空证明）抛 `ValueError`；纯空范围
+  （`size > 0` 而条目、证明、命中皆空）只验证结构，空快照还须匹配规范
+  空树根；本类型不提供签名包装或序列化格式
 - `BatchInclusionProof(hash_name, indices, entry_hashes, size, root, proof)` —
   不可变的紧凑批量包含证明凭据，把 `verify_batch_inclusion` 的核验上下文与
   `batch_inclusion_proof` 的共享证明节点绑成一件制品，按全部六个字段相等、支持
@@ -4954,6 +5037,31 @@ python3 -m auditchain
     长度不符抛 `ValueError`）；范围或尺寸类型错抛 `TypeError`、越界或快照
     不可重建抛 `ValueError`；异钥追加的条目与普通条目不命中；签发为只读、
     可重复调用，不改变条目、`head`、认证状态、密文定位索引、Merkle 根或证明
+  - `find_encrypted_prefix(prefix, key, start=None, stop=None)` —
+    持追加时 AES 密钥对范围内每个保留条目解封并对**恢复出的明文**做
+    `startswith(prefix)`（原生 `bytes` 语义），返回严格升序的绝对索引
+    元组，无命中为 `()`；范围默认值、半开边界与异常规则与
+    `find_encrypted` 完全相同。`prefix` 只收 `bytes` 或 `str`（`str` 按
+    UTF-8 规范化），其他类型抛 `TypeError`；`key` 只收 32 字节 `bytes`
+    （类型错抛 `TypeError`、长度不符抛 `ValueError`）。空前缀命中所有能
+    用该密钥成功解密的条目，包括空明文；普通条目、异钥封装与任何解密失败
+    均不命中，合法但错误的密钥返回 `()` 而不抛错。前缀无法经等值定位索引
+    查找，本查询扫描并解封整个范围；查询只读，不保存明文或密钥，也不改变
+    封装、`Entry` 摘要、链、定位索引、Merkle 根或证明
+  - `encrypted_prefix_receipt(prefix, key, start=None, stop=None, size=None)` —
+    把一次 `find_encrypted_prefix` 的结果固化为可离线核验**完整性**的冻结
+    `EncryptedPrefixReceipt`：在半开范围 `[start, stop)`（默认
+    `[retain_from, size)`）内，`size` 默认当前长度且快照须可重建；公开
+    字段语义与 `full_encrypted_search_receipt` 相同，仅以规范化 `prefix`
+    取代 `query`——该范围内**每一个**条目按绝对索引严格升序逐条列出
+    （payload 保持密封原样），附一份覆盖全部条目的共享紧凑批量证明，以及
+    签发方用查询密钥当场逐条解封、按字节 `startswith` 比对得出的升序命中
+    索引 `hits`（空范围与空快照时三者均为 `()`）；不记录密钥或解密所得
+    明文。前缀或密钥类型错抛 `TypeError`、密钥长度不符抛 `ValueError`；
+    范围或尺寸须为非 `bool` 整数，类型错抛 `TypeError`、越界、逆序或快照
+    不可重建抛 `ValueError`；构造拒绝缺失、重复、乱序条目及非法命中索引，
+    未知算法、错误摘要宽度或证明节点数不符抛 `ValueError`；签发为只读、
+    可重复调用，不改变条目、`head`、认证状态、定位索引、Merkle 根或证明
   - `retain_from` 属性 — 当前保留点（首个仍持有条目的绝对索引，未裁剪时为 `0`）
   - `stage` 属性 — 当前密钥演进 stage（首次演进前为 `0`）
   - `verify()` — 从创世摘要（裁剪后从检查点）开始校验持有的链段，等价于
@@ -5325,6 +5433,21 @@ python3 -m auditchain
   `FullEncryptedSearchReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
   版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序或命中索引非法（含绕过
   冻结构造器写入的字段）抛 `ValueError`；调用只读
+- `verify_encrypted_prefix_receipt(receipt, key)` — 无需持有日志即可验证
+  `EncryptedPrefixReceipt`：逐条重算每个所列条目的 `entry_digest`、用共享
+  紧凑批量证明核对记录的快照根（空快照只认规范空树根），再以 `key` 用
+  `decrypt_entry` 逐条尝试解封并对恢复明文做字节
+  `startswith(receipt.prefix)`；重算出的完整命中集与回执记录的 `hits`
+  逐项一致且真实性成立才返回 `True`，少列、多列或伪造命中都是核验失败。
+  普通条目、异钥封装与解密失败都不算命中也不判失败；错误密钥使解密全部
+  失败、重算集恒为空，因此记录也为空且真实性通过时仍返回 `True`，记录了
+  非空命中时返回 `False`；纯空范围（`size > 0` 而条目、证明、命中皆空）
+  只验证结构，空快照还须匹配规范空树根（根不符返回 `False`）；内容、证明、
+  根或命中集不符一律返回 `False` 而不抛异常。入参不是
+  `EncryptedPrefixReceipt` 或 `key` 不是 `bytes` 抛 `TypeError`；密钥长度、
+  版本、范围、尺寸、未知算法、摘要宽度、条目覆盖/顺序、证明节点数或命中
+  索引非法（含绕过冻结构造器写入的字段）抛 `ValueError`；调用只读，追加或
+  裁剪不影响既有回执的离线核验
 - `inspect_full_search_receipt(receipt)` —
   `verify_full_search_receipt` 的只读诊断对应物，无需持有日志、只读且确定，
   不新增签名原文与线格式、不做报告编解码；收一份冻结 `FullSearchReceipt`

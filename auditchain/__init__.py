@@ -1531,6 +1531,19 @@ def _check_json_value(value: Any) -> None:
     raise TypeError("value must be str, int, float, bool or None")
 
 
+def _check_json_threshold(value: Any) -> None:
+    """Validate a find_where numeric-comparison threshold.
+
+    Only a non-boolean ``int`` or a finite ``float`` is accepted: booleans
+    are not numbers for this comparison, and a non-finite threshold would
+    make the comparison degenerate.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("threshold must be an int or a float")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("threshold must be a finite number")
+
+
 def _parse_json_pointer(pointer: Any) -> tuple[str, ...]:
     """Parse an RFC 6901 JSON Pointer into its tuple of unescaped tokens.
 
@@ -3929,6 +3942,53 @@ def _json_groups_find_all(
     return tuple(merged)
 
 
+def _json_groups_find_range(
+    groups: tuple[JsonSearchIndexGroup, ...], operator: str, threshold: Any
+) -> tuple[int, ...]:
+    """Merge every hit of a numeric comparison over one pointer's groups.
+
+    Shared core of the ``lt`` / ``le`` / ``gt`` / ``ge`` leaves of
+    :meth:`JsonMultiIndex.find_where`. Only the integer and float kinds
+    take part — strings, booleans and null never satisfy a numeric
+    comparison — and ints and floats compare by exact numeric value
+    across both kinds: Python compares an int and a float by exact
+    rational value without rounding the int, so big integers never
+    spuriously compare equal to a nearby float threshold, and negative
+    zero equals positive zero. The matching buckets' hits merge in
+    strictly ascending order; range clipping is the caller's job.
+    """
+    if operator == "lt":
+
+        def matches(number: Any) -> bool:
+            return number < threshold
+
+    elif operator == "le":
+
+        def matches(number: Any) -> bool:
+            return number <= threshold
+
+    elif operator == "gt":
+
+        def matches(number: Any) -> bool:
+            return number > threshold
+
+    else:  # "ge"
+
+        def matches(number: Any) -> bool:
+            return number >= threshold
+
+    streams: list[tuple[int, ...]] = []
+    for group in groups:
+        if group.kind not in (_JSON_TAG_INTEGER, _JSON_TAG_FLOAT):
+            continue
+        for bucket in group.buckets:
+            number = _decode_json_index_numeric(group.kind, bucket.key)
+            if matches(number):
+                streams.append(bucket.hits)
+    merged = heapq.merge(*streams) if streams else ()
+    return tuple(merged)
+
+
 def _intersect_ascending_tuples(
     left: tuple[int, ...], right: tuple[int, ...]
 ) -> tuple[int, ...]:
@@ -4320,6 +4380,22 @@ class JsonMultiIndex:
                 ) from error
             _check_json_value(value)
             return ("eq", position, value)
+        if operator in ("lt", "le", "gt", "ge"):
+            if len(expression) != 3:
+                raise ValueError(
+                    f'a "{operator}" node must have exactly three items'
+                )
+            _, pointer, threshold = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            _check_json_threshold(threshold)
+            return (operator, position, threshold)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4347,6 +4423,11 @@ class JsonMultiIndex:
         operator = node[0]
         if operator == "eq":
             merged = _json_groups_find_all(self.groups[node[1]], node[2])
+            return tuple(index for index in merged if start <= index < stop)
+        if operator in ("lt", "le", "gt", "ge"):
+            merged = _json_groups_find_range(
+                self.groups[node[1]], operator, node[2]
+            )
             return tuple(index for index in merged if start <= index < stop)
         if operator == "and":
             children = node[1]
@@ -4387,7 +4468,14 @@ class JsonMultiIndex:
         and ``value`` a JSON scalar (``str``, ``int``, finite ``float``,
         ``bool`` or ``None``) with the same kind-separated comparison —
         strings, booleans and null match only their own kind while ints
-        and floats compare by numeric value. A combination is
+        and floats compare by numeric value. A numeric-comparison leaf is
+        ``("lt", pointer, threshold)``, ``("le", pointer, threshold)``,
+        ``("gt", pointer, threshold)`` or ``("ge", pointer, threshold)``
+        with the same pointer rules; ``threshold`` must be a non-boolean
+        ``int`` or a finite ``float`` and the addressed JSON number
+        compares against it by exact numeric value across the integer
+        and float kinds — big integers never round to a nearby float and
+        negative zero equals positive zero. A combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -4401,18 +4489,21 @@ class JsonMultiIndex:
         and bounds as :meth:`find`; an empty range yields ``()``.
 
         Non-JSON, encrypted, missing-field and non-scalar targets never
-        satisfy an ``eq`` leaf — a missing field is not ``null`` — so
-        they do satisfy that leaf's negation, exactly as for
-        :meth:`find`. A non-tuple node or ``children``, a non-string
-        operator or pointer, a value of another type, or a wrong-typed
-        range bound raises TypeError; an empty node, an unknown operator,
-        a node of the wrong length, a malformed or uncovered pointer, a
-        non-finite float, or an out-of-range or reversed range raises
-        ValueError. The whole expression is validated before any lookup —
-        a node's own errors before its children's, children from left to
-        right, the range last — so an empty range or an already
-        determined intermediate result never masks an invalid branch. The
-        lookup is read-only and never mutates the index.
+        satisfy an ``eq`` leaf — a missing field is not ``null`` — and
+        non-numeric targets (booleans, strings, null, objects and arrays)
+        never satisfy a numeric-comparison leaf, so all of them do
+        satisfy that leaf's negation, exactly as for :meth:`find`. A
+        non-tuple node or ``children``, a non-string operator or pointer,
+        a value or threshold of another type, or a wrong-typed range
+        bound raises TypeError; an empty node, an unknown operator, a
+        node of the wrong length, a malformed or uncovered pointer, a
+        non-finite float value or threshold, or an out-of-range or
+        reversed range raises ValueError. The whole expression is
+        validated before any lookup — a node's own errors before its
+        children's, children from left to right, the range last — so an
+        empty range or an already determined intermediate result never
+        masks an invalid branch. The lookup is read-only and never
+        mutates the index.
         """
         resolved = self._resolve_where_expression(expression)
         start, stop = self._range_bounds(start, stop)

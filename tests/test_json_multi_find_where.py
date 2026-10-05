@@ -321,6 +321,222 @@ class FindWhereArgumentsTest(unittest.TestCase):
             self.bundle.find_where(("eq", "/a", [1]), 3, 3)
 
 
+class FindWhereComparisonTest(unittest.TestCase):
+    def setUp(self):
+        log = AuditLog()
+        # 0: int 1
+        log.append(j({"a": 1, "b": "x"}))
+        # 1: float 1.5
+        log.append(j({"a": 1.5, "b": "y"}))
+        # 2: int 2
+        log.append(j({"a": 2, "b": "x"}))
+        # 3: float 2.0 (the JSON number 2)
+        log.append(j({"a": 2.0, "b": "x"}))
+        # 4: boolean true (not a number)
+        log.append(j({"a": True, "b": "x"}))
+        # 5: string "2" (not a number)
+        log.append(j({"a": "2", "b": "x"}))
+        # 6: null (not a number)
+        log.append(j({"a": None, "b": "x"}))
+        # 7: array (non-scalar)
+        log.append(j({"a": [2], "b": "x"}))
+        # 8: missing /a
+        log.append(j({"b": "x"}))
+        # 9: not JSON
+        log.append(b"not json")
+        self.log = log
+        self.bundle = log.signed_json_multi_index(POINTERS, SEED_A)
+
+    def test_lt_le_gt_ge(self):
+        self.assertEqual(self.bundle.find_where(("lt", "/a", 2)), (0, 1))
+        self.assertEqual(
+            self.bundle.find_where(("le", "/a", 2)), (0, 1, 2, 3)
+        )
+        self.assertEqual(
+            self.bundle.find_where(("gt", "/a", 1)), (1, 2, 3)
+        )
+        self.assertEqual(
+            self.bundle.find_where(("ge", "/a", 2)), (2, 3)
+        )
+
+    def test_float_threshold_compares_across_kinds(self):
+        self.assertEqual(self.bundle.find_where(("lt", "/a", 1.5)), (0,))
+        self.assertEqual(
+            self.bundle.find_where(("le", "/a", 1.5)), (0, 1)
+        )
+        self.assertEqual(
+            self.bundle.find_where(("gt", "/a", 1.5)), (2, 3)
+        )
+        self.assertEqual(
+            self.bundle.find_where(("ge", "/a", 2.0)), (2, 3)
+        )
+
+    def test_big_integer_threshold_does_not_round(self):
+        log = AuditLog()
+        log.append(j({"a": 9007199254740992}))  # 0: exactly 2**53
+        log.append(j({"a": 9007199254740993}))  # 1: 2**53 + 1
+        log.append(j({"a": 9007199254740994.0}))  # 2: 2**53 + 2
+        bundle = log.signed_json_multi_index(POINTERS, SEED_A)
+        # 2**53 + 1 is not representable as a float; it must still
+        # compare strictly greater than the float 2**53.
+        self.assertEqual(
+            bundle.find_where(("gt", "/a", 9007199254740992.0)), (1, 2)
+        )
+        self.assertEqual(
+            bundle.find_where(("lt", "/a", 9007199254740993)), (0,)
+        )
+        self.assertEqual(
+            bundle.find_where(("ge", "/a", 9007199254740993)), (1, 2)
+        )
+        self.assertEqual(
+            bundle.find_where(("le", "/a", 9007199254740993)), (0, 1)
+        )
+
+    def test_zero_threshold_matches_both_zero_spellings(self):
+        log = AuditLog()
+        log.append(j({"a": 0}))
+        log.append(j({"a": -0.0}))
+        log.append(j({"a": 0.5}))
+        bundle = log.signed_json_multi_index(POINTERS, SEED_A)
+        self.assertEqual(bundle.find_where(("le", "/a", 0)), (0, 1))
+        self.assertEqual(bundle.find_where(("ge", "/a", -0.0)), (0, 1, 2))
+        self.assertEqual(bundle.find_where(("lt", "/a", 0.0)), ())
+        self.assertEqual(bundle.find_where(("gt", "/a", 0)), (2,))
+
+    def test_non_numeric_targets_miss_comparison_hit_not(self):
+        # Entries 4..9 (bool, string, null, array, missing, non-JSON)
+        # never match a comparison leaf but do match its negation.
+        for operator in ("lt", "le", "gt", "ge"):
+            self.assertEqual(
+                self.bundle.find_where((operator, "/a", 2)),
+                self.bundle.find_where(
+                    ("not", ("not", (operator, "/a", 2)))
+                ),
+            )
+        self.assertEqual(
+            self.bundle.find_where(("not", ("ge", "/a", 1))),
+            (4, 5, 6, 7, 8, 9),
+        )
+
+    def test_encrypted_entries_never_match_comparison(self):
+        log = AuditLog()
+        log.append(j({"a": 1, "b": "x"}))
+        log.encrypt(j({"a": 2, "b": "x"}), b"k" * 32)
+        bundle = log.signed_json_multi_index(POINTERS, SEED_A)
+        self.assertEqual(bundle.find_where(("ge", "/a", 1)), (0,))
+        self.assertEqual(bundle.find_where(("not", ("ge", "/a", 1))), (1,))
+
+    def test_and_expresses_closed_and_open_intervals(self):
+        self.assertEqual(
+            self.bundle.find_where(
+                ("and", (("ge", "/a", 1), ("le", "/a", 2)))
+            ),
+            (0, 1, 2, 3),
+        )
+        self.assertEqual(
+            self.bundle.find_where(
+                ("and", (("gt", "/a", 1), ("lt", "/a", 2)))
+            ),
+            (1,),
+        )
+
+    def test_combines_with_eq_and_or(self):
+        expression = (
+            "or",
+            (
+                ("and", (("ge", "/a", 2), ("eq", "/b", "x"))),
+                ("eq", "/b", "y"),
+            ),
+        )
+        self.assertEqual(self.bundle.find_where(expression), (1, 2, 3))
+
+    def test_duplicate_comparison_branches_add_no_duplicates(self):
+        leaf = ("lt", "/a", 2)
+        result = self.bundle.find_where(("or", (leaf, leaf, leaf)))
+        self.assertEqual(result, (0, 1))
+        self.assertEqual(result, tuple(sorted(set(result))))
+
+    def test_range_clips_comparison_hits(self):
+        self.assertEqual(
+            self.bundle.find_where(("le", "/a", 2), 1, 3), (1, 2)
+        )
+        self.assertEqual(self.bundle.find_where(("le", "/a", 2), 3, 3), ())
+        self.assertEqual(
+            self.bundle.find_where(("le", "/a", 2), None, 2), (0, 1)
+        )
+
+    def test_signed_and_inner_index_agree(self):
+        expression = ("and", (("gt", "/a", 1), ("not", ("eq", "/b", "y"))))
+        self.assertEqual(
+            self.bundle.find_where(expression),
+            self.bundle.index.find_where(expression),
+        )
+
+
+class FindWhereComparisonArgumentsTest(unittest.TestCase):
+    def setUp(self):
+        self.bundle = make_log().signed_json_multi_index(POINTERS, SEED_A)
+
+    def test_threshold_must_be_a_number(self):
+        for operator in ("lt", "le", "gt", "ge"):
+            for bad in (True, False, "1", None, [1], {"x": 1}, b"1"):
+                with self.assertRaises(TypeError):
+                    self.bundle.find_where((operator, "/a", bad))
+
+    def test_threshold_must_be_finite(self):
+        for operator in ("lt", "le", "gt", "ge"):
+            for bad in (float("nan"), float("inf"), -float("inf")):
+                with self.assertRaises(ValueError):
+                    self.bundle.find_where((operator, "/a", bad))
+
+    def test_comparison_node_length(self):
+        for bad in (
+            ("lt", "/a"),
+            ("le", "/a", 1, 2),
+            ("gt",),
+            ("ge", "/a", 1, 2, 3),
+        ):
+            with self.assertRaises(ValueError):
+                self.bundle.find_where(bad)
+
+    def test_comparison_pointer_rules_match_eq(self):
+        with self.assertRaises(TypeError):
+            self.bundle.find_where(("lt", b"/a", 1))
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "a", 1))
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/a~2", 1))
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/missing", 1))
+
+    def test_comparison_range_rules_match_eq(self):
+        with self.assertRaises(TypeError):
+            self.bundle.find_where(("lt", "/a", 1), True)
+        with self.assertRaises(TypeError):
+            self.bundle.find_where(("lt", "/a", 1), 0, "3")
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/a", 1), -1)
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/a", 1), 0, 99)
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/a", 1), 4, 2)
+
+    def test_invalid_comparison_branches_are_not_masked(self):
+        contradicting = ("and", (("eq", "/a", 1), ("eq", "/a", 2)))
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(
+                ("and", (contradicting, ("lt", "/missing", 1)))
+            )
+        with self.assertRaises(TypeError):
+            self.bundle.find_where(
+                ("and", (contradicting, ("lt", "/a", "1")))
+            )
+        with self.assertRaises(ValueError):
+            self.bundle.find_where(("lt", "/missing", 1), 3, 3)
+        with self.assertRaises(TypeError):
+            self.bundle.find_where(("lt", "/a", None), 3, 3)
+
+
 class FindWhereSnapshotAndOfflineTest(unittest.TestCase):
     def test_frozen_snapshot_survives_append_and_prune(self):
         log = make_log()
@@ -350,6 +566,29 @@ class FindWhereSnapshotAndOfflineTest(unittest.TestCase):
         self.assertEqual(
             decoded_bundle.find_where(expression),
             decoded_index.find_where(expression),
+        )
+        # Re-encoding is byte-identical: queries change nothing.
+        self.assertEqual(encode_json_multi_index(decoded_index), index_blob)
+        self.assertEqual(
+            encode_signed_json_multi_index(decoded_bundle), signed_blob
+        )
+
+    def test_comparison_works_off_decoded_bytes_without_log_or_key(self):
+        log = make_log()
+        bundle = log.signed_json_multi_index(POINTERS, SEED_A)
+        index_blob = encode_json_multi_index(bundle.index)
+        signed_blob = encode_signed_json_multi_index(bundle)
+        decoded_index = decode_json_multi_index(index_blob)
+        decoded_bundle = decode_signed_json_multi_index(signed_blob)
+        expression = ("and", (("ge", "/a", 1), ("le", "/a", 1)))
+        self.assertEqual(decoded_index.find_where(expression), (0, 1, 4))
+        self.assertEqual(decoded_bundle.find_where(expression), (0, 1, 4))
+        self.assertEqual(
+            decoded_bundle.find_where(expression),
+            decoded_index.find_where(expression),
+        )
+        self.assertTrue(
+            verify_signed_json_multi_index(decoded_bundle, public_key(SEED_A))
         )
         # Re-encoding is byte-identical: queries change nothing.
         self.assertEqual(encode_json_multi_index(decoded_index), index_blob)

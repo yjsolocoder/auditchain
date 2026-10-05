@@ -183,6 +183,7 @@ __all__ = [
     "JsonSearchIndexGroup",
     "JsonSearchReceipt",
     "MerkleFrontier",
+    "MultiQueryReceipt",
     "PrefixSearchReceipt",
     "PruneReceipt",
     "RangeSearchReceipt",
@@ -240,6 +241,7 @@ __all__ = [
     "decode_json_search_index",
     "decode_json_search_receipt",
     "decode_merkle_frontier",
+    "decode_multi_query_receipt",
     "decode_prefix_search_receipt",
     "decode_prune_receipt",
     "decode_retention_transition",
@@ -309,6 +311,7 @@ __all__ = [
     "encode_json_search_index",
     "encode_json_search_receipt",
     "encode_merkle_frontier",
+    "encode_multi_query_receipt",
     "encode_prefix_search_receipt",
     "encode_prune_receipt",
     "encode_retention_transition",
@@ -403,6 +406,7 @@ __all__ = [
     "verify_json_multi_index",
     "verify_json_search_index",
     "verify_json_search_receipt",
+    "verify_multi_query_receipt",
     "verify_range_search_receipt",
     "verify_prefix_search_receipt",
     "verify_retention_chain",
@@ -611,6 +615,21 @@ _SIGNED_JSON_MULTI_INDEX_VERSION = 1
 _SIGNED_JSON_MULTI_INDEX_DOMAIN = (
     b"auditchain/signed-json-multi-index/v1\0"
 )
+# Offline multi-condition query receipt of
+# SignedJsonMultiIndex.query_receipt / verify_multi_query_receipt. The
+# receipt carries no new signature: it bundles the whole signed multi
+# index (whose own signature authenticates every index field) with the
+# find_all conditions, the resolved half-open range and the claimed
+# complete hit tuple, so an offline receiver re-runs the query over the
+# authenticated index and confirms the hits are exactly the complete
+# result. The binary framing of encode_multi_query_receipt /
+# decode_multi_query_receipt is the usual one: a fixed magic, the
+# envelope version as a u64, a u64-length-prefixed blob holding the
+# complete canonical encode_signed_json_multi_index bytes, the condition
+# count with one (pointer blob, value tag, value blob) triple per
+# condition in order, then start, stop and the ascending hit u64s.
+_MULTI_QUERY_RECEIPT_MAGIC = b"auditchain/multi-query-receipt/v1\0"
+_MULTI_QUERY_RECEIPT_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -4577,6 +4596,152 @@ class SignedJsonMultiIndex:
     ) -> tuple[int, ...]:
         """Nested boolean find on the bundled index; semantics identical."""
         return self.index.find_where(expression, start, stop)
+
+    def query_receipt(
+        self,
+        conditions: Any,
+        start: int | None = None,
+        stop: int | None = None,
+    ) -> "MultiQueryReceipt":
+        """Issue an offline completeness receipt for one find_all query.
+
+        Runs the multi-condition query exactly like :meth:`find_all` —
+        ``conditions`` is a tuple of ``(pointer, value)`` pairs following
+        the rules of :meth:`find`, the half-open ``[start, stop)`` range
+        defaults to the whole retained segment ``[retain_from, size)``,
+        an empty ``conditions`` tuple matches every index in the range,
+        and an empty range or a query without matches yields ``()`` —
+        and packages this bundle, the conditions, the *resolved* range
+        bounds and the strictly ascending duplicate-free absolute hit
+        indices as an immutable :class:`MultiQueryReceipt`. An offline
+        receiver holding only a pre-trusted 32-byte Ed25519 public key
+        confirms with :func:`verify_multi_query_receipt` that the bundled
+        signed index is genuine and that ``hits`` is exactly the complete
+        result of the conditions over that range.
+
+        The conditions and the range are validated with exactly the
+        exception types and ordering of :meth:`find_all` — every
+        condition is checked before any lookup, so an empty range or an
+        early condition without hits never masks a later illegal
+        condition. Issuing a receipt needs neither the log nor a private
+        key and does not assert that this bundle's signature verifies;
+        the call is read-only and never mutates the bundle.
+        """
+        hits = self.index.find_all(conditions, start, stop)
+        resolved_start, resolved_stop = self.index._range_bounds(start, stop)
+        return MultiQueryReceipt(
+            bundle=self,
+            conditions=conditions,
+            start=resolved_start,
+            stop=resolved_stop,
+            hits=hits,
+        )
+
+
+@dataclass(frozen=True)
+class MultiQueryReceipt:
+    """Offline completeness receipt for one multi-condition index query.
+
+    Issued by :meth:`SignedJsonMultiIndex.query_receipt` and verified
+    entirely offline by :func:`verify_multi_query_receipt`, it bundles:
+
+    - ``bundle``: the :class:`SignedJsonMultiIndex` the query ran
+      against — its own Ed25519 signature already authenticates the
+      whole index, so the receipt itself carries no new signature and
+      the conditions are not separately authenticated,
+    - ``conditions``: the find_all conditions, a tuple of ``(pointer,
+      value)`` pairs in their original order,
+    - ``start`` / ``stop``: the resolved half-open query range within
+      the bundled index's covered segment,
+    - ``hits``: the claimed complete result — absolute indices in
+      strictly ascending order without duplicates, each inside
+      ``[start, stop)`` (``()`` for an empty range or no match).
+
+    Instances are immutable, may be built positionally and compare by
+    all five fields. The constructor validates the bundle's container
+    and nested index structure, every condition (with exactly the
+    exception types and ordering of :meth:`JsonMultiIndex.find_all`),
+    the range bounds against the index's covered segment and the hit
+    tuple's types, ordering and bounds; whether the bundle's evidence
+    and signature are genuine and whether ``hits`` is the complete
+    result is left to :func:`verify_multi_query_receipt`, so a
+    structurally valid receipt whose claim is wrong still constructs
+    and round-trips through :func:`encode_multi_query_receipt` /
+    :func:`decode_multi_query_receipt`.
+    """
+
+    bundle: SignedJsonMultiIndex
+    conditions: tuple
+    start: int
+    stop: int
+    hits: tuple
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bundle, SignedJsonMultiIndex):
+            raise TypeError("bundle must be a SignedJsonMultiIndex")
+        # Re-validate the bundle container and the nested index exactly
+        # as their own constructors would, so a field bypassed into an
+        # illegal shape raises the same TypeError or ValueError here.
+        bundle = SignedJsonMultiIndex(self.bundle.index, self.bundle.signature)
+        index = JsonMultiIndex(
+            bundle.index.version,
+            bundle.index.hash_name,
+            bundle.index.size,
+            bundle.index.root,
+            bundle.index.head,
+            bundle.index.retain_from,
+            bundle.index.pointers,
+            bundle.index.items,
+            bundle.index.proof,
+            bundle.index.groups,
+        )
+        # Conditions and range follow JsonMultiIndex.find_all exactly:
+        # every condition is validated before the range, so an empty
+        # range never masks an illegal condition.
+        if not isinstance(self.conditions, tuple):
+            raise TypeError(
+                "conditions must be a tuple of (pointer, value) pairs"
+            )
+        for condition in self.conditions:
+            if not isinstance(condition, tuple):
+                raise TypeError(
+                    "each condition must be a (pointer, value) tuple"
+                )
+            if len(condition) != 2:
+                raise ValueError("each condition must have exactly two items")
+            pointer, value = condition
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            if canonical not in index.pointers:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                )
+            _check_json_value(value)
+        for name in ("start", "stop"):
+            bound = getattr(self, name)
+            if not isinstance(bound, int) or isinstance(bound, bool):
+                raise TypeError(f"{name} must be an integer")
+        if not index.retain_from <= self.start <= self.stop <= index.size:
+            raise ValueError(
+                f"range must satisfy retain_from ({index.retain_from}) "
+                f"<= start <= stop <= size ({index.size})"
+            )
+        if not isinstance(self.hits, tuple):
+            raise TypeError("hits must be a tuple of integers")
+        previous: int | None = None
+        for hit in self.hits:
+            if not isinstance(hit, int) or isinstance(hit, bool):
+                raise TypeError("hits must be non-bool integers")
+            if not self.start <= hit < self.stop:
+                raise ValueError(
+                    f"hit {hit} must satisfy start ({self.start}) "
+                    f"<= hit < stop ({self.stop})"
+                )
+            if previous is not None and hit <= previous:
+                raise ValueError(
+                    "hits must be strictly ascending with no duplicates"
+                )
+            previous = hit
 
 
 @dataclass(frozen=True)
@@ -11440,6 +11605,58 @@ def verify_signed_json_multi_index(bundle: Any, public_key: Any) -> bool:
     return True
 
 
+def verify_multi_query_receipt(receipt: Any, public_key: Any) -> bool:
+    """Verify a :class:`MultiQueryReceipt` against a pre-trusted key.
+
+    Confirms both halves of the offline claim without holding the log:
+    :func:`verify_signed_json_multi_index` re-checks the bundled index's
+    whole evidence (every covered entry digest, the shared batch
+    inclusion proof against the snapshot root, the chain head and every
+    pointer's complete hit-bucket partition) together with its Ed25519
+    signature under the 32-byte ``public_key``, and the receipt's
+    ``hits`` are then compared against the complete result of
+    re-running the receipt's ``conditions`` over the authenticated
+    index within ``[start, stop)``. A genuine receipt from the trusted
+    key returns True; a structurally valid receipt whose bundle was
+    signed by another key, whose signature or index evidence does not
+    match, or whose hit tuple misses a match (under-report) or lists a
+    non-match (over-report) returns False — all without raising. The
+    conditions themselves carry no signature: editing them (and the
+    range) still verifies whenever the declared hits remain exactly the
+    complete result of the edited query.
+
+    Input that is not a :class:`MultiQueryReceipt` raises TypeError, as
+    does a non-``bytes`` ``public_key``; a 32-byte-violating key raises
+    ValueError. Every structural rule of :class:`MultiQueryReceipt`
+    (conditions and range exactly as :meth:`JsonMultiIndex.find_all`,
+    ascending in-range hits) is re-validated before any signature
+    check, so an illegal condition, range or hit tuple raises its
+    TypeError or ValueError even when the signature would fail — a
+    signature mismatch never masks a structural error, and an empty
+    range or early miss never masks a later illegal condition. The
+    call is read-only and never mutates the receipt.
+    """
+    if not isinstance(receipt, MultiQueryReceipt):
+        raise TypeError("receipt must be a MultiQueryReceipt")
+    # Re-validate the whole receipt structure exactly as the constructor
+    # would — before any signature check — so a bypassed field raises
+    # the same TypeError or ValueError rather than reporting False.
+    checked = MultiQueryReceipt(
+        receipt.bundle,
+        receipt.conditions,
+        receipt.start,
+        receipt.stop,
+        receipt.hits,
+    )
+    _load_ed25519_public(public_key)
+    if not verify_signed_json_multi_index(checked.bundle, public_key):
+        return False
+    expected = checked.bundle.find_all(
+        checked.conditions, checked.start, checked.stop
+    )
+    return expected == checked.hits
+
+
 def verify_signed_range_search_receipt(bundle: Any, public_key: Any) -> bool:
     """Verify a :class:`SignedRangeSearchReceipt` against a pre-trusted key.
     Confirms both claims of the sealed bundle without holding the log:
@@ -14811,6 +15028,224 @@ def decode_signed_json_multi_index(data: Any) -> SignedJsonMultiIndex:
         )
     index = decode_json_multi_index(index_blob)
     return SignedJsonMultiIndex(index=index, signature=signature)
+
+
+def _encode_json_condition_value(value: Any) -> bytes:
+    """Encode one validated find_all condition scalar deterministically.
+
+    Writes the scalar's kind tag as a u64 followed by its canonical
+    bucket-key blob — exactly the spelling the JSON index groups use, so
+    strings keep their UTF-8 bytes, integers their canonical ASCII
+    decimal spelling (arbitrary precision), floats their canonical
+    ``repr`` spelling and booleans/null the empty blob. Assumes
+    ``value`` already passed :func:`_check_json_value`.
+    """
+    kind = _json_index_tag_of_scalar(value)
+    return _encode_u64(kind, "condition value tag") + _encode_blob(
+        _json_index_key_of_scalar(kind, value)
+    )
+
+
+def _decode_json_condition_value(tag: int, key: bytes) -> Any:
+    """Decode one condition scalar written by :func:`_encode_json_condition_value`.
+
+    An unknown tag, a non-empty boolean/null blob, invalid UTF-8, a
+    non-canonical integer or float spelling or a non-finite float all
+    raise ValueError.
+    """
+    if tag == _JSON_TAG_STRING:
+        try:
+            return key.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                "string condition value must be valid UTF-8"
+            ) from error
+    if tag == _JSON_TAG_INTEGER:
+        try:
+            text = key.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                "integer condition value must be ASCII"
+            ) from error
+        try:
+            value = int(text)
+        except ValueError as error:
+            raise ValueError(
+                "integer condition value must be canonical ASCII decimal"
+            ) from error
+        if str(value).encode("ascii") != key:
+            raise ValueError(
+                "integer condition value must be canonical ASCII decimal"
+            )
+        return value
+    if tag == _JSON_TAG_FLOAT:
+        try:
+            text = key.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError("float condition value must be ASCII") from error
+        try:
+            value = float(text)
+        except ValueError as error:
+            raise ValueError(
+                "float condition value must be an ASCII number"
+            ) from error
+        if not math.isfinite(value):
+            raise ValueError("float condition value must be finite")
+        if repr(value).encode("ascii") != key:
+            raise ValueError(
+                "float condition value must be the canonical repr spelling"
+            )
+        return value
+    if tag in _JSON_INDEX_EMPTY_KINDS:
+        if key:
+            raise ValueError(
+                "a boolean or null condition value must be the empty blob"
+            )
+        if tag == _JSON_TAG_TRUE:
+            return True
+        if tag == _JSON_TAG_FALSE:
+            return False
+        return None
+    raise ValueError(f"unknown condition value tag {tag}")
+
+
+def encode_multi_query_receipt(receipt: Any) -> bytes:
+    """Encode a :class:`MultiQueryReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/multi-query-receipt/v1\\0"``; every integer is an
+    unsigned 8-byte big-endian value and every blob is a u64 byte length
+    followed by the raw bytes. Fields appear strictly in the order
+    ``version`` (always 1), the ``bundle`` blob (the complete canonical
+    output of :func:`encode_signed_json_multi_index`), the condition
+    count followed per condition — in their original order — by the
+    pointer UTF-8 blob and the scalar value (its kind tag plus its
+    canonical value blob, preserving strings, arbitrary-precision
+    integers, floats, booleans and null exactly), then ``start``,
+    ``stop``, the hit count and one u64 per strictly ascending hit —
+    with nothing omitted, reordered or appended.
+
+    ``receipt`` must be a :class:`MultiQueryReceipt` (anything else
+    raises TypeError); every field is re-validated exactly as the
+    constructor would, so an instance whose frozen fields were bypassed
+    into an illegal shape raises the same TypeError or ValueError, and
+    nested bundle problems raise exactly the exceptions of
+    :func:`encode_signed_json_multi_index`. Encoding is read-only and
+    deterministic: re-encoding a decoded receipt reproduces the
+    original bytes exactly, and a structurally valid receipt whose
+    claim fails verification encodes just as well.
+    """
+    if not isinstance(receipt, MultiQueryReceipt):
+        raise TypeError("receipt must be a MultiQueryReceipt")
+    checked = MultiQueryReceipt(
+        receipt.bundle,
+        receipt.conditions,
+        receipt.start,
+        receipt.stop,
+        receipt.hits,
+    )
+    parts = [
+        _MULTI_QUERY_RECEIPT_MAGIC,
+        _encode_u64(_MULTI_QUERY_RECEIPT_VERSION, "version"),
+        _encode_blob(encode_signed_json_multi_index(checked.bundle)),
+        _encode_u64(len(checked.conditions), "conditions count"),
+    ]
+    for pointer, value in checked.conditions:
+        parts.append(_encode_blob(pointer.encode("utf-8")))
+        parts.append(_encode_json_condition_value(value))
+    parts.append(_encode_u64(checked.start, "start"))
+    parts.append(_encode_u64(checked.stop, "stop"))
+    parts.append(_encode_u64(len(checked.hits), "hits count"))
+    for hit in checked.hits:
+        parts.append(_encode_u64(hit, "hit"))
+    return b"".join(parts)
+
+
+def decode_multi_query_receipt(data: Any) -> MultiQueryReceipt:
+    """Decode bytes produced by :func:`encode_multi_query_receipt`.
+
+    ``data`` must be exact ``bytes`` (anything else, including
+    ``bytearray`` and ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/multi-query-receipt/v1\\0"`` it must contain,
+    strictly in order, the u64 envelope version (only ``1`` is
+    supported), one length-prefixed signed-index bundle blob (handed
+    whole to :func:`decode_signed_json_multi_index`, so every nested
+    framing and structural rule is hers), the condition count with one
+    (pointer blob, value tag, value blob) triple per condition,
+    ``start``, ``stop``, the hit count and one u64 per hit, with no
+    trailing bytes. A bad magic or version, truncation, an oversized
+    blob length, trailing bytes, invalid UTF-8 in a pointer or string
+    value, an unknown value tag, a non-canonical integer or float
+    value spelling, a non-finite float, a non-empty boolean/null value
+    blob, an illegal condition or range (exactly as
+    :meth:`JsonMultiIndex.find_all` reports them) and an out-of-range,
+    duplicated or misordered hit all raise ValueError.
+
+    The returned object is a frozen :class:`MultiQueryReceipt` whose
+    fields equal the originally encoded ones — condition order, scalar
+    types and arbitrary-precision integers included — and re-encoding
+    reproduces the original bytes exactly. A structurally sound receipt
+    whose claim simply does not verify still decodes;
+    :func:`verify_multi_query_receipt` reports False. The call is
+    read-only.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_MULTI_QUERY_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain multi-query-receipt encoding")
+    offset = len(_MULTI_QUERY_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _MULTI_QUERY_RECEIPT_VERSION:
+        raise ValueError(
+            f"unsupported multi-query-receipt version {version}"
+        )
+    bundle = decode_signed_json_multi_index(read_blob("bundle"))
+    condition_count = read_u64("conditions count")
+    conditions: list[tuple] = []
+    for position in range(condition_count):
+        raw_pointer = read_blob(f"condition {position} pointer")
+        try:
+            pointer = raw_pointer.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"condition {position} pointer is not valid UTF-8"
+            ) from error
+        tag = read_u64(f"condition {position} value tag")
+        key = read_blob(f"condition {position} value")
+        conditions.append((pointer, _decode_json_condition_value(tag, key)))
+    start = read_u64("start")
+    stop = read_u64("stop")
+    hit_count = read_u64("hits count")
+    hits = tuple(read_u64("hit") for _ in range(hit_count))
+    if offset != len(data):
+        raise ValueError("trailing bytes after the multi query receipt")
+    return MultiQueryReceipt(
+        bundle=bundle,
+        conditions=tuple(conditions),
+        start=start,
+        stop=stop,
+        hits=hits,
+    )
 
 
 def encode_prune_receipt(receipt: Any) -> bytes:

@@ -1219,6 +1219,7 @@ log.consistency_proof(2, 5)    # 保留点到任意后续前缀的一致性证�
 receipt = log.apply_retention(2)                 # mode="retain_from"：保留点直接取 value
 log.retain_from                                  # 2
 receipt = log.apply_retention(3, mode="keep_last")  # 保留点 = max(当前保留点, len(log)-3)
+receipt = log.apply_retention(1024, mode="keep_bytes")  # 保留载荷总字节不超过 1024 的最长后缀
 ```
 
 - `mode="retain_from"`（默认）：目标保留点等于 `value`，要求
@@ -1226,7 +1227,16 @@ receipt = log.apply_retention(3, mode="keep_last")  # 保留点 = max(当前保�
 - `mode="keep_last"`：目标保留点等于 `max(当前保留点, len(log) - value)`，
   即至多保留最新的 `value` 条且保留点绝不回退；要求 `value >= 0`
   （`value` 大于当前条数时保留点保持不动，`value=0` 裁剪全部）
+- `mode="keep_bytes"`：`value` 是裁剪后允许保留的载荷总字节预算，目标保留点
+  是满足预算的最长连续保留后缀的起点。计量以每条 `Entry.payload` 的实际长度
+  为准——字符串按已存储的 UTF-8 字节、密文按完整封装——不计入摘要、索引、
+  认证标签或 nonce 历史的额外空间，因此预算只约束载荷，不代表整个日志对象或
+  导出文件的大小。保留点只能在当前 `retain_from` 到 `len(log)` 之间前进：
+  不能跳过中间的大条目再保留更早的小条目，也不能拆分条目。总量不超过预算
+  （含空日志或已全部裁剪）时保留点不变；`value=0` 仍保留末尾连续的零字节
+  载荷；最新一条载荷大于预算时裁剪全部。要求 `value >= 0`
 - `value` 必须是非 `bool` 整数；`mode` 只接受 `"retain_from"` / `"keep_last"`
+  / `"keep_bytes"`
 - `value` 或 `mode` 类型非法抛 `TypeError`；未知 `mode` 或 `value` 越界抛
   `ValueError`；任何失败都发生在改动之前，全部日志、认证、索引与证明状态不变
 - 已裁剪条目的加密 nonce 仍记录在案，裁剪后依旧不可复用

@@ -135,6 +135,163 @@ class ApplyRetentionKeepLastTest(unittest.TestCase):
         self.assertEqual(receipt.size, 0)
 
 
+class ApplyRetentionKeepBytesTest(unittest.TestCase):
+    def setUp(self):
+        # Payload byte lengths: 2, 0, 3, 0.
+        self.log = AuditLog()
+        for payload in (b"aa", b"", b"bbb", b""):
+            self.log.append(payload)
+
+    def test_keeps_longest_suffix_within_budget(self):
+        receipt = self.log.apply_retention(3, mode="keep_bytes")
+        self.assertEqual(receipt.size, 1)
+        self.assertEqual(self.log.retain_from, 1)
+        self.assertEqual(len(self.log), 4)
+        self.assertEqual([e.payload for e in self.log], [b"", b"bbb", b""])
+        self.assertTrue(self.log.verify())
+
+    def test_zero_budget_keeps_trailing_empty_payloads(self):
+        receipt = self.log.apply_retention(0, mode="keep_bytes")
+        self.assertEqual(receipt.size, 3)
+        self.assertEqual(self.log.retain_from, 3)
+        self.assertEqual([e.payload for e in self.log], [b""])
+
+    def test_all_empty_payloads_never_pruned(self):
+        log = AuditLog()
+        for _ in range(3):
+            log.append(b"")
+        receipt = log.apply_retention(0, mode="keep_bytes")
+        self.assertEqual(receipt.size, 0)
+        self.assertEqual(log.retain_from, 0)
+        self.assertEqual(len(log.entries()), 3)
+
+    def test_total_equal_to_budget_keeps_everything(self):
+        receipt = self.log.apply_retention(5, mode="keep_bytes")
+        self.assertEqual(receipt.size, 0)
+        self.assertEqual(self.log.retain_from, 0)
+        self.assertEqual(len(self.log.entries()), 4)
+
+    def test_ample_budget_is_noop(self):
+        receipt = self.log.apply_retention(100, mode="keep_bytes")
+        self.assertEqual(receipt.size, 0)
+        self.assertEqual(self.log.retain_from, 0)
+
+    def test_empty_log_is_noop(self):
+        log = AuditLog()
+        receipt = log.apply_retention(0, mode="keep_bytes")
+        self.assertEqual(receipt.size, 0)
+        self.assertEqual(log.retain_from, 0)
+
+    def test_fully_pruned_log_keeps_retain_point(self):
+        self.log.apply_retention(4)
+        receipt = self.log.apply_retention(0, mode="keep_bytes")
+        self.assertEqual(receipt.size, 4)
+        self.assertEqual(self.log.retain_from, 4)
+
+    def test_newest_entry_larger_than_budget_prunes_all(self):
+        log = AuditLog()
+        log.append(b"x" * 10)
+        head = log.head
+        receipt = log.apply_retention(5, mode="keep_bytes")
+        self.assertEqual(receipt.size, 1)
+        self.assertEqual(log.retain_from, 1)
+        self.assertEqual(log.entries(), [])
+        self.assertEqual(log.head, head)
+
+    def test_text_payload_metered_as_utf8_bytes(self):
+        log = AuditLog()
+        log.append("éé")  # 4 stored UTF-8 bytes
+        log.append("ab")  # 2 stored bytes
+        receipt = log.apply_retention(4, mode="keep_bytes")
+        self.assertEqual(receipt.size, 1)
+        self.assertEqual([e.payload for e in log], [b"ab"])
+
+    def test_encrypted_payload_metered_as_full_envelope(self):
+        key = os.urandom(32)
+        log = AuditLog()
+        nonce = b"\x01" * 12
+        entry = log.encrypt("secret", key, nonce)
+        envelope = len(entry.payload)
+        log.append(b"ab")
+        receipt = log.apply_retention(envelope + 2, mode="keep_bytes")
+        self.assertEqual(receipt.size, 0)
+        self.assertEqual(log.retain_from, 0)
+        receipt = log.apply_retention(envelope + 1, mode="keep_bytes")
+        self.assertEqual(receipt.size, 1)
+        self.assertEqual([e.payload for e in log], [b"ab"])
+        # The released entry's nonce stays spent and its copy still decrypts.
+        with self.assertRaises(ValueError):
+            log.encrypt("again", key, nonce)
+        self.assertEqual(decrypt_entry(entry, key), b"secret")
+        self.assertTrue(log.verify())
+
+    def test_retain_point_never_moves_backwards(self):
+        self.log.apply_retention(2)
+        receipt = self.log.apply_retention(100, mode="keep_bytes")
+        self.assertEqual(receipt.size, 2)
+        self.assertEqual(self.log.retain_from, 2)
+        self.assertEqual([e.index for e in self.log], [2, 3])
+
+    def test_repeat_call_same_budget_is_idempotent(self):
+        first = self.log.apply_retention(3, mode="keep_bytes")
+        second = self.log.apply_retention(3, mode="keep_bytes")
+        self.assertEqual(first, second)
+        self.assertEqual(self.log.retain_from, 1)
+
+    def test_recomputed_after_append(self):
+        first = self.log.apply_retention(3, mode="keep_bytes")
+        self.log.append(b"z")
+        second = self.log.apply_retention(3, mode="keep_bytes")
+        self.assertNotEqual(first, second)
+        # Suffix b"bbb" + b"" + b"z" totals 4 > 3; longest fit is b"" + b"z".
+        self.assertEqual(second.size, 3)
+        self.assertEqual([e.payload for e in self.log], [b"", b"z"])
+        self.assertTrue(self.log.verify())
+
+    def test_receipt_equals_seal_at_target(self):
+        expected = self.log.seal(1)
+        receipt = self.log.apply_retention(3, mode="keep_bytes")
+        self.assertEqual(receipt, expected)
+        self.assertEqual(receipt.merkle_root, self.log.merkle_root(1))
+        self.assertTrue(receipt.matches(self.log.entry(1)))
+
+    def test_head_length_and_released_index_semantics(self):
+        head = self.log.head
+        self.log.apply_retention(3, mode="keep_bytes")
+        self.assertEqual(len(self.log), 4)
+        self.assertEqual(self.log.head, head)
+        with self.assertRaises(IndexError):
+            self.log.entry(0)
+        self.assertEqual(self.log.entry(1).payload, b"")
+
+    def test_negative_value_rejected(self):
+        with self.assertRaises(ValueError):
+            self.log.apply_retention(-1, mode="keep_bytes")
+        self.assertEqual(self.log.retain_from, 0)
+        self.assertEqual(len(self.log.entries()), 4)
+
+    def test_bad_value_type_rejected(self):
+        for bad in ("3", 3.0, None, b"3", True, [3]):
+            with self.assertRaises(TypeError):
+                self.log.apply_retention(bad, mode="keep_bytes")
+        self.assertEqual(self.log.retain_from, 0)
+        self.assertEqual(len(self.log.entries()), 4)
+
+    def test_auth_stage_and_tags_survive(self):
+        key = os.urandom(32)
+        log = AuditLog(key=key)
+        for payload in (b"aa", b"", b"bbb", b""):
+            log.append(payload)
+        verifier = log.export_verifier()
+        tag = log.auth(3)
+        stage = log.stage
+        receipt = log.apply_retention(3, mode="keep_bytes")
+        self.assertEqual(receipt.size, 1)
+        self.assertEqual(log.stage, stage)
+        self.assertTrue(verify_auth(log.entry(3), tag, verifier))
+        self.assertTrue(log.verify())
+
+
 class ApplyRetentionValidationTest(unittest.TestCase):
     def setUp(self):
         self.log = AuditLog()

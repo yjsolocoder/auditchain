@@ -10373,17 +10373,31 @@ class AuditLog:
         ``value``; with ``mode="keep_last"`` it is
         ``max(retain_from, len(log) - value)``, so at most the newest
         ``value`` entries are kept without ever moving the retain point
-        backwards.
+        backwards. With ``mode="keep_bytes"`` the target is the start of the
+        longest contiguous suffix of the currently retained entries whose
+        payload bytes total at most ``value``: each entry is metered as
+        ``len(entry.payload)`` — the stored UTF-8 bytes of a text payload, the
+        complete sealed envelope of an encrypted one — with no allowance for
+        digests, indexes, authentication tags or nonce history, so the budget
+        constrains payloads only, not the size of the log object or any
+        export. The retain point still only advances: entries are released
+        from the front of the retained window, never skipped and never split,
+        so a zero budget keeps exactly the trailing run of zero-byte payloads
+        and a newest entry larger than the budget releases everything. When
+        the retained payloads already total no more than the budget — an
+        ample budget, an empty log or a fully pruned window — the retain
+        point does not move.
 
         ``value`` must be a non-bool integer. In ``retain_from`` mode it must
-        satisfy ``retain_from <= value <= len(log)``; in ``keep_last`` mode it
-        must be non-negative. ``mode`` must be one of the two known strings.
-        On success the call is exactly ``receipt = seal(target);
-        prune(target, receipt)`` and the receipt is returned. A type error in
-        ``value`` or ``mode`` raises TypeError; an unknown mode or an
-        out-of-range value raises ValueError before anything is touched, so on
-        failure every entry, authentication tag/stage/key, locator index,
-        frontier checkpoint and nonce history stays exactly as it was.
+        satisfy ``retain_from <= value <= len(log)``; in ``keep_last`` and
+        ``keep_bytes`` modes it must be non-negative. ``mode`` must be one of
+        the three known strings. On success the call is exactly
+        ``receipt = seal(target); prune(target, receipt)`` and the receipt is
+        returned. A type error in ``value`` or ``mode`` raises TypeError; an
+        unknown mode or an out-of-range value raises ValueError before
+        anything is touched, so on failure every entry, authentication
+        tag/stage/key, locator index, frontier checkpoint and nonce history
+        stays exactly as it was.
         """
         if not isinstance(mode, str):
             raise TypeError("mode must be a string")
@@ -10401,8 +10415,26 @@ class AuditLog:
             if value < 0:
                 raise ValueError("value must be non-negative")
             target = max(self._retain_from, length - value)
+        elif mode == "keep_bytes":
+            if value < 0:
+                raise ValueError("value must be non-negative")
+            # Walk the retained window from the newest entry backwards,
+            # accumulating payload bytes until the next entry would exceed
+            # the budget; target is the absolute index where that suffix
+            # starts. Payload lengths are non-negative, so the first fit
+            # found this way is the longest suffix within budget.
+            target = length
+            total = 0
+            for entry in reversed(self._entries):
+                size = len(entry.payload)
+                if total + size > value:
+                    break
+                total += size
+                target -= 1
         else:
-            raise ValueError(f"unknown mode {mode!r}; expected 'retain_from' or 'keep_last'")
+            raise ValueError(
+                f"unknown mode {mode!r}; expected 'retain_from', 'keep_last' or 'keep_bytes'"
+            )
         receipt = self.seal(target)
         self.prune(target, receipt)
         return receipt

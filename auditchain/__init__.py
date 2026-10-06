@@ -650,8 +650,10 @@ _MULTI_QUERY_RECEIPT_VERSION = 1
 # then start, stop and the ascending hit u64s.
 _WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
 _WHERE_RECEIPT_VERSION = 1
-# Expression node tags of the where-receipt expression tree: the five leaf
-# operators in their find_where spelling order, then the three combinations.
+# Expression node tags of the where-receipt expression tree: the five
+# original leaf operators in their find_where spelling order, then the
+# three combinations, then the prefix leaf (appended so every tag of a
+# version-1 encoding keeps its meaning).
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -660,12 +662,14 @@ _WHERE_TAG_GE = 4
 _WHERE_TAG_AND = 5
 _WHERE_TAG_OR = 6
 _WHERE_TAG_NOT = 7
+_WHERE_TAG_PREFIX = 8
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
     "le": _WHERE_TAG_LE,
     "gt": _WHERE_TAG_GT,
     "ge": _WHERE_TAG_GE,
+    "prefix": _WHERE_TAG_PREFIX,
 }
 _WHERE_TAG_OPERATORS = {
     tag: operator for operator, tag in _WHERE_LEAF_OPERATORS.items()
@@ -1601,6 +1605,17 @@ def _check_json_threshold(value: Any) -> None:
         raise TypeError("threshold must be an int or a float")
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError("threshold must be a finite number")
+
+
+def _check_json_prefix(text: Any) -> None:
+    """Validate a find_where string-prefix leaf's prefix text.
+
+    Only a ``str`` is accepted — the prefix compares against the
+    addressed JSON string's exact characters (case-sensitive, no
+    Unicode normalization), so no other type is meaningful.
+    """
+    if not isinstance(text, str):
+        raise TypeError("prefix must be a string")
 
 
 def _parse_json_pointer(pointer: Any) -> tuple[str, ...]:
@@ -4048,6 +4063,35 @@ def _json_groups_find_range(
     return tuple(merged)
 
 
+def _json_groups_find_prefix(
+    groups: tuple[JsonSearchIndexGroup, ...], text: str
+) -> tuple[int, ...]:
+    """Merge every hit of a string-prefix condition over one pointer's groups.
+
+    Shared core of the ``prefix`` leaf of
+    :meth:`JsonMultiIndex.find_where`. Only the string kind takes part —
+    numbers, booleans, null, objects and arrays never satisfy a prefix
+    condition — and a bucket matches when the addressed JSON string
+    starts with ``text`` exactly: case-sensitive, with no Unicode
+    normalization. Because a bucket key is the string's exact UTF-8
+    encoding and a valid UTF-8 prefix never splits a code point,
+    comparing the encoded bytes is the same comparison. An empty prefix
+    therefore matches every string, the empty string included. The
+    matching buckets' hits merge in strictly ascending order; range
+    clipping is the caller's job.
+    """
+    key = text.encode("utf-8")
+    streams: list[tuple[int, ...]] = []
+    for group in groups:
+        if group.kind != _JSON_TAG_STRING:
+            continue
+        for bucket in group.buckets:
+            if bucket.key.startswith(key):
+                streams.append(bucket.hits)
+    merged = heapq.merge(*streams) if streams else ()
+    return tuple(merged)
+
+
 def _intersect_ascending_tuples(
     left: tuple[int, ...], right: tuple[int, ...]
 ) -> tuple[int, ...]:
@@ -4455,6 +4499,22 @@ class JsonMultiIndex:
                 ) from error
             _check_json_threshold(threshold)
             return (operator, position, threshold)
+        if operator == "prefix":
+            if len(expression) != 3:
+                raise ValueError(
+                    'a "prefix" node must have exactly three items'
+                )
+            _, pointer, text = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            _check_json_prefix(text)
+            return ("prefix", position, text)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4487,6 +4547,9 @@ class JsonMultiIndex:
             merged = _json_groups_find_range(
                 self.groups[node[1]], operator, node[2]
             )
+            return tuple(index for index in merged if start <= index < stop)
+        if operator == "prefix":
+            merged = _json_groups_find_prefix(self.groups[node[1]], node[2])
             return tuple(index for index in merged if start <= index < stop)
         if operator == "and":
             children = node[1]
@@ -4534,7 +4597,12 @@ class JsonMultiIndex:
         ``int`` or a finite ``float`` and the addressed JSON number
         compares against it by exact numeric value across the integer
         and float kinds — big integers never round to a nearby float and
-        negative zero equals positive zero. A combination is
+        negative zero equals positive zero. A string-prefix leaf is
+        ``("prefix", pointer, text)`` with the same pointer rules;
+        ``text`` must be a ``str`` and only an addressed JSON string
+        that starts with ``text`` matches — case-sensitive, with no
+        Unicode normalization — so an empty prefix matches every string,
+        the empty string included. A combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -4548,14 +4616,15 @@ class JsonMultiIndex:
         and bounds as :meth:`find`; an empty range yields ``()``.
 
         Non-JSON, encrypted, missing-field and non-scalar targets never
-        satisfy an ``eq`` leaf — a missing field is not ``null`` — and
+        satisfy an ``eq`` leaf — a missing field is not ``null`` —
         non-numeric targets (booleans, strings, null, objects and arrays)
-        never satisfy a numeric-comparison leaf, so all of them do
-        satisfy that leaf's negation, exactly as for :meth:`find`. A
+        never satisfy a numeric-comparison leaf, and non-string targets
+        never satisfy a ``prefix`` leaf, so all of them do satisfy that
+        leaf's negation, exactly as for :meth:`find`. A
         non-tuple node or ``children``, a non-string operator or pointer,
-        a value or threshold of another type, or a wrong-typed range
-        bound raises TypeError; an empty node, an unknown operator, a
-        node of the wrong length, a malformed or uncovered pointer, a
+        a value, threshold or prefix of another type, or a wrong-typed
+        range bound raises TypeError; an empty node, an unknown operator,
+        a node of the wrong length, a malformed or uncovered pointer, a
         non-finite float value or threshold, or an out-of-range or
         reversed range raises ValueError. The whole expression is
         validated before any lookup — a node's own errors before its
@@ -4686,8 +4755,9 @@ class SignedJsonMultiIndex:
         """Issue an offline completeness receipt for one find_where query.
 
         Runs the nested boolean query exactly like :meth:`find_where` —
-        ``expression`` is a tuple tree of ``("eq", pointer, value)`` and
-        ``("lt" | "le" | "gt" | "ge", pointer, threshold)`` leaves
+        ``expression`` is a tuple tree of ``("eq", pointer, value)``,
+        ``("lt" | "le" | "gt" | "ge", pointer, threshold)`` and
+        ``("prefix", pointer, text)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
         ``("not", child)`` nodes following the rules of :meth:`find_where`,
         the half-open ``[start, stop)`` range defaults to the whole
@@ -4841,8 +4911,9 @@ class WhereReceipt:
       whole index, so the receipt itself carries no new signature and
       the expression is not separately authenticated,
     - ``expression``: the find_where expression, a tuple tree of
-      ``("eq", pointer, value)`` and ``("lt" | "le" | "gt" | "ge",
-      pointer, threshold)`` leaves combined by ``("and", children)``,
+      ``("eq", pointer, value)``, ``("lt" | "le" | "gt" | "ge",
+      pointer, threshold)`` and ``("prefix", pointer, text)`` leaves
+      combined by ``("and", children)``,
       ``("or", children)`` and ``("not", child)`` nodes,
     - ``start`` / ``stop``: the resolved half-open query range within
       the bundled index's covered segment,
@@ -15543,7 +15614,8 @@ def encode_where_receipt(receipt: Any) -> bytes:
     (always 1), the ``bundle`` blob (the complete canonical output of
     :func:`encode_signed_json_multi_index`), the ``expression`` tree —
     per node a u64 operator tag, then for ``eq`` / ``lt`` / ``le`` /
-    ``gt`` / ``ge`` leaves the pointer UTF-8 blob and the scalar value
+    ``gt`` / ``ge`` / ``prefix`` leaves the pointer UTF-8 blob and the
+    scalar value
     (its kind tag plus its canonical value blob, preserving strings,
     arbitrary-precision integers, floats, booleans and null exactly),
     for ``and`` / ``or`` the child count and every child in order, and
@@ -15603,7 +15675,8 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
     in a pointer or string value, an unknown node or value tag, a
     non-canonical integer or float spelling, a non-finite float, a
     non-empty boolean/null value blob, a non-numeric comparison
-    threshold, a count that does not match its items, an illegal
+    threshold, a non-string prefix text,
+    a count that does not match its items, an illegal
     expression node or range (exactly as
     :meth:`JsonMultiIndex.find_where` reports them) and an out-of-range,
     duplicated or misordered hit all raise ValueError.
@@ -15654,7 +15727,12 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                 ) from error
             value_tag = read_u64(f"{position} value tag")
             key = read_blob(f"{position} value")
-            if tag != _WHERE_TAG_EQ and value_tag not in (
+            if tag == _WHERE_TAG_PREFIX:
+                if value_tag != _JSON_TAG_STRING:
+                    raise ValueError(
+                        'a "prefix" text must be a string'
+                    )
+            elif tag != _WHERE_TAG_EQ and value_tag not in (
                 _JSON_TAG_INTEGER,
                 _JSON_TAG_FLOAT,
             ):

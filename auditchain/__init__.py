@@ -651,16 +651,18 @@ _MULTI_QUERY_RECEIPT_VERSION = 1
 # the complete canonical encode_signed_json_multi_index bytes, the
 # expression tree (one node tag per node — leaves carry their pointer blob
 # and, except the value-less exists leaf, their scalar value exactly as a
-# find_all condition value does, and/or carry
+# find_all condition value does, the in leaf carries its candidate count
+# and every candidate scalar in order, and/or carry
 # a child count and their children in order, not carries its one child),
 # then start, stop and the ascending hit u64s.
 _WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
 _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
-# operators in their find_where spelling order, then the three combinations.
-# The string-prefix leaf and the field-existence leaf were appended after
-# them, so every tag an older encoding could carry keeps its value and old
-# receipts still decode and re-encode byte-identically.
+# operators in their find_where spelling order, then the three
+# combinations. The string-prefix leaf, the field-existence leaf and the
+# set-membership leaf were appended after them, so every tag an older
+# encoding could carry keeps its value and old receipts still decode and
+# re-encode byte-identically.
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -671,6 +673,7 @@ _WHERE_TAG_OR = 6
 _WHERE_TAG_NOT = 7
 _WHERE_TAG_PREFIX = 8
 _WHERE_TAG_EXISTS = 9
+_WHERE_TAG_IN = 10
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -4540,6 +4543,23 @@ class JsonMultiIndex:
                 ) from error
             _check_json_value(value)
             return ("eq", position, value)
+        if operator == "in":
+            if len(expression) != 3:
+                raise ValueError('an "in" node must have exactly three items')
+            _, pointer, values = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            if not isinstance(values, tuple):
+                raise TypeError('"in" values must be a tuple of scalars')
+            for value in values:
+                _check_json_value(value)
+            return ("in", position, values)
         if operator in ("lt", "le", "gt", "ge"):
             if len(expression) != 3:
                 raise ValueError(
@@ -4615,6 +4635,14 @@ class JsonMultiIndex:
         operator = node[0]
         if operator == "eq":
             merged = _json_groups_find_all(self.groups[node[1]], node[2])
+            return tuple(index for index in merged if start <= index < stop)
+        if operator == "in":
+            merged = _union_ascending_tuples(
+                tuple(
+                    _json_groups_find_all(self.groups[node[1]], value)
+                    for value in node[2]
+                )
+            )
             return tuple(index for index in merged if start <= index < stop)
         if operator in ("lt", "le", "gt", "ge"):
             merged = _json_groups_find_range(
@@ -4693,7 +4721,13 @@ class JsonMultiIndex:
         and ``value`` a JSON scalar (``str``, ``int``, finite ``float``,
         ``bool`` or ``None``) with the same kind-separated comparison —
         strings, booleans and null match only their own kind while ints
-        and floats compare by numeric value. A numeric-comparison leaf is
+        and floats compare by numeric value. A set-membership leaf is
+        ``("in", pointer, values)`` with the same pointer rules;
+        ``values`` is a tuple of candidate scalars, each following
+        exactly the ``eq`` value rules, and an entry matches when its
+        addressed scalar equals any one candidate — repeated candidates
+        never add duplicate hits and an empty candidate tuple matches
+        nothing. A numeric-comparison leaf is
         ``("lt", pointer, threshold)``, ``("le", pointer, threshold)``,
         ``("gt", pointer, threshold)`` or ``("ge", pointer, threshold)``
         with the same pointer rules; ``threshold`` must be a non-boolean
@@ -4728,7 +4762,8 @@ class JsonMultiIndex:
         and bounds as :meth:`find`; an empty range yields ``()``.
 
         Non-JSON, encrypted, missing-field and non-scalar targets never
-        satisfy an ``eq`` leaf — a missing field is not ``null`` — and
+        satisfy an ``eq`` or ``in`` leaf — a missing field is not
+        ``null`` — and
         non-numeric targets (booleans, strings, null, objects and arrays)
         never satisfy a numeric-comparison leaf, just as non-string
         targets never satisfy a ``prefix`` leaf, so all of them do
@@ -4739,13 +4774,19 @@ class JsonMultiIndex:
         negation. A
         non-tuple node or ``children``, a non-string operator or pointer,
         a value or threshold of another type, a non-string prefix text,
+        a non-tuple ``in`` candidate container or a candidate of another
+        type,
         or a wrong-typed range bound raises TypeError; an empty node, an
         unknown operator, a node of the wrong length, a malformed or
-        uncovered pointer, a non-finite float value or threshold, or an
+        uncovered pointer, a non-finite float value, threshold or ``in``
+        candidate, or an
         out-of-range or reversed range raises ValueError. The whole expression is
         validated before any lookup — a node's own errors before its
-        children's, children from left to right, the range last — so an
-        empty range or an already determined intermediate result never
+        children's, children from left to right, an ``in`` node's length
+        and pointer before its candidate container and each candidate in
+        order, the range last — so an
+        empty range, an empty candidate tuple or an already determined
+        intermediate result never
         masks an invalid branch. The lookup is read-only and never
         mutates the index.
         """
@@ -4872,6 +4913,7 @@ class SignedJsonMultiIndex:
 
         Runs the nested boolean query exactly like :meth:`find_where` —
         ``expression`` is a tuple tree of ``("eq", pointer, value)``,
+        ``("in", pointer, values)``,
         ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
         ``("prefix", pointer, text)`` and ``("exists", pointer)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
@@ -5027,7 +5069,8 @@ class WhereReceipt:
       whole index, so the receipt itself carries no new signature and
       the expression is not separately authenticated,
     - ``expression``: the find_where expression, a tuple tree of
-      ``("eq", pointer, value)``, ``("lt" | "le" | "gt" | "ge",
+      ``("eq", pointer, value)``, ``("in", pointer, values)``,
+      ``("lt" | "le" | "gt" | "ge",
       pointer, threshold)``, ``("prefix", pointer, text)`` and
       ``("exists", pointer)`` leaves
       combined by ``("and", children)``,
@@ -12277,7 +12320,8 @@ def verify_signed_where_receipt(bundle: Any, public_key: Any) -> bool:
     non-match returns False — all without raising. Because the signature
     binds the expression and the range, editing them keeps nothing: a
     swapped-in query whose complete result merely coincides with the
-    recorded hits, an equivalent expression with reordered branches or a
+    recorded hits, an equivalent expression with reordered branches or
+    reordered ``in`` candidates, or a
     scalar re-spelled with another type all fail against the original
     signature.
 
@@ -15892,7 +15936,9 @@ def _encode_where_expression(expression: tuple) -> bytes:
     leaf's text included — keep their
     UTF-8 bytes, integers their canonical ASCII decimal spelling at
     arbitrary precision, floats their canonical ``repr`` spelling —
-    negative zero included — and booleans/null the empty blob), an
+    negative zero included — and booleans/null the empty blob); an
+    ``in`` leaf carries its candidate count followed by every candidate
+    scalar in order, repetitions included, an
     ``and`` / ``or`` node carries its child count followed by every child
     in order, and a ``not`` node carries its one child. Assumes
     ``expression`` already passed
@@ -15904,6 +15950,16 @@ def _encode_where_expression(expression: tuple) -> bytes:
             _encode_u64(_WHERE_TAG_EXISTS, "expression tag"),
             _encode_blob(expression[1].encode("utf-8")),
         ))
+    if operator == "in":
+        values = expression[2]
+        parts = [
+            _encode_u64(_WHERE_TAG_IN, "expression tag"),
+            _encode_blob(expression[1].encode("utf-8")),
+            _encode_u64(len(values), "values count"),
+        ]
+        for value in values:
+            parts.append(_encode_where_scalar(value))
+        return b"".join(parts)
     if operator in _WHERE_LEAF_OPERATORS:
         return b"".join((
             _encode_u64(_WHERE_LEAF_OPERATORS[operator], "expression tag"),
@@ -15940,6 +15996,9 @@ def encode_where_receipt(receipt: Any) -> bytes:
     scalar value
     (its kind tag plus its canonical value blob, preserving strings,
     arbitrary-precision integers, floats, booleans and null exactly),
+    for ``in`` the pointer UTF-8 blob, the candidate count and every
+    candidate scalar in order (candidate order, repetitions, scalar
+    types and a float's negative zero preserved exactly),
     for ``exists`` the pointer UTF-8 blob alone,
     for ``and`` / ``or`` the child count and every child in order, and
     for ``not`` the one child — then ``start``, ``stop``, the hit count
@@ -15991,7 +16050,9 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
     :func:`decode_signed_json_multi_index`, so every nested framing and
     structural rule is hers), the expression tree (per node a u64
     operator tag; a leaf's pointer blob, value tag and value blob — an
-    ``exists`` leaf carries its pointer blob alone; an
+    ``exists`` leaf carries its pointer blob alone; an ``in`` leaf
+    carries its pointer blob, its candidate count and exactly that many
+    candidate scalars in order; an
     ``and`` / ``or`` child count with exactly that many children; a
     ``not`` with exactly one child), ``start``, ``stop``, the hit count
     and one u64 per hit, with no trailing bytes. A bad magic or version,
@@ -16007,7 +16068,8 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
 
     The returned object is a frozen :class:`WhereReceipt` whose fields
     equal the originally encoded ones — nested structure, child order,
-    repeated branches, scalar types and arbitrary-precision integers
+    repeated branches, ``in`` candidate order and repetitions, scalar
+    types and arbitrary-precision integers
     included — and re-encoding reproduces the original bytes exactly. A
     structurally sound receipt whose claim simply does not verify still
     decodes; :func:`verify_where_receipt` reports False. The call is
@@ -16049,6 +16111,21 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                     f"{position} pointer is not valid UTF-8"
                 ) from error
             return ("exists", pointer)
+        if tag == _WHERE_TAG_IN:
+            raw_pointer = read_blob(f"{position} pointer")
+            try:
+                pointer = raw_pointer.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} pointer is not valid UTF-8"
+                ) from error
+            value_count = read_u64(f"{position} values count")
+            values: list[Any] = []
+            for index in range(value_count):
+                value_tag = read_u64(f"{position} value {index} tag")
+                key = read_blob(f"{position} value {index}")
+                values.append(_decode_json_condition_value(value_tag, key))
+            return ("in", pointer, tuple(values))
         if tag in _WHERE_TAG_OPERATORS:
             operator = _WHERE_TAG_OPERATORS[tag]
             raw_pointer = read_blob(f"{position} pointer")

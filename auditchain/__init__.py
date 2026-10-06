@@ -20,6 +20,7 @@ SignedFullSearchReceipt /
 RangeSearchReceipt /
 SignedRangeSearchReceipt /
 SignedSearchReceipt /
+SignedWhereReceipt /
 SignedAuthAuditBundle /
 SignedConsistency / SignedPrune / RetentionTransition /
 IntegrityIssue / IntegrityReport /
@@ -46,6 +47,7 @@ verify_full_search_receipt /
 verify_range_search_receipt /
 verify_json_search_receipt /
 verify_signed_range_search_receipt /
+sign_where_receipt / verify_signed_where_receipt /
 inspect_full_search_receipt /
 inspect_full_encrypted_search_receipt /
 inspect_search_receipt /
@@ -80,6 +82,7 @@ encode_full_search_receipt / decode_full_search_receipt /
 encode_range_search_receipt / decode_range_search_receipt /
 encode_signed_range_search_receipt /
 decode_signed_range_search_receipt /
+encode_signed_where_receipt / decode_signed_where_receipt /
 encode_prune_receipt / decode_prune_receipt /
 encode_audit_batch / decode_audit_batch /
 encode_batch_inclusion_proof / decode_batch_inclusion_proof /
@@ -217,6 +220,7 @@ __all__ = [
     "SignedStageAuthAuditContinuation",
     "SignedStageVerifier",
     "SignedVerifier",
+    "SignedWhereReceipt",
     "StageAnchoredContinuationChain",
     "StageAnchorSet",
     "StageVerifier",
@@ -273,6 +277,7 @@ __all__ = [
     "decode_signed_stage_auth_bundle",
     "decode_signed_stage_verifier",
     "decode_signed_verifier",
+    "decode_signed_where_receipt",
     "decode_stage_anchored_continuations",
     "decode_stage_anchor_set",
     "decode_stage_continuations",
@@ -344,6 +349,7 @@ __all__ = [
     "encode_signed_stage_auth_bundle",
     "encode_signed_stage_verifier",
     "encode_signed_verifier",
+    "encode_signed_where_receipt",
     "encode_stage_anchored_continuations",
     "encode_stage_anchor_set",
     "encode_stage_continuations",
@@ -392,6 +398,7 @@ __all__ = [
     "merge_stage_anchor_set",
     "merge_stage_rotated_anchor_set",
     "rebuild_merkle_root",
+    "sign_where_receipt",
     "verify_audit_receipt",
     "verify_audit_batch",
     "verify_auth",
@@ -438,6 +445,7 @@ __all__ = [
     "verify_signed_stage_auth_audit_continuation",
     "verify_signed_stage_verifier",
     "verify_signed_verifier",
+    "verify_signed_where_receipt",
     "verify_stage_continuation_chain",
     "verify_stage_rotated_chain",
     "verify_where_receipt",
@@ -677,6 +685,20 @@ _WHERE_LEAF_OPERATORS = {
 _WHERE_TAG_OPERATORS = {
     tag: operator for operator, tag in _WHERE_LEAF_OPERATORS.items()
 }
+# Trusted query receipt of sign_where_receipt /
+# verify_signed_where_receipt: a WhereReceipt sealed by one more Ed25519
+# signature over a domain-separated message embedding the receipt's whole
+# canonical encoding, so the signature binds the nested signed index, the
+# whole find_where expression tree (operators, pointers, scalar values and
+# branch order), the resolved range and the claimed hit tuple — unlike the
+# bare receipt, whose expression and range are not separately
+# authenticated. The binary framing of encode_signed_where_receipt /
+# decode_signed_where_receipt is the usual signed-envelope one: a fixed
+# magic, the envelope version as a u64, a u64-length-prefixed blob holding
+# the complete canonical encode_where_receipt bytes, then the raw 64-byte
+# signature.
+_SIGNED_WHERE_RECEIPT_MAGIC = b"auditchain/signed-where-receipt/v1\0"
+_SIGNED_WHERE_RECEIPT_VERSION = 1
 # Binary framing of encode_audit_batch / decode_audit_batch: same u64/blob
 # rules, one shared proof at the end instead of one proof per item.
 _BATCH_MAGIC = b"auditchain/batch/v1\0"
@@ -1284,6 +1306,24 @@ def _signed_range_search_message(receipt_blob: bytes) -> bytes:
     """
     return (
         _SIGNED_RANGE_SEARCH_MAGIC
+        + bytes((0x01,))
+        + _encode_blob(receipt_blob)
+    )
+
+
+def _signed_where_receipt_message(receipt_blob: bytes) -> bytes:
+    """M of sign_where_receipt / verify_signed_where_receipt.
+
+    ``D || 0x01 || B(receipt_blob)`` with
+    ``D = b"auditchain/signed-where-receipt/v1\\0"`` and
+    ``B(x) = U(len(x)) || x``; ``receipt_blob`` is the complete canonical
+    output of :func:`encode_where_receipt`, so the signature binds every
+    field of the receipt — the nested signed index, the whole find_where
+    expression tree with its branch order, the resolved range and the
+    complete hit tuple.
+    """
+    return (
+        _SIGNED_WHERE_RECEIPT_MAGIC
         + bytes((0x01,))
         + _encode_blob(receipt_blob)
     )
@@ -5071,6 +5111,52 @@ class WhereReceipt:
                     "hits must be strictly ascending with no duplicates"
                 )
             previous = hit
+
+
+@dataclass(frozen=True)
+class SignedWhereReceipt:
+    """Boolean-query completeness receipt sealed by a pre-trusted Ed25519 key.
+
+    Bundles a :class:`WhereReceipt` with a 64-byte Ed25519 signature over a
+    domain-separated message embedding the receipt's whole canonical
+    encoding (:func:`encode_where_receipt`), so the signature binds every
+    receipt field — the nested signed index, the whole find_where
+    expression tree (operators, pointers, scalar values and branch order),
+    the resolved half-open range and the claimed complete hit tuple.
+    Unlike a bare :class:`WhereReceipt`, whose expression and range are not
+    separately authenticated, an offline receiver holding only a
+    pre-trusted 32-byte Ed25519 public key confirms with
+    :func:`verify_signed_where_receipt` that this exact query and its
+    result were sealed together by the log holder: editing the expression,
+    swapping equivalent branches, changing a scalar's type or shifting the
+    range invalidates the signature even when the declared hits stay the
+    same.
+
+    - ``receipt``: the :class:`WhereReceipt` produced by
+      :meth:`SignedJsonMultiIndex.where_receipt`,
+    - ``signature``: the 64-byte Ed25519 signature over
+      ``D || 0x01 || B(encode_where_receipt(receipt))`` with
+      ``D = b"auditchain/signed-where-receipt/v1\\0"``.
+
+    Instances are immutable, may be built positionally and compare by both
+    fields. ``receipt`` must be a :class:`WhereReceipt` and ``signature``
+    exact 64-byte ``bytes`` — wrong field types raise TypeError and a
+    wrong signature width ValueError. Whether the signature is genuine is
+    left to :func:`verify_signed_where_receipt`.
+    """
+
+    receipt: WhereReceipt
+    signature: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, WhereReceipt):
+            raise TypeError("receipt must be a WhereReceipt")
+        if not isinstance(self.signature, bytes):
+            raise TypeError("signature must be bytes")
+        if len(self.signature) != _ED25519_SIGNATURE_BYTES:
+            raise ValueError(
+                f"signature must be {_ED25519_SIGNATURE_BYTES} bytes"
+            )
 
 
 @dataclass(frozen=True)
@@ -12070,6 +12156,118 @@ def verify_where_receipt(receipt: Any, public_key: Any) -> bool:
     return expected == checked.hits
 
 
+def sign_where_receipt(receipt: Any, private_key: Any) -> SignedWhereReceipt:
+    """Seal a :class:`WhereReceipt` with a pre-trusted Ed25519 key.
+
+    Signs one Ed25519 signature over a domain-separated message embedding
+    the receipt's whole canonical encoding (``D || 0x01 ||
+    B(encode_where_receipt(receipt))`` with
+    ``D = b"auditchain/signed-where-receipt/v1\\0"``) and bundles it with
+    the receipt as one immutable :class:`SignedWhereReceipt`. The
+    signature therefore binds everything the bare receipt leaves
+    unauthenticated — the nested signed index, the whole find_where
+    expression tree (operators, pointers, scalar values and branch
+    order), the resolved range and the claimed complete hit tuple — so an
+    offline receiver holding only the pre-trusted 32-byte public key
+    confirms with :func:`verify_signed_where_receipt` that this exact
+    query and its result were sealed together, with no :class:`AuditLog`
+    and no further key material.
+
+    ``receipt`` must be a :class:`WhereReceipt` (anything else raises
+    TypeError) and is re-validated exactly as its constructor would, so an
+    instance whose frozen fields were bypassed into an illegal shape
+    raises the same TypeError or ValueError; ``private_key`` must be a
+    32-byte Ed25519 seed (non-``bytes`` raises TypeError, a wrong length
+    ValueError). Signing checks structure only: a structurally valid
+    receipt whose claim is false signs just as well — whether the content
+    is genuine is established by :func:`verify_signed_where_receipt`, not
+    by the signature's existence. The call is read-only and deterministic:
+    the same receipt and seed yield byte-for-byte the same bundle, and any
+    failure raises before the bundle is constructed, leaving all state
+    unchanged.
+    """
+    if not isinstance(receipt, WhereReceipt):
+        raise TypeError("receipt must be a WhereReceipt")
+    # Re-validate the whole receipt structure exactly as the constructor
+    # would, so a bypassed field raises the same TypeError or ValueError
+    # rather than being sealed into a signed bundle.
+    checked = WhereReceipt(
+        receipt.bundle,
+        receipt.expression,
+        receipt.start,
+        receipt.stop,
+        receipt.hits,
+    )
+    signing_key = _load_ed25519_seed(private_key)
+    message = _signed_where_receipt_message(encode_where_receipt(checked))
+    signature = signing_key.sign(message)
+    return SignedWhereReceipt(receipt=checked, signature=signature)
+
+
+def verify_signed_where_receipt(bundle: Any, public_key: Any) -> bool:
+    """Verify a :class:`SignedWhereReceipt` against a pre-trusted key.
+
+    Confirms every layer of the sealed claim offline, with no
+    :class:`AuditLog`: :func:`verify_signed_json_multi_index` re-checks
+    the bundled index's whole evidence (every covered entry digest, the
+    shared batch inclusion proof against the snapshot root, the chain head
+    and every pointer's complete hit-bucket partition) together with its
+    Ed25519 signature under the 32-byte ``public_key``; the receipt's
+    ``hits`` are compared against the complete result of re-evaluating the
+    receipt's ``expression`` over the authenticated index within
+    ``[start, stop)``; and the bundle's own 64-byte Ed25519 signature is
+    checked with the same ``public_key`` over the domain-separated message
+    embedding the whole canonical receipt encoding — so it binds the
+    nested index, the expression tree with its branch order, the range and
+    the hit tuple. Only when all three hold does the call return True. A
+    structurally valid bundle signed by another key at either layer, whose
+    index evidence or hit claim does not match, or whose expression,
+    range, scalar types or branch order were edited after signing — even
+    when the edited query still yields exactly the declared hits — returns
+    False, all without raising.
+
+    Input that is not a :class:`SignedWhereReceipt` (or whose container
+    fields have been bypassed to wrong types) raises TypeError; nested
+    structural violations raise exactly the exceptions of
+    :class:`WhereReceipt` and :func:`verify_where_receipt` (TypeError or
+    ValueError), and a public key that is not 32 ``bytes`` raises
+    ValueError (a non-``bytes`` key TypeError). Every structural rule is
+    re-validated before any signature check, so a signature mismatch never
+    masks a structural error. The call is read-only and never mutates the
+    bundle.
+    """
+    if not isinstance(bundle, SignedWhereReceipt):
+        raise TypeError("bundle must be a SignedWhereReceipt")
+    # Re-validate the container fields even for an instance whose fields
+    # were set bypassing the frozen constructor, so container-type
+    # corruption raises TypeError exactly as the constructor would.
+    checked = SignedWhereReceipt(bundle.receipt, bundle.signature)
+    # Re-validate the nested receipt as its own constructor would, so a
+    # bypassed field raises exactly the constructor's TypeError or
+    # ValueError rather than being reported as False.
+    receipt = WhereReceipt(
+        checked.receipt.bundle,
+        checked.receipt.expression,
+        checked.receipt.start,
+        checked.receipt.stop,
+        checked.receipt.hits,
+    )
+    verification_key = _load_ed25519_public(public_key)
+    if not verify_signed_json_multi_index(receipt.bundle, public_key):
+        return False
+    expected = receipt.bundle.find_where(
+        receipt.expression, receipt.start, receipt.stop
+    )
+    if expected != receipt.hits:
+        return False
+    message = _signed_where_receipt_message(encode_where_receipt(receipt))
+    try:
+        verification_key.verify(checked.signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
 def verify_signed_range_search_receipt(bundle: Any, public_key: Any) -> bool:
     """Verify a :class:`SignedRangeSearchReceipt` against a pre-trusted key.
     Confirms both claims of the sealed bundle without holding the log:
@@ -15909,6 +16107,106 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
         stop=stop,
         hits=hits,
     )
+
+
+def encode_signed_where_receipt(bundle: Any) -> bytes:
+    """Encode a :class:`SignedWhereReceipt` into canonical bytes.
+
+    The encoding starts with the magic
+    ``b"auditchain/signed-where-receipt/v1\\0"``; it then writes, strictly
+    in order, the envelope ``version`` (always 1) as an unsigned 8-byte
+    big-endian integer, the receipt blob and the raw 64-byte Ed25519
+    signature — nothing may be omitted, reordered or appended. The receipt
+    blob is a u64 byte length followed by the complete canonical output of
+    :func:`encode_where_receipt` over ``bundle.receipt``; the signature
+    follows verbatim. The signed message embeds exactly those receipt
+    bytes, so no new signing message is introduced beyond the
+    signed-where-receipt domain separator.
+
+    ``bundle`` must be a :class:`SignedWhereReceipt` — anything else, or a
+    bundle whose container fields have been bypassed to wrong types,
+    raises TypeError; nested structural problems raise exactly the
+    exceptions of :func:`encode_where_receipt` (TypeError or ValueError),
+    and a signature that is not 64 bytes raises ValueError. Encoding is
+    deterministic: re-encoding a decoded bundle reproduces the original
+    bytes exactly, and a structurally valid bundle whose signature does
+    not verify encodes just as well.
+    """
+    if not isinstance(bundle, SignedWhereReceipt):
+        raise TypeError("bundle must be a SignedWhereReceipt")
+    # Re-validate the container even for an instance whose fields were set
+    # bypassing the frozen constructor, so container-type corruption raises
+    # TypeError exactly as the constructor would.
+    checked = SignedWhereReceipt(bundle.receipt, bundle.signature)
+    receipt_blob = encode_where_receipt(checked.receipt)
+    return b"".join((
+        _SIGNED_WHERE_RECEIPT_MAGIC,
+        _encode_u64(_SIGNED_WHERE_RECEIPT_VERSION, "version"),
+        _encode_blob(receipt_blob),
+        checked.signature,
+    ))
+
+
+def decode_signed_where_receipt(data: Any) -> SignedWhereReceipt:
+    """Decode bytes produced by :func:`encode_signed_where_receipt`.
+
+    ``data`` must be ``bytes`` (anything else, including ``bytearray`` and
+    ``memoryview``, raises TypeError). After the magic
+    ``b"auditchain/signed-where-receipt/v1\\0"`` it must contain, strictly
+    in order, the u64 envelope version (only ``1`` is supported), one
+    length-prefixed receipt blob and exactly 64 raw signature bytes, with
+    no trailing bytes. The receipt blob is handed whole to
+    :func:`decode_where_receipt`, so every nested framing and structural
+    rule is hers. A bad magic or version, truncation, an oversized blob
+    length, trailing bytes, a signature that is not 64 bytes or an illegal
+    nested encoding all raise ValueError.
+
+    The returned object is a frozen :class:`SignedWhereReceipt` whose
+    fields equal the originally encoded ones, and re-encoding reproduces
+    the original bytes exactly. A structurally sound encoding whose
+    signature simply does not verify still decodes;
+    :func:`verify_signed_where_receipt` reports False.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    if not data.startswith(_SIGNED_WHERE_RECEIPT_MAGIC):
+        raise ValueError("not an auditchain signed-where-receipt encoding")
+    offset = len(_SIGNED_WHERE_RECEIPT_MAGIC)
+
+    def read_u64(name: str) -> int:
+        nonlocal offset
+        end = offset + _U64_BYTES
+        if end > len(data):
+            raise ValueError(f"truncated encoding: expected 8 bytes for {name}")
+        value = int.from_bytes(data[offset:end], "big")
+        offset = end
+        return value
+
+    def read_blob(name: str) -> bytes:
+        nonlocal offset
+        length = read_u64(f"{name} length")
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"truncated encoding: {name} is {length} bytes")
+        blob = data[offset:end]
+        offset = end
+        return blob
+
+    version = read_u64("version")
+    if version != _SIGNED_WHERE_RECEIPT_VERSION:
+        raise ValueError(
+            f"unsupported signed-where-receipt version {version}"
+        )
+    receipt_blob = read_blob("receipt")
+    signature_end = offset + _ED25519_SIGNATURE_BYTES
+    if signature_end > len(data):
+        raise ValueError("truncated encoding: expected 64 bytes for signature")
+    signature = data[offset:signature_end]
+    offset = signature_end
+    if offset != len(data):
+        raise ValueError("trailing bytes after the signed where receipt")
+    receipt = decode_where_receipt(receipt_blob)
+    return SignedWhereReceipt(receipt=receipt, signature=signature)
 
 
 def encode_prune_receipt(receipt: Any) -> bytes:

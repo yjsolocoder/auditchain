@@ -644,17 +644,18 @@ _MULTI_QUERY_RECEIPT_VERSION = 1
 # encode_where_receipt / decode_where_receipt is the usual one: a fixed
 # magic, the envelope version as a u64, a u64-length-prefixed blob holding
 # the complete canonical encode_signed_json_multi_index bytes, the
-# expression tree (one node tag per node — leaves carry their pointer blob
-# and scalar value exactly as a find_all condition value does, and/or carry
-# a child count and their children in order, not carries its one child),
+# expression tree (one node tag per node — eq/comparison/prefix leaves carry
+# their pointer blob and scalar value exactly as a find_all condition value
+# does, an exists leaf carries only its pointer blob, and/or carry a child
+# count and their children in order, not carries its one child),
 # then start, stop and the ascending hit u64s.
 _WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
 _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
 # operators in their find_where spelling order, then the three combinations.
-# The string-prefix leaf was appended after them, so every tag an older
-# encoding could carry keeps its value and old receipts still decode and
-# re-encode byte-identically.
+# The string-prefix leaf and later the field-existence leaf were appended
+# after them, so every tag an older encoding could carry keeps its value and
+# old receipts still decode and re-encode byte-identically.
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -664,6 +665,7 @@ _WHERE_TAG_AND = 5
 _WHERE_TAG_OR = 6
 _WHERE_TAG_NOT = 7
 _WHERE_TAG_PREFIX = 8
+_WHERE_TAG_EXISTS = 9
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -1723,6 +1725,42 @@ def _json_pointer_resolve(document: Any, tokens: tuple[str, ...]) -> Any:
     return _JSON_MISSING
 
 
+def _json_pointer_resolves(document: Any, tokens: tuple[str, ...]) -> bool:
+    """Whether parsed pointer tokens locate any value in a parsed document.
+
+    The field-existence counterpart of :func:`_json_pointer_resolve` with
+    exactly the same traversal rules — a missing member/element, traversal
+    through a non-container, or an array token that is non-numeric (``-``
+    included), has leading zeroes or is out of range does not resolve —
+    except that *any* addressed value counts: null, a scalar, an object and
+    an array (the empty ones included) all exist, and the empty token tuple
+    locates the whole document.
+    """
+    current = document
+    for token in tokens:
+        if isinstance(current, dict):
+            if token not in current:
+                return False
+            current = current[token]
+        elif isinstance(current, list):
+            # "-" addresses the nonexistent append position; array tokens
+            # are plain decimal indices with no leading zeroes (RFC 6901).
+            if (
+                not token
+                or token == "-"
+                or any(char not in "0123456789" for char in token)
+                or (len(token) > 1 and token[0] == "0")
+            ):
+                return False
+            index = int(token)
+            if index >= len(current):
+                return False
+            current = current[index]
+        else:
+            return False
+    return True
+
+
 def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
     """Resolve parsed pointer tokens against strict UTF-8 JSON bytes.
 
@@ -1781,6 +1819,24 @@ def _json_entry_scalar(payload: bytes, tokens: tuple[str, ...]) -> Any:
     if payload.startswith(_ENC_MAGIC):
         return _JSON_MISSING
     return _json_scalar_at(payload, tokens)
+
+
+def _json_entry_exists(payload: bytes, tokens: tuple[str, ...]) -> bool:
+    """Whether one stored payload holds any value at the pointer's path.
+
+    The field-existence counterpart of :func:`_json_entry_scalar` with the
+    same resolution rules — an AES-256-GCM envelope is never parsed, and
+    invalid UTF-8, invalid JSON or a repeated object member name counts as
+    missing without raising — except that a resolved value of any JSON kind
+    (null, scalar, object or array) exists; the empty token tuple locates
+    every strictly valid document.
+    """
+    if payload.startswith(_ENC_MAGIC):
+        return False
+    document = _strict_json_document(payload)
+    if document is _JSON_MISSING:
+        return False
+    return _json_pointer_resolves(document, tokens)
 
 
 def _encrypted_json_entry_matches(
@@ -4502,6 +4558,21 @@ class JsonMultiIndex:
             if not isinstance(text, str):
                 raise TypeError("prefix text must be a string")
             return ("prefix", position, text)
+        if operator == "exists":
+            if len(expression) != 2:
+                raise ValueError(
+                    'an "exists" node must have exactly two items'
+                )
+            _, pointer = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            return ("exists", position)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4538,6 +4609,18 @@ class JsonMultiIndex:
         if operator == "prefix":
             merged = _json_groups_find_prefix(self.groups[node[1]], node[2])
             return tuple(index for index in merged if start <= index < stop)
+        if operator == "exists":
+            # The frozen groups record scalars only, so existence of any
+            # JSON value (null, object and array included) is re-resolved
+            # from the authenticated entries themselves; items are stored
+            # in strictly ascending index order, so the hits stay sorted.
+            tokens = _parse_json_pointer(self.pointers[node[1]])
+            return tuple(
+                entry.index
+                for entry in self.items
+                if start <= entry.index < stop
+                and _json_entry_exists(entry.payload, tokens)
+            )
         if operator == "and":
             children = node[1]
             if not children:
@@ -4589,7 +4672,15 @@ class JsonMultiIndex:
         ``text`` must be a ``str`` and only an addressed JSON string
         that starts with it matches — case-sensitively and without any
         Unicode normalization — so the empty prefix matches every
-        string, the empty string included. A combination is
+        string, the empty string included. A field-existence leaf is
+        ``("exists", pointer)`` with the same pointer rules; an entry
+        matches when the pointer locates *any* JSON value in its
+        document — null, a scalar, an object or an array (the empty
+        ones included) — so the empty pointer matches every strictly
+        valid JSON document, while a missing member/element, traversal
+        through a scalar, or an array token that is non-numeric (``-``
+        included), has leading zeroes or is out of range does not. A
+        combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -4607,7 +4698,11 @@ class JsonMultiIndex:
         non-numeric targets (booleans, strings, null, objects and arrays)
         never satisfy a numeric-comparison leaf, just as non-string
         targets never satisfy a ``prefix`` leaf, so all of them do
-        satisfy that leaf's negation, exactly as for :meth:`find`. A
+        satisfy that leaf's negation, exactly as for :meth:`find`.
+        Non-JSON and encrypted payloads likewise never satisfy an
+        ``exists`` leaf — and here a missing field and an explicit
+        ``null`` differ: the null exists and hits the leaf, the missing
+        field does not and hits only its negation. A
         non-tuple node or ``children``, a non-string operator or pointer,
         a value or threshold of another type, a non-string prefix text,
         or a wrong-typed range bound raises TypeError; an empty node, an
@@ -4743,8 +4838,8 @@ class SignedJsonMultiIndex:
 
         Runs the nested boolean query exactly like :meth:`find_where` —
         ``expression`` is a tuple tree of ``("eq", pointer, value)``,
-        ``("lt" | "le" | "gt" | "ge", pointer, threshold)`` and
-        ``("prefix", pointer, text)`` leaves
+        ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
+        ``("prefix", pointer, text)`` and ``("exists", pointer)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
         ``("not", child)`` nodes following the rules of :meth:`find_where`,
         the half-open ``[start, stop)`` range defaults to the whole
@@ -4899,7 +4994,8 @@ class WhereReceipt:
       the expression is not separately authenticated,
     - ``expression``: the find_where expression, a tuple tree of
       ``("eq", pointer, value)``, ``("lt" | "le" | "gt" | "ge",
-      pointer, threshold)`` and ``("prefix", pointer, text)`` leaves
+      pointer, threshold)``, ``("prefix", pointer, text)`` and
+      ``("exists", pointer)`` leaves
       combined by ``("and", children)``,
       ``("or", children)`` and ``("not", child)`` nodes,
     - ``start`` / ``stop``: the resolved half-open query range within
@@ -15557,13 +15653,15 @@ def _encode_where_scalar(value: Any) -> bytes:
 def _encode_where_expression(expression: tuple) -> bytes:
     """Encode one validated find_where expression node deterministically.
 
-    Writes the node's operator tag as a u64; a leaf then carries its
+    Writes the node's operator tag as a u64; an ``eq`` / comparison /
+    ``prefix`` leaf then carries its
     pointer UTF-8 blob and its scalar value exactly as
     :func:`_encode_where_scalar` writes it (so strings — a ``prefix``
     leaf's text included — keep their
     UTF-8 bytes, integers their canonical ASCII decimal spelling at
     arbitrary precision, floats their canonical ``repr`` spelling —
     negative zero included — and booleans/null the empty blob), an
+    ``exists`` leaf carries only its pointer UTF-8 blob, an
     ``and`` / ``or`` node carries its child count followed by every child
     in order, and a ``not`` node carries its one child. Assumes
     ``expression`` already passed
@@ -15576,6 +15674,10 @@ def _encode_where_expression(expression: tuple) -> bytes:
             _encode_blob(expression[1].encode("utf-8")),
             _encode_where_scalar(expression[2]),
         ))
+    if operator == "exists":
+        return _encode_u64(_WHERE_TAG_EXISTS, "expression tag") + _encode_blob(
+            expression[1].encode("utf-8")
+        )
     if operator == "and" or operator == "or":
         tag = _WHERE_TAG_AND if operator == "and" else _WHERE_TAG_OR
         children = expression[1]
@@ -15606,6 +15708,7 @@ def encode_where_receipt(receipt: Any) -> bytes:
     scalar value
     (its kind tag plus its canonical value blob, preserving strings,
     arbitrary-precision integers, floats, booleans and null exactly),
+    for ``exists`` leaves only the pointer UTF-8 blob,
     for ``and`` / ``or`` the child count and every child in order, and
     for ``not`` the one child — then ``start``, ``stop``, the hit count
     and one u64 per strictly ascending hit, with nothing omitted,
@@ -15655,7 +15758,8 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
     length-prefixed signed-index bundle blob (handed whole to
     :func:`decode_signed_json_multi_index`, so every nested framing and
     structural rule is hers), the expression tree (per node a u64
-    operator tag; a leaf's pointer blob, value tag and value blob; an
+    operator tag; an ``eq`` / comparison / ``prefix`` leaf's pointer
+    blob, value tag and value blob; an ``exists`` leaf's pointer blob; an
     ``and`` / ``or`` child count with exactly that many children; a
     ``not`` with exactly one child), ``start``, ``stop``, the hit count
     and one u64 per hit, with no trailing bytes. A bad magic or version,
@@ -15704,6 +15808,15 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
 
     def read_expression(position: str) -> tuple:
         tag = read_u64(f"{position} tag")
+        if tag == _WHERE_TAG_EXISTS:
+            raw_pointer = read_blob(f"{position} pointer")
+            try:
+                pointer = raw_pointer.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} pointer is not valid UTF-8"
+                ) from error
+            return ("exists", pointer)
         if tag in _WHERE_TAG_OPERATORS:
             operator = _WHERE_TAG_OPERATORS[tag]
             raw_pointer = read_blob(f"{position} pointer")

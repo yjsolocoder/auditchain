@@ -68,7 +68,7 @@ verify_signed_audit_batch / verify_signed_audit_receipt /
 verify_signed_search_receipt /
 verify_signed_full_search_receipt /
 verify_signed_consistency / verify_signed_prune /
-verify_retention_chain /
+verify_retention_chain / inspect_retention_chain /
 verify_rotation /
 verify_rotation_chain /
 encode_audit_receipt / decode_audit_receipt /
@@ -187,6 +187,7 @@ __all__ = [
     "PrefixSearchReceipt",
     "PruneReceipt",
     "RangeSearchReceipt",
+    "RetentionReport",
     "RetentionTransition",
     "RotatedAnchorSet",
     "RotatedChain",
@@ -365,6 +366,7 @@ __all__ = [
     "inspect_encrypted_search_receipt",
     "inspect_full_encrypted_search_receipt",
     "inspect_full_search_receipt",
+    "inspect_retention_chain",
     "inspect_rotated_anchors",
     "inspect_rotated_chain",
     "inspect_rotation_chain",
@@ -18617,6 +18619,309 @@ def verify_retention_chain(
             return False
         expected = end
     return True
+
+
+# Diagnostic codes of inspect_retention_chain, each pinpointing the first
+# retention step — or the chain-level checkpoint — at which a signed
+# retention evolution fails to verify: "initial" — the initial checkpoint
+# fails verify_signed_root against the pre-trusted key (no step position);
+# "link" — the step's before checkpoint does not equal the previous step's
+# end checkpoint (or, for the first step, the initial checkpoint) on every
+# field; "before" — the step's before checkpoint signature does not verify
+# against the pre-trusted key; "prune" — the step's prune authorization
+# fails verify_signed_prune; "consistency" — the step's consistency
+# credential fails verify_signed_consistency, including a proof whose node
+# count does not match its two snapshot sizes; "binding" — the three
+# credentials each verify on their own yet do not bind the same pair of
+# checkpoints, or a checkpoint or receipt names a different hash algorithm
+# than the initial checkpoint; "growth" — the end boundary does not strictly
+# exceed the before boundary; "end" — the whole chain verifies but the
+# expected_end checkpoint does not verify against the pre-trusted key or
+# does not equal the chain's actual end checkpoint on every field.
+_RETENTION_CODE_INITIAL = "initial"
+_RETENTION_CODE_LINK = "link"
+_RETENTION_CODE_BEFORE = "before"
+_RETENTION_CODE_PRUNE = "prune"
+_RETENTION_CODE_CONSISTENCY = "consistency"
+_RETENTION_CODE_BINDING = "binding"
+_RETENTION_CODE_GROWTH = "growth"
+_RETENTION_CODE_END = "end"
+_RETENTION_CODES = frozenset(
+    {
+        _RETENTION_CODE_INITIAL,
+        _RETENTION_CODE_LINK,
+        _RETENTION_CODE_BEFORE,
+        _RETENTION_CODE_PRUNE,
+        _RETENTION_CODE_CONSISTENCY,
+        _RETENTION_CODE_BINDING,
+        _RETENTION_CODE_GROWTH,
+        _RETENTION_CODE_END,
+    }
+)
+
+
+@dataclass(frozen=True)
+class RetentionReport:
+    """Result of :func:`inspect_retention_chain`.
+
+    A read-only diagnosis of an offline chain of :class:`RetentionTransition`
+    steps, locating the **first** step — or the chain-level checkpoint — at
+    which the evolution fails to verify; only the earliest problem is ever
+    reported:
+
+    - ``ok``: the single source of truth, ``True`` exactly when every step
+      verifies against the pre-trusted key, adjacent steps join on equal
+      checkpoints, every boundary strictly grows and — when an
+      ``expected_end`` was supplied — the chain's actual end checkpoint
+      equals it on every field;
+    - ``index``: the zero-based tuple position of the failing step for
+      ``"link"``, ``"before"``, ``"prune"``, ``"consistency"``, ``"binding"``
+      and ``"growth"``; the position of the last step for ``"end"`` (``None``
+      when the chain is empty, its actual end being the initial checkpoint);
+      ``None`` for ``"initial"``, which blames no step; ``None`` exactly
+      when ``ok`` is ``True``;
+    - ``code``: one of ``"initial"``, ``"link"``, ``"before"``, ``"prune"``,
+      ``"consistency"``, ``"binding"``, ``"growth"`` or ``"end"`` describing
+      that first failure; ``None`` exactly when ``ok`` is ``True``.
+
+    Reports are immutable, may be built positionally and compare by all three
+    fields. The success report is ``RetentionReport(True, None, None)``. A
+    non-bool ``ok``, a non-string ``code`` or a ``bool`` / non-integer
+    ``index`` raises TypeError; an unknown code string, a successful report
+    carrying a code or index, a failed report missing its code, a negative
+    index, an ``"initial"`` code carrying a position, or a step code other
+    than ``"end"`` carrying no position raises ValueError.
+    """
+
+    ok: bool
+    index: int | None
+    code: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ok, bool):
+            raise TypeError("ok must be a bool")
+        if self.ok:
+            if self.index is not None or self.code is not None:
+                raise ValueError(
+                    "a successful report must carry index None and code None"
+                )
+            return
+        if self.code is None:
+            raise ValueError("a failed report must carry a code")
+        if not isinstance(self.code, str):
+            raise TypeError("code must be a string")
+        if self.code not in _RETENTION_CODES:
+            raise ValueError(
+                f"unknown retention code {self.code!r}; expected one of "
+                "'initial', 'link', 'before', 'prune', 'consistency', "
+                "'binding', 'growth', 'end'"
+            )
+        if self.index is not None:
+            if not isinstance(self.index, int) or isinstance(self.index, bool):
+                raise TypeError("index must be an integer or None")
+            if self.index < 0:
+                raise ValueError("index must be non-negative")
+        if self.code == _RETENTION_CODE_INITIAL:
+            if self.index is not None:
+                raise ValueError("an 'initial' code must carry index None")
+        elif self.code != _RETENTION_CODE_END and self.index is None:
+            raise ValueError(
+                f"a {self.code!r} code must carry a step position"
+            )
+
+
+def inspect_retention_chain(
+    initial: Any,
+    transitions: Any,
+    public_key: Any,
+    *,
+    expected_end: Any = None,
+) -> RetentionReport:
+    """Diagnose an offline chain of :class:`RetentionTransition` steps.
+
+    The read-only diagnostic counterpart of :func:`verify_retention_chain`:
+    it introduces no new signing or wire domain, never mutates the initial
+    checkpoint, the transitions or any log, needs no private key and no
+    plaintext, and — instead of a bare bool — returns a frozen
+    :class:`RetentionReport` locating the **first** failure, so a receiver
+    can tell exactly at which step a retention history broke. With
+    ``expected_end`` left at its default of ``None`` and a structurally
+    legal input, ``report.ok`` is ``True`` exactly when
+    :func:`verify_retention_chain` returns ``True`` for the same arguments.
+    The fixed examination order is:
+
+    1. the ``initial`` :class:`SignedRoot` checkpoint itself, verified
+       against the 32-byte ``public_key`` via :func:`verify_signed_root`: a
+       signature that does not verify — including a checkpoint signed by
+       another key, presented under the wrong public key — reports
+       ``"initial"`` with no position;
+    2. each step strictly in tuple order, reporting its zero-based position
+       and stopping at the first failure, in this fixed per-step order:
+       ``"link"`` — the step's ``before`` checkpoint does not equal the
+       previous step's end checkpoint (or, for the first step, ``initial``)
+       on every field, signature bytes included; ``"before"`` — the
+       ``before`` checkpoint signature does not verify; ``"prune"`` — the
+       prune authorization fails :func:`verify_signed_prune`;
+       ``"consistency"`` — the consistency credential fails
+       :func:`verify_signed_consistency`, including a proof whose node count
+       does not match its two snapshot sizes (a structurally legal proof of
+       the wrong length is diagnosed here, not raised); ``"binding"`` — the
+       three credentials each verify on their own yet do not bind the same
+       pair of checkpoints, or a checkpoint or receipt names a different
+       hash algorithm than ``initial``; ``"growth"`` — the end boundary
+       does not strictly exceed the before boundary. A step with several
+       problems reports only the earliest of these; later steps are not
+       examined;
+    3. only when the whole chain passes, the optional ``expected_end``
+       :class:`SignedRoot`: its signature is verified against
+       ``public_key`` and it is compared field by field — signature bytes
+       included — with the chain's actual end checkpoint (the last step's
+       end, or ``initial`` for an empty chain). Either mismatch reports
+       ``"end"`` at the last step's position (``None`` for an empty chain),
+       so a genuine chain silently truncated at the tail is identified
+       instead of passing.
+
+    The input structure is fully checked before any diagnosis begins, and a
+    structural error always takes priority over a diagnostic report: a
+    non-:class:`SignedRoot` ``initial``, a non-tuple ``transitions``, a
+    non-:class:`RetentionTransition` element, a non-:class:`SignedRoot`
+    ``expected_end`` or a nested field of the wrong type — including a
+    container field bypassed with ``object.__setattr__`` — raises TypeError
+    exactly as the matching constructor would, and a ``public_key`` that is
+    not ``bytes`` raises TypeError; an unknown hash algorithm, an illegal
+    size, a digest or signature of the wrong length and a ``public_key``
+    that is not 32 bytes raise ValueError. A consistency proof whose node
+    count does not match its snapshot sizes is the one exception: with
+    structurally legal fields it reports ``"consistency"`` rather than
+    raising. The call is read-only, deterministic and supports every
+    fixed-length digest algorithm the rest of the package supports, so
+    credentials recovered by :func:`decode_retention_transition` diagnose
+    exactly like freshly issued ones.
+    """
+    if not isinstance(initial, SignedRoot):
+        raise TypeError("initial must be a SignedRoot")
+    if not isinstance(transitions, tuple):
+        raise TypeError("transitions must be a tuple of RetentionTransition")
+    for transition in transitions:
+        if not isinstance(transition, RetentionTransition):
+            raise TypeError(
+                "each transition must be a RetentionTransition"
+            )
+    if expected_end is not None and not isinstance(expected_end, SignedRoot):
+        raise TypeError("expected_end must be a SignedRoot or None")
+    # Pin the pre-trusted key before any examination: a non-bytes key always
+    # raises TypeError and a key of another length than 32 bytes ValueError,
+    # however sound or broken the chain itself is.
+    _load_ed25519_public(public_key)
+    # Re-validate every nested structure as its own constructor would, so a
+    # field bypassed with object.__setattr__ raises exactly the constructor's
+    # TypeError or ValueError before any diagnosis begins — a structural
+    # error anywhere in the input takes priority over a diagnostic report.
+    def checked_root(checkpoint: SignedRoot) -> SignedRoot:
+        return SignedRoot(
+            checkpoint.version,
+            checkpoint.hash_name,
+            checkpoint.size,
+            checkpoint.root,
+            checkpoint.head,
+            checkpoint.signature,
+        )
+
+    initial = checked_root(initial)
+    checked_transitions = []
+    for transition in transitions:
+        # Re-validate the container first, so a field bypassed to the wrong
+        # type raises the container's TypeError before any nested access.
+        container = RetentionTransition(
+            transition.before, transition.prune, transition.consistency
+        )
+        # ...then each nested container, so a bypassed receipt, checkpoint
+        # or proof field raises its own container's TypeError as well.
+        prune_container = SignedPrune(
+            container.prune.receipt, container.prune.checkpoint
+        )
+        consistency_container = SignedConsistency(
+            container.consistency.old,
+            container.consistency.new,
+            container.consistency.proof,
+        )
+        before = checked_root(container.before)
+        receipt = PruneReceipt(
+            prune_container.receipt.hash_name,
+            prune_container.receipt.size,
+            prune_container.receipt.merkle_root,
+            prune_container.receipt.chain_hash,
+        )
+        prune = SignedPrune(
+            receipt, checked_root(prune_container.checkpoint)
+        )
+        consistency = SignedConsistency(
+            checked_root(consistency_container.old),
+            checked_root(consistency_container.new),
+            consistency_container.proof,
+        )
+        checked_transitions.append(
+            RetentionTransition(before, prune, consistency)
+        )
+    transitions = tuple(checked_transitions)
+    if expected_end is not None:
+        expected_end = checked_root(expected_end)
+
+    # An empty chain is exactly "the initial checkpoint is valid".
+    if not verify_signed_root(initial, public_key):
+        return RetentionReport(False, None, _RETENTION_CODE_INITIAL)
+    expected = initial
+    for index, transition in enumerate(transitions):
+        before = transition.before
+        prune = transition.prune
+        end = prune.checkpoint
+        consistency = transition.consistency
+        # Adjacent boundaries must be byte-for-byte the same signed
+        # checkpoint, starting with the caller-supplied initial one.
+        if before != expected:
+            return RetentionReport(False, index, _RETENTION_CODE_LINK)
+        if not verify_signed_root(before, public_key):
+            return RetentionReport(False, index, _RETENTION_CODE_BEFORE)
+        if not verify_signed_prune(prune, public_key):
+            return RetentionReport(False, index, _RETENTION_CODE_PRUNE)
+        # A structurally legal consistency proof whose node count does not
+        # match the two snapshot sizes is a failed credential, diagnosed
+        # here, not a structural error — unlike verify_retention_chain,
+        # which surfaces verify_consistency's ValueError for it.
+        old = consistency.old
+        new = consistency.new
+        if old.hash_name == new.hash_name and old.size <= new.size:
+            if old.size == new.size or old.size == 0:
+                expected_nodes = 0
+            else:
+                expected_nodes = _subproof_length(old.size, new.size, True)
+            if len(consistency.proof) != expected_nodes:
+                return RetentionReport(
+                    False, index, _RETENTION_CODE_CONSISTENCY
+                )
+        if not verify_signed_consistency(consistency, public_key):
+            return RetentionReport(False, index, _RETENTION_CODE_CONSISTENCY)
+        # One hash algorithm across the whole evolution, and the three
+        # credentials must bind the same two snapshots.
+        if (
+            before.hash_name != initial.hash_name
+            or end.hash_name != initial.hash_name
+            or prune.receipt.hash_name != initial.hash_name
+            or consistency.old != before
+            or consistency.new != end
+        ):
+            return RetentionReport(False, index, _RETENTION_CODE_BINDING)
+        # Deletion only ever advances the boundary, never holds or reverses it.
+        if not before.size < end.size:
+            return RetentionReport(False, index, _RETENTION_CODE_GROWTH)
+        expected = end
+    if expected_end is not None:
+        last_index = len(transitions) - 1 if transitions else None
+        if not verify_signed_root(expected_end, public_key) or (
+            expected_end != expected
+        ):
+            return RetentionReport(False, last_index, _RETENTION_CODE_END)
+    return RetentionReport(True, None, None)
 
 
 def verify_signed_auth_bundle(bundle: Any, public_key: Any) -> tuple[bool, ...]:

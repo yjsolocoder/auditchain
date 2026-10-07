@@ -653,18 +653,20 @@ _MULTI_QUERY_RECEIPT_VERSION = 1
 # and, except the value-less exists leaf, their scalar value exactly as a
 # find_all condition value does, the type leaf carries its pointer blob and
 # its kind name blob, the in leaf carries its candidate count
-# and every candidate scalar in order, and/or carry
-# a child count and their children in order, not carries its one child),
+# and every candidate scalar in order, the compare leaf carries its left
+# pointer blob, its relation name blob and its right pointer blob, and/or
+# carry a child count and their children in order, not carries its one
+# child),
 # then start, stop and the ascending hit u64s.
 _WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
 _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
 # operators in their find_where spelling order, then the three
 # combinations. The string-prefix leaf, the field-existence leaf, the
-# set-membership leaf, the value-type leaf and the array-membership leaf
-# were appended after them, so every tag an older encoding could carry
-# keeps its value and old receipts still decode and re-encode
-# byte-identically.
+# set-membership leaf, the value-type leaf, the array-membership leaf and
+# the field-comparison leaf were appended after them, so every tag an
+# older encoding could carry keeps its value and old receipts still
+# decode and re-encode byte-identically.
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -678,6 +680,12 @@ _WHERE_TAG_EXISTS = 9
 _WHERE_TAG_IN = 10
 _WHERE_TAG_TYPE = 11
 _WHERE_TAG_CONTAINS = 12
+_WHERE_TAG_COMPARE = 13
+# Relation names accepted by the find_where "compare" leaf, matched
+# case-sensitively: the left addressed number is equal to, less than,
+# less than or equal to, greater than, or greater than or equal to the
+# right addressed number.
+_WHERE_COMPARE_RELATIONS = frozenset({"eq", "lt", "le", "gt", "ge"})
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -4710,6 +4718,33 @@ class JsonMultiIndex:
                 ) from error
             _check_json_value(value)
             return ("contains", position, value)
+        if operator == "compare":
+            if len(expression) != 4:
+                raise ValueError(
+                    'a "compare" node must have exactly four items'
+                )
+            _, left, relation, right = expression
+            left_tokens = _parse_json_pointer(left)
+            left_canonical = _json_pointer_canonical(left_tokens)
+            try:
+                left_position = self.pointers.index(left_canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {left_canonical!r} is not covered by this index"
+                ) from error
+            if not isinstance(relation, str):
+                raise TypeError("compare relation must be a string")
+            if relation not in _WHERE_COMPARE_RELATIONS:
+                raise ValueError(f"unknown compare relation {relation!r}")
+            right_tokens = _parse_json_pointer(right)
+            right_canonical = _json_pointer_canonical(right_tokens)
+            try:
+                right_position = self.pointers.index(right_canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {right_canonical!r} is not covered by this index"
+                ) from error
+            return ("compare", left_position, relation, right_position)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4760,6 +4795,8 @@ class JsonMultiIndex:
             return self._type_hits(node[1], node[2], start, stop)
         if operator == "contains":
             return self._contains_hits(node[1], node[2], start, stop)
+        if operator == "compare":
+            return self._compare_hits(node[1], node[2], node[3], start, stop)
         if operator == "and":
             children = node[1]
             if not children:
@@ -4891,6 +4928,73 @@ class JsonMultiIndex:
                     break
         return tuple(hits)
 
+    def _compare_hits(
+        self,
+        left_position: int,
+        relation: str,
+        right_position: int,
+        start: int,
+        stop: int,
+    ) -> tuple[int, ...]:
+        """Evaluate a resolved ``compare`` leaf over [start, stop).
+
+        Walks the frozen covered entries in ascending order and reports
+        every index whose payload is strict UTF-8 JSON (no repeated
+        member name, no non-finite number) in which both bound pointers
+        resolve to a JSON number — a non-boolean integer or a finite
+        float; booleans are not numbers — related by ``relation``. Ints
+        and floats compare by exact numeric value across both kinds:
+        Python compares an int and a float by exact rational value
+        without rounding the int, so big integers never spuriously
+        compare equal to a nearby float, and negative zero equals
+        positive zero. Both pointers may be the same pointer. A missing
+        field, an invalid array position, a path through a scalar, a
+        non-numeric target (a boolean, string, null, object or array),
+        every parse failure and an AES-256-GCM envelope simply do not
+        hit; none of them raises.
+        """
+        left_tokens = _parse_json_pointer(self.pointers[left_position])
+        right_tokens = _parse_json_pointer(self.pointers[right_position])
+        hits: list[int] = []
+        for entry in self.items:
+            if entry.index < start:
+                continue
+            if entry.index >= stop:
+                break
+            payload = entry.payload
+            if payload.startswith(_ENC_MAGIC):
+                # An AES-256-GCM envelope is never plain JSON; it takes
+                # no part and never reaches the parser.
+                continue
+            document = _strict_json_document(payload)
+            if document is _JSON_MISSING:
+                continue
+            left = _json_pointer_value(document, left_tokens)
+            if left is _JSON_MISSING:
+                continue
+            right = _json_pointer_value(document, right_tokens)
+            if right is _JSON_MISSING:
+                continue
+            # Booleans are not numbers; the strict parse already
+            # rejected every non-finite float.
+            if isinstance(left, bool) or not isinstance(left, (int, float)):
+                continue
+            if isinstance(right, bool) or not isinstance(right, (int, float)):
+                continue
+            if relation == "eq":
+                matched = left == right
+            elif relation == "lt":
+                matched = left < right
+            elif relation == "le":
+                matched = left <= right
+            elif relation == "gt":
+                matched = left > right
+            else:  # "ge"
+                matched = left >= right
+            if matched:
+                hits.append(entry.index)
+        return tuple(hits)
+
     def find_where(
         self,
         expression: Any,
@@ -4957,7 +5061,21 @@ class JsonMultiIndex:
         document and an encrypted entry never match; the empty pointer
         addresses the whole document, so it matches every valid JSON
         document that is itself an array containing ``value``. A
-        combination is
+        field-comparison leaf is
+        ``("compare", left, relation, right)`` where ``left`` and
+        ``right`` are both pointers with the same pointer rules — the
+        same pointer may serve as both ends — and ``relation`` is one of
+        the case-sensitive strings ``"eq"``, ``"lt"``, ``"le"``,
+        ``"gt"`` or ``"ge"``; it matches every entry whose payload is
+        strict UTF-8 JSON (no repeated member name, no non-finite
+        number) in which both pointers resolve to a JSON number — a
+        non-boolean integer or a finite float — related by the named
+        relation, ints and floats comparing by exact numeric value
+        across both kinds, so big integers never round to a nearby float
+        and negative zero equals positive zero. A missing field, an
+        invalid array position, a path through a scalar, a non-numeric
+        target on either side, an invalid document and an encrypted
+        entry never match. A combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -4982,14 +5100,17 @@ class JsonMultiIndex:
         either — the parse failure is not a query error — so they
         satisfy its negation, exactly as a missing field, an invalid
         array position or a path through a scalar never satisfies a
-        ``type`` leaf. A
+        ``type`` leaf, and exactly as any of those failures or a
+        non-numeric target on either side never satisfies a ``compare``
+        leaf. A
         non-tuple node or ``children``, a non-string operator or pointer,
         a value or threshold of another type, a non-string prefix text,
-        a non-string ``type`` kind,
+        a non-string ``type`` kind, a non-string ``compare`` relation,
         a non-tuple ``in`` candidate container or a candidate of another
         type,
         or a wrong-typed range bound raises TypeError; an empty node, an
-        unknown operator, an unknown ``type`` kind name, a node of the
+        unknown operator, an unknown ``type`` kind name, an unsupported
+        ``compare`` relation, a node of the
         wrong length, a malformed or
         uncovered pointer, a non-finite float value, threshold or ``in``
         candidate, or an
@@ -4998,7 +5119,9 @@ class JsonMultiIndex:
         children's, children from left to right, an ``in`` node's length
         and pointer before its candidate container and each candidate in
         order, a ``type`` node's length before its pointer and its
-        pointer before its kind, the range last — so an
+        pointer before its kind, a ``compare`` node's length before its
+        left pointer, its relation and its right pointer in that order,
+        the range last — so an
         empty range, an empty candidate tuple or an already determined
         intermediate result never
         masks an invalid branch. The lookup is read-only and never
@@ -5130,8 +5253,9 @@ class SignedJsonMultiIndex:
         ``("in", pointer, values)``,
         ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
         ``("prefix", pointer, text)``, ``("exists", pointer)``,
-        ``("type", pointer, kind)`` and
-        ``("contains", pointer, value)`` leaves
+        ``("type", pointer, kind)``,
+        ``("contains", pointer, value)`` and
+        ``("compare", left, relation, right)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
         ``("not", child)`` nodes following the rules of :meth:`find_where`,
         the half-open ``[start, stop)`` range defaults to the whole
@@ -5288,8 +5412,9 @@ class WhereReceipt:
       ``("eq", pointer, value)``, ``("in", pointer, values)``,
       ``("lt" | "le" | "gt" | "ge",
       pointer, threshold)``, ``("prefix", pointer, text)``,
-      ``("exists", pointer)``, ``("type", pointer, kind)`` and
-      ``("contains", pointer, value)`` leaves
+      ``("exists", pointer)``, ``("type", pointer, kind)``,
+      ``("contains", pointer, value)`` and
+      ``("compare", left, relation, right)`` leaves
       combined by ``("and", children)``,
       ``("or", children)`` and ``("not", child)`` nodes,
     - ``start`` / ``stop``: the resolved half-open query range within
@@ -16155,7 +16280,9 @@ def _encode_where_expression(expression: tuple) -> bytes:
     arbitrary precision, floats their canonical ``repr`` spelling —
     negative zero included — and booleans/null the empty blob); a
     ``type`` leaf carries its pointer UTF-8 blob and its kind name UTF-8
-    blob instead of a scalar; an
+    blob instead of a scalar; a ``compare`` leaf carries its left pointer
+    UTF-8 blob, its relation name UTF-8 blob and its right pointer UTF-8
+    blob; an
     ``in`` leaf carries its candidate count followed by every candidate
     scalar in order, repetitions included, an
     ``and`` / ``or`` node carries its child count followed by every child
@@ -16185,6 +16312,13 @@ def _encode_where_expression(expression: tuple) -> bytes:
         for value in values:
             parts.append(_encode_where_scalar(value))
         return b"".join(parts)
+    if operator == "compare":
+        return b"".join((
+            _encode_u64(_WHERE_TAG_COMPARE, "expression tag"),
+            _encode_blob(expression[1].encode("utf-8")),
+            _encode_blob(expression[2].encode("utf-8")),
+            _encode_blob(expression[3].encode("utf-8")),
+        ))
     if operator in _WHERE_LEAF_OPERATORS:
         return b"".join((
             _encode_u64(_WHERE_LEAF_OPERATORS[operator], "expression tag"),
@@ -16226,6 +16360,8 @@ def encode_where_receipt(receipt: Any) -> bytes:
     types and a float's negative zero preserved exactly),
     for ``exists`` the pointer UTF-8 blob alone,
     for ``type`` the pointer UTF-8 blob and the kind name UTF-8 blob,
+    for ``compare`` the left pointer UTF-8 blob, the relation name UTF-8
+    blob and the right pointer UTF-8 blob,
     for ``and`` / ``or`` the child count and every child in order, and
     for ``not`` the one child — then ``start``, ``stop``, the hit count
     and one u64 per strictly ascending hit, with nothing omitted,
@@ -16277,15 +16413,18 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
     structural rule is hers), the expression tree (per node a u64
     operator tag; a leaf's pointer blob, value tag and value blob — an
     ``exists`` leaf carries its pointer blob alone; a ``type`` leaf
-    carries its pointer blob and its kind name blob; an ``in`` leaf
+    carries its pointer blob and its kind name blob; a ``compare`` leaf
+    carries its left pointer blob, its relation name blob and its right
+    pointer blob; an ``in`` leaf
     carries its pointer blob, its candidate count and exactly that many
     candidate scalars in order; an
     ``and`` / ``or`` child count with exactly that many children; a
     ``not`` with exactly one child), ``start``, ``stop``, the hit count
     and one u64 per hit, with no trailing bytes. A bad magic or version,
     truncation, an oversized blob length, trailing bytes, invalid UTF-8
-    in a pointer, kind name or string value, an unknown node or value
-    tag, an unknown ``type`` kind name, a
+    in a pointer, kind name, relation name or string value, an unknown
+    node or value tag, an unknown ``type`` kind name, an unsupported
+    ``compare`` relation, a
     non-canonical integer or float spelling, a non-finite float, a
     non-empty boolean/null value blob, a non-numeric comparison
     threshold, a non-string prefix text, a count that does not match
@@ -16370,6 +16509,29 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                 key = read_blob(f"{position} value {index}")
                 values.append(_decode_json_condition_value(value_tag, key))
             return ("in", pointer, tuple(values))
+        if tag == _WHERE_TAG_COMPARE:
+            raw_left = read_blob(f"{position} left pointer")
+            try:
+                left = raw_left.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} left pointer is not valid UTF-8"
+                ) from error
+            raw_relation = read_blob(f"{position} relation")
+            try:
+                relation = raw_relation.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} relation is not valid UTF-8"
+                ) from error
+            raw_right = read_blob(f"{position} right pointer")
+            try:
+                right = raw_right.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} right pointer is not valid UTF-8"
+                ) from error
+            return ("compare", left, relation, right)
         if tag in _WHERE_TAG_OPERATORS:
             operator = _WHERE_TAG_OPERATORS[tag]
             raw_pointer = read_blob(f"{position} pointer")

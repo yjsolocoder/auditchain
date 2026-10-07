@@ -661,7 +661,8 @@ _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
 # operators in their find_where spelling order, then the three
 # combinations. The string-prefix leaf, the field-existence leaf, the
-# set-membership leaf and the value-type leaf were appended after them, so
+# set-membership leaf, the value-type leaf and the array-membership leaf
+# were appended after them, so
 # every tag an older encoding could carry keeps its value and old receipts
 # still decode and re-encode byte-identically.
 _WHERE_TAG_EQ = 0
@@ -676,6 +677,7 @@ _WHERE_TAG_PREFIX = 8
 _WHERE_TAG_EXISTS = 9
 _WHERE_TAG_IN = 10
 _WHERE_TAG_TYPE = 11
+_WHERE_TAG_CONTAINS = 12
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -683,6 +685,7 @@ _WHERE_LEAF_OPERATORS = {
     "gt": _WHERE_TAG_GT,
     "ge": _WHERE_TAG_GE,
     "prefix": _WHERE_TAG_PREFIX,
+    "contains": _WHERE_TAG_CONTAINS,
 }
 _WHERE_TAG_OPERATORS = {
     tag: operator for operator, tag in _WHERE_LEAF_OPERATORS.items()
@@ -4607,6 +4610,22 @@ class JsonMultiIndex:
                 ) from error
             _check_json_value(value)
             return ("eq", position, value)
+        if operator == "contains":
+            if len(expression) != 3:
+                raise ValueError(
+                    'a "contains" node must have exactly three items'
+                )
+            _, pointer, value = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            _check_json_value(value)
+            return ("contains", position, value)
         if operator == "in":
             if len(expression) != 3:
                 raise ValueError('an "in" node must have exactly three items')
@@ -4719,6 +4738,8 @@ class JsonMultiIndex:
         if operator == "eq":
             merged = _json_groups_find_all(self.groups[node[1]], node[2])
             return tuple(index for index in merged if start <= index < stop)
+        if operator == "contains":
+            return self._contains_hits(node[1], node[2], start, stop)
         if operator == "in":
             merged = _union_ascending_tuples(
                 tuple(
@@ -4829,6 +4850,48 @@ class JsonMultiIndex:
                 hits.append(entry.index)
         return tuple(hits)
 
+    def _contains_hits(
+        self, position: int, value: Any, start: int, stop: int
+    ) -> tuple[int, ...]:
+        """Evaluate a resolved ``contains`` leaf over [start, stop).
+
+        Walks the frozen covered entries in ascending order and reports
+        every index whose payload is strict UTF-8 JSON (no repeated
+        member name, no non-finite number) in which the bound pointer
+        resolves to an array carrying at least one direct element equal
+        to ``value`` under the JSON kind-separated scalar comparison —
+        strings, booleans and null match only their own kind while ints
+        and floats compare by exact numeric value. Repeated elements
+        produce one hit, nested arrays and objects are never unpacked
+        (a container element never equals a scalar), and an empty
+        array, a non-array target, a missing path, an AES-256-GCM
+        envelope and every parse failure simply do not hit; neither
+        raises.
+        """
+        tokens = _parse_json_pointer(self.pointers[position])
+        hits: list[int] = []
+        for entry in self.items:
+            if entry.index < start:
+                continue
+            if entry.index >= stop:
+                break
+            payload = entry.payload
+            if payload.startswith(_ENC_MAGIC):
+                # An AES-256-GCM envelope is never plain JSON; it takes
+                # no part and never reaches the parser.
+                continue
+            document = _strict_json_document(payload)
+            if document is _JSON_MISSING:
+                continue
+            target = _json_pointer_value(document, tokens)
+            if not isinstance(target, list):
+                continue
+            if any(
+                _json_scalar_matches(element, value) for element in target
+            ):
+                hits.append(entry.index)
+        return tuple(hits)
+
     def find_where(
         self,
         expression: Any,
@@ -4843,7 +4906,17 @@ class JsonMultiIndex:
         and ``value`` a JSON scalar (``str``, ``int``, finite ``float``,
         ``bool`` or ``None``) with the same kind-separated comparison —
         strings, booleans and null match only their own kind while ints
-        and floats compare by numeric value. A set-membership leaf is
+        and floats compare by numeric value. An array-membership leaf is
+        ``("contains", pointer, value)`` with the same pointer and value
+        rules; it matches when the pointer resolves to a JSON array and
+        at least one direct element equals ``value`` under the same
+        kind-separated scalar comparison — repeated elements produce one
+        hit, nested arrays and objects are never unpacked (a container
+        element never equals a scalar), and an empty array, a non-array
+        target, a missing path, invalid JSON, a repeated member name and
+        an encrypted entry never match. The empty pointer addresses the
+        whole document, so it matches a document that is itself an array
+        containing ``value``. A set-membership leaf is
         ``("in", pointer, values)`` with the same pointer rules;
         ``values`` is a tuple of candidate scalars, each following
         exactly the ``eq`` value rules, and an entry matches when its
@@ -4896,7 +4969,8 @@ class JsonMultiIndex:
 
         Non-JSON, encrypted, missing-field and non-scalar targets never
         satisfy an ``eq`` or ``in`` leaf — a missing field is not
-        ``null`` — and
+        ``null`` — and non-array targets (scalars, objects, missing
+        paths and parse failures) never satisfy a ``contains`` leaf, and
         non-numeric targets (booleans, strings, null, objects and arrays)
         never satisfy a numeric-comparison leaf, just as non-string
         targets never satisfy a ``prefix`` leaf, so all of them do
@@ -4911,12 +4985,13 @@ class JsonMultiIndex:
         a value or threshold of another type, a non-string prefix text,
         a non-string ``type`` kind,
         a non-tuple ``in`` candidate container or a candidate of another
-        type,
+        type, or a ``contains`` candidate that is a container or another
+        non-scalar,
         or a wrong-typed range bound raises TypeError; an empty node, an
         unknown operator, an unknown ``type`` kind name, a node of the
         wrong length, a malformed or
-        uncovered pointer, a non-finite float value, threshold or ``in``
-        candidate, or an
+        uncovered pointer, a non-finite float value, threshold, ``in``
+        candidate or ``contains`` candidate, or an
         out-of-range or reversed range raises ValueError. The whole expression is
         validated before any lookup — a node's own errors before its
         children's, children from left to right, an ``in`` node's length
@@ -5051,7 +5126,7 @@ class SignedJsonMultiIndex:
 
         Runs the nested boolean query exactly like :meth:`find_where` —
         ``expression`` is a tuple tree of ``("eq", pointer, value)``,
-        ``("in", pointer, values)``,
+        ``("contains", pointer, value)``, ``("in", pointer, values)``,
         ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
         ``("prefix", pointer, text)``, ``("exists", pointer)`` and
         ``("type", pointer, kind)`` leaves
@@ -5208,7 +5283,8 @@ class WhereReceipt:
       whole index, so the receipt itself carries no new signature and
       the expression is not separately authenticated,
     - ``expression``: the find_where expression, a tuple tree of
-      ``("eq", pointer, value)``, ``("in", pointer, values)``,
+      ``("eq", pointer, value)``, ``("contains", pointer, value)``,
+      ``("in", pointer, values)``,
       ``("lt" | "le" | "gt" | "ge",
       pointer, threshold)``, ``("prefix", pointer, text)``,
       ``("exists", pointer)`` and ``("type", pointer, kind)`` leaves
@@ -16138,7 +16214,8 @@ def encode_where_receipt(receipt: Any) -> bytes:
     by the raw bytes. Fields appear strictly in the order ``version``
     (always 1), the ``bundle`` blob (the complete canonical output of
     :func:`encode_signed_json_multi_index`), the ``expression`` tree —
-    per node a u64 operator tag, then for ``eq`` / ``lt`` / ``le`` /
+    per node a u64 operator tag, then for ``eq`` / ``contains`` /
+    ``lt`` / ``le`` /
     ``gt`` / ``ge`` / ``prefix`` leaves the pointer UTF-8 blob and the
     scalar value
     (its kind tag plus its canonical value blob, preserving strings,
@@ -16308,9 +16385,11 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                     raise ValueError(
                         'a "prefix" text must be a string'
                     )
-            elif tag != _WHERE_TAG_EQ and value_tag not in (
-                _JSON_TAG_INTEGER,
-                _JSON_TAG_FLOAT,
+            elif tag not in (_WHERE_TAG_EQ, _WHERE_TAG_CONTAINS) and (
+                value_tag not in (
+                    _JSON_TAG_INTEGER,
+                    _JSON_TAG_FLOAT,
+                )
             ):
                 raise ValueError(
                     f'a "{operator}" threshold must be an integer or a float'

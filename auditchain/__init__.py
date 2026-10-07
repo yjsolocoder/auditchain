@@ -651,18 +651,19 @@ _MULTI_QUERY_RECEIPT_VERSION = 1
 # the complete canonical encode_signed_json_multi_index bytes, the
 # expression tree (one node tag per node — leaves carry their pointer blob
 # and, except the value-less exists leaf, their scalar value exactly as a
-# find_all condition value does, the in leaf carries its candidate count
-# and every candidate scalar in order, and/or carry
+# find_all condition value does, the type leaf carries its kind name as a
+# UTF-8 blob instead of a scalar value, the in leaf carries its candidate
+# count and every candidate scalar in order, and/or carry
 # a child count and their children in order, not carries its one child),
 # then start, stop and the ascending hit u64s.
 _WHERE_RECEIPT_MAGIC = b"auditchain/where-receipt/v1\0"
 _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
 # operators in their find_where spelling order, then the three
-# combinations. The string-prefix leaf, the field-existence leaf and the
-# set-membership leaf were appended after them, so every tag an older
-# encoding could carry keeps its value and old receipts still decode and
-# re-encode byte-identically.
+# combinations. The string-prefix leaf, the field-existence leaf, the
+# set-membership leaf and the JSON-type leaf were appended after them, so
+# every tag an older encoding could carry keeps its value and old receipts
+# still decode and re-encode byte-identically.
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -674,6 +675,13 @@ _WHERE_TAG_NOT = 7
 _WHERE_TAG_PREFIX = 8
 _WHERE_TAG_EXISTS = 9
 _WHERE_TAG_IN = 10
+_WHERE_TAG_TYPE = 11
+# Kind names accepted by the "type" leaf of find_where: exactly the six
+# JSON value types, case-sensitively. Integers and finite floats are both
+# "number"; booleans are not numbers.
+_WHERE_TYPE_KINDS = frozenset(
+    {"null", "boolean", "number", "string", "array", "object"}
+)
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -1795,6 +1803,62 @@ def _json_pointer_exists(document: Any, tokens: tuple[str, ...]) -> bool:
         else:
             return False
     return True
+
+
+def _json_pointer_resolve_any(document: Any, tokens: tuple[str, ...]) -> Any:
+    """Resolve parsed pointer tokens to any JSON value, or ``_JSON_MISSING``.
+
+    Same traversal rules as :func:`_json_pointer_exists` — a missing
+    member/element, traversal through a non-container, or an array token
+    that is non-numeric (``-`` included), has leading zeroes or is out of
+    range yields ``_JSON_MISSING`` — but the addressed value itself is
+    returned, whatever its type: null, a scalar, an object or an array.
+    The empty token tuple addresses the whole document.
+    """
+    current = document
+    for token in tokens:
+        if isinstance(current, dict):
+            if token not in current:
+                return _JSON_MISSING
+            current = current[token]
+        elif isinstance(current, list):
+            # "-" addresses the nonexistent append position; array tokens
+            # are plain decimal indices with no leading zeroes (RFC 6901).
+            if (
+                not token
+                or token == "-"
+                or any(char not in "0123456789" for char in token)
+                or (len(token) > 1 and token[0] == "0")
+            ):
+                return _JSON_MISSING
+            index = int(token)
+            if index >= len(current):
+                return _JSON_MISSING
+            current = current[index]
+        else:
+            return _JSON_MISSING
+    return current
+
+
+def _json_type_kind_of_value(value: Any) -> str:
+    """The JSON type name of one parsed document value.
+
+    Exactly the kind names a ``"type"`` leaf of
+    :meth:`JsonMultiIndex.find_where` accepts: integers and floats are
+    both ``"number"`` (a strict parse never yields a non-finite float)
+    and booleans are their own kind, never numbers.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
 
 
 def _json_scalar_at(payload: bytes, tokens: tuple[str, ...]) -> Any:
@@ -4608,6 +4672,25 @@ class JsonMultiIndex:
                     f"pointer {canonical!r} is not covered by this index"
                 ) from error
             return ("exists", position)
+        if operator == "type":
+            if len(expression) != 3:
+                raise ValueError(
+                    'a "type" node must have exactly three items'
+                )
+            _, pointer, kind = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            if not isinstance(kind, str):
+                raise TypeError("type kind must be a string")
+            if kind not in _WHERE_TYPE_KINDS:
+                raise ValueError(f"unknown type kind {kind!r}")
+            return ("type", position, kind)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4654,6 +4737,8 @@ class JsonMultiIndex:
             return tuple(index for index in merged if start <= index < stop)
         if operator == "exists":
             return self._exists_hits(node[1], start, stop)
+        if operator == "type":
+            return self._type_hits(node[1], node[2], start, stop)
         if operator == "and":
             children = node[1]
             if not children:
@@ -4707,6 +4792,43 @@ class JsonMultiIndex:
                 hits.append(entry.index)
         return tuple(hits)
 
+    def _type_hits(
+        self, position: int, kind: str, start: int, stop: int
+    ) -> tuple[int, ...]:
+        """Evaluate a resolved ``type`` leaf over [start, stop).
+
+        Walks the frozen covered entries in ascending order and reports
+        every index whose payload is strict UTF-8 JSON (no repeated
+        member name, no non-finite number) in which the bound pointer
+        resolves to a value whose JSON type is ``kind``: integers and
+        finite floats are both ``"number"``, booleans are never numbers,
+        and the empty array and empty object hit their own kinds. An
+        AES-256-GCM envelope, every parse failure and an unresolvable
+        pointer (a missing field, an invalid array position or a path
+        through a scalar) simply do not hit; neither raises.
+        """
+        tokens = _parse_json_pointer(self.pointers[position])
+        hits: list[int] = []
+        for entry in self.items:
+            if entry.index < start:
+                continue
+            if entry.index >= stop:
+                break
+            payload = entry.payload
+            if payload.startswith(_ENC_MAGIC):
+                # An AES-256-GCM envelope is never plain JSON; it takes
+                # no part and never reaches the parser.
+                continue
+            document = _strict_json_document(payload)
+            if document is _JSON_MISSING:
+                continue
+            value = _json_pointer_resolve_any(document, tokens)
+            if value is _JSON_MISSING:
+                continue
+            if _json_type_kind_of_value(value) == kind:
+                hits.append(entry.index)
+        return tuple(hits)
+
     def find_where(
         self,
         expression: Any,
@@ -4748,7 +4870,17 @@ class JsonMultiIndex:
         empty pointer matches every valid JSON document (the empty
         object and the empty array included), and an out-of-range,
         leading-zero or append-position array token or a path through a
-        scalar does not hit. A combination is
+        scalar does not hit. A JSON-type leaf is
+        ``("type", pointer, kind)`` with the same pointer rules;
+        ``kind`` must be one of the case-sensitive strings ``"null"``,
+        ``"boolean"``, ``"number"``, ``"string"``, ``"array"`` or
+        ``"object"`` and matches every entry whose payload is strict
+        UTF-8 JSON in which the pointer resolves to a value of that
+        type — integers and finite floats are both ``"number"``,
+        booleans are never numbers, and the empty array and empty
+        object hit their own kinds. The empty pointer addresses the
+        whole document, so ``("type", "", "object")`` matches every
+        valid JSON object document. A combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -4769,22 +4901,27 @@ class JsonMultiIndex:
         targets never satisfy a ``prefix`` leaf, so all of them do
         satisfy that leaf's negation, exactly as for :meth:`find`.
         Invalid UTF-8, invalid JSON, a repeated member name and an
-        encrypted entry never satisfy an ``exists`` leaf either — the
-        parse failure is not a query error — so they satisfy its
-        negation. A
+        encrypted entry never satisfy an ``exists`` or ``type`` leaf
+        either — the parse failure is not a query error — so they
+        satisfy its negation, exactly as a missing field, an invalid
+        array position or a path through a scalar never satisfies a
+        ``type`` leaf. A
         non-tuple node or ``children``, a non-string operator or pointer,
-        a value or threshold of another type, a non-string prefix text,
-        a non-tuple ``in`` candidate container or a candidate of another
+        a value or threshold of another type, a non-string prefix text
+        or ``type`` kind, a non-tuple ``in`` candidate container or a
+        candidate of another
         type,
         or a wrong-typed range bound raises TypeError; an empty node, an
         unknown operator, a node of the wrong length, a malformed or
-        uncovered pointer, a non-finite float value, threshold or ``in``
+        uncovered pointer, an unknown ``type`` kind name, a non-finite
+        float value, threshold or ``in``
         candidate, or an
         out-of-range or reversed range raises ValueError. The whole expression is
         validated before any lookup — a node's own errors before its
         children's, children from left to right, an ``in`` node's length
         and pointer before its candidate container and each candidate in
-        order, the range last — so an
+        order, a ``type`` node's length and pointer before its kind, the
+        range last — so an
         empty range, an empty candidate tuple or an already determined
         intermediate result never
         masks an invalid branch. The lookup is read-only and never
@@ -4915,7 +5052,8 @@ class SignedJsonMultiIndex:
         ``expression`` is a tuple tree of ``("eq", pointer, value)``,
         ``("in", pointer, values)``,
         ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
-        ``("prefix", pointer, text)`` and ``("exists", pointer)`` leaves
+        ``("prefix", pointer, text)``, ``("exists", pointer)`` and
+        ``("type", pointer, kind)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
         ``("not", child)`` nodes following the rules of :meth:`find_where`,
         the half-open ``[start, stop)`` range defaults to the whole
@@ -5071,8 +5209,8 @@ class WhereReceipt:
     - ``expression``: the find_where expression, a tuple tree of
       ``("eq", pointer, value)``, ``("in", pointer, values)``,
       ``("lt" | "le" | "gt" | "ge",
-      pointer, threshold)``, ``("prefix", pointer, text)`` and
-      ``("exists", pointer)`` leaves
+      pointer, threshold)``, ``("prefix", pointer, text)``,
+      ``("exists", pointer)`` and ``("type", pointer, kind)`` leaves
       combined by ``("and", children)``,
       ``("or", children)`` and ``("not", child)`` nodes,
     - ``start`` / ``stop``: the resolved half-open query range within
@@ -15936,7 +16074,9 @@ def _encode_where_expression(expression: tuple) -> bytes:
     leaf's text included — keep their
     UTF-8 bytes, integers their canonical ASCII decimal spelling at
     arbitrary precision, floats their canonical ``repr`` spelling —
-    negative zero included — and booleans/null the empty blob); an
+    negative zero included — and booleans/null the empty blob); a
+    ``type`` leaf carries its kind name as a UTF-8 blob instead of a
+    scalar value; an
     ``in`` leaf carries its candidate count followed by every candidate
     scalar in order, repetitions included, an
     ``and`` / ``or`` node carries its child count followed by every child
@@ -15949,6 +16089,12 @@ def _encode_where_expression(expression: tuple) -> bytes:
         return b"".join((
             _encode_u64(_WHERE_TAG_EXISTS, "expression tag"),
             _encode_blob(expression[1].encode("utf-8")),
+        ))
+    if operator == "type":
+        return b"".join((
+            _encode_u64(_WHERE_TAG_TYPE, "expression tag"),
+            _encode_blob(expression[1].encode("utf-8")),
+            _encode_blob(expression[2].encode("utf-8")),
         ))
     if operator == "in":
         values = expression[2]
@@ -16000,6 +16146,7 @@ def encode_where_receipt(receipt: Any) -> bytes:
     candidate scalar in order (candidate order, repetitions, scalar
     types and a float's negative zero preserved exactly),
     for ``exists`` the pointer UTF-8 blob alone,
+    for ``type`` the pointer UTF-8 blob and the kind name UTF-8 blob,
     for ``and`` / ``or`` the child count and every child in order, and
     for ``not`` the one child — then ``start``, ``stop``, the hit count
     and one u64 per strictly ascending hit, with nothing omitted,
@@ -16050,14 +16197,16 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
     :func:`decode_signed_json_multi_index`, so every nested framing and
     structural rule is hers), the expression tree (per node a u64
     operator tag; a leaf's pointer blob, value tag and value blob — an
-    ``exists`` leaf carries its pointer blob alone; an ``in`` leaf
+    ``exists`` leaf carries its pointer blob alone; a ``type`` leaf
+    carries its pointer blob and its kind name blob; an ``in`` leaf
     carries its pointer blob, its candidate count and exactly that many
     candidate scalars in order; an
     ``and`` / ``or`` child count with exactly that many children; a
     ``not`` with exactly one child), ``start``, ``stop``, the hit count
     and one u64 per hit, with no trailing bytes. A bad magic or version,
     truncation, an oversized blob length, trailing bytes, invalid UTF-8
-    in a pointer or string value, an unknown node or value tag, a
+    in a pointer, kind name or string value, an unknown node or value
+    tag, an unknown ``type`` kind name, a
     non-canonical integer or float spelling, a non-finite float, a
     non-empty boolean/null value blob, a non-numeric comparison
     threshold, a non-string prefix text, a count that does not match
@@ -16111,6 +16260,22 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                     f"{position} pointer is not valid UTF-8"
                 ) from error
             return ("exists", pointer)
+        if tag == _WHERE_TAG_TYPE:
+            raw_pointer = read_blob(f"{position} pointer")
+            try:
+                pointer = raw_pointer.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} pointer is not valid UTF-8"
+                ) from error
+            raw_kind = read_blob(f"{position} kind")
+            try:
+                kind = raw_kind.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    f"{position} kind is not valid UTF-8"
+                ) from error
+            return ("type", pointer, kind)
         if tag == _WHERE_TAG_IN:
             raw_pointer = read_blob(f"{position} pointer")
             try:

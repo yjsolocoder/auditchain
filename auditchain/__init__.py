@@ -661,9 +661,10 @@ _WHERE_RECEIPT_VERSION = 1
 # Expression node tags of the where-receipt expression tree: the five leaf
 # operators in their find_where spelling order, then the three
 # combinations. The string-prefix leaf, the field-existence leaf, the
-# set-membership leaf and the value-type leaf were appended after them, so
-# every tag an older encoding could carry keeps its value and old receipts
-# still decode and re-encode byte-identically.
+# set-membership leaf, the value-type leaf and the array-membership leaf
+# were appended after them, so every tag an older encoding could carry
+# keeps its value and old receipts still decode and re-encode
+# byte-identically.
 _WHERE_TAG_EQ = 0
 _WHERE_TAG_LT = 1
 _WHERE_TAG_LE = 2
@@ -676,6 +677,7 @@ _WHERE_TAG_PREFIX = 8
 _WHERE_TAG_EXISTS = 9
 _WHERE_TAG_IN = 10
 _WHERE_TAG_TYPE = 11
+_WHERE_TAG_CONTAINS = 12
 _WHERE_LEAF_OPERATORS = {
     "eq": _WHERE_TAG_EQ,
     "lt": _WHERE_TAG_LT,
@@ -683,6 +685,7 @@ _WHERE_LEAF_OPERATORS = {
     "gt": _WHERE_TAG_GT,
     "ge": _WHERE_TAG_GE,
     "prefix": _WHERE_TAG_PREFIX,
+    "contains": _WHERE_TAG_CONTAINS,
 }
 _WHERE_TAG_OPERATORS = {
     tag: operator for operator, tag in _WHERE_LEAF_OPERATORS.items()
@@ -4691,6 +4694,22 @@ class JsonMultiIndex:
             if kind not in _JSON_TYPE_KINDS:
                 raise ValueError(f"unknown type kind {kind!r}")
             return ("type", position, kind)
+        if operator == "contains":
+            if len(expression) != 3:
+                raise ValueError(
+                    'a "contains" node must have exactly three items'
+                )
+            _, pointer, value = expression
+            tokens = _parse_json_pointer(pointer)
+            canonical = _json_pointer_canonical(tokens)
+            try:
+                position = self.pointers.index(canonical)
+            except ValueError as error:
+                raise ValueError(
+                    f"pointer {canonical!r} is not covered by this index"
+                ) from error
+            _check_json_value(value)
+            return ("contains", position, value)
         if operator in ("and", "or"):
             if len(expression) != 2:
                 raise ValueError(
@@ -4739,6 +4758,8 @@ class JsonMultiIndex:
             return self._exists_hits(node[1], start, stop)
         if operator == "type":
             return self._type_hits(node[1], node[2], start, stop)
+        if operator == "contains":
+            return self._contains_hits(node[1], node[2], start, stop)
         if operator == "and":
             children = node[1]
             if not children:
@@ -4829,6 +4850,47 @@ class JsonMultiIndex:
                 hits.append(entry.index)
         return tuple(hits)
 
+    def _contains_hits(
+        self, position: int, value: Any, start: int, stop: int
+    ) -> tuple[int, ...]:
+        """Evaluate a resolved ``contains`` leaf over [start, stop).
+
+        Walks the frozen covered entries in ascending order and reports
+        every index whose payload is strict UTF-8 JSON (no repeated
+        member name, no non-finite number) in which the bound pointer
+        resolves to an array carrying at least one direct element equal
+        to ``value`` under the find_json scalar comparison — strings,
+        booleans and null match only their own kind while ints and
+        floats compare by numeric value. Repeated elements still
+        produce a single hit, nested arrays and objects are never
+        unfolded, and an empty array, a non-array target, a missing
+        path, every parse failure and an AES-256-GCM envelope simply do
+        not hit; none of them raises.
+        """
+        tokens = _parse_json_pointer(self.pointers[position])
+        hits: list[int] = []
+        for entry in self.items:
+            if entry.index < start:
+                continue
+            if entry.index >= stop:
+                break
+            payload = entry.payload
+            if payload.startswith(_ENC_MAGIC):
+                # An AES-256-GCM envelope is never plain JSON; it takes
+                # no part and never reaches the parser.
+                continue
+            document = _strict_json_document(payload)
+            if document is _JSON_MISSING:
+                continue
+            target = _json_pointer_value(document, tokens)
+            if not isinstance(target, list):
+                continue
+            for element in target:
+                if _json_scalar_matches(element, value):
+                    hits.append(entry.index)
+                    break
+        return tuple(hits)
+
     def find_where(
         self,
         expression: Any,
@@ -4881,7 +4943,21 @@ class JsonMultiIndex:
         not numbers, and the empty array and empty object match
         ``"array"`` / ``"object"``; the empty pointer addresses the
         whole document, so it matches every valid JSON document of the
-        named type. A combination is
+        named type. An array-membership leaf is
+        ``("contains", pointer, value)`` with the same pointer rules and
+        the same scalar ``value`` rules as ``eq``; it matches every
+        entry whose payload is strict UTF-8 JSON (no repeated member
+        name, no non-finite number) in which the pointer resolves to an
+        array carrying at least one direct element equal to ``value``
+        under the same kind-separated comparison — strings, booleans
+        and null match only their own kind while ints and floats
+        compare by numeric value. Repeated elements still yield a
+        single hit, nested arrays and objects are never unfolded, and
+        an empty array, a non-array target, a missing path, an invalid
+        document and an encrypted entry never match; the empty pointer
+        addresses the whole document, so it matches every valid JSON
+        document that is itself an array containing ``value``. A
+        combination is
         ``("and", children)``, ``("or", children)`` or ``("not", child)``
         where ``children`` is a tuple of sub-expressions that may nest
         recursively. ``and`` intersects its children's hits, ``or`` takes
@@ -5053,8 +5129,9 @@ class SignedJsonMultiIndex:
         ``expression`` is a tuple tree of ``("eq", pointer, value)``,
         ``("in", pointer, values)``,
         ``("lt" | "le" | "gt" | "ge", pointer, threshold)``,
-        ``("prefix", pointer, text)``, ``("exists", pointer)`` and
-        ``("type", pointer, kind)`` leaves
+        ``("prefix", pointer, text)``, ``("exists", pointer)``,
+        ``("type", pointer, kind)`` and
+        ``("contains", pointer, value)`` leaves
         combined by ``("and", children)``, ``("or", children)`` and
         ``("not", child)`` nodes following the rules of :meth:`find_where`,
         the half-open ``[start, stop)`` range defaults to the whole
@@ -5211,7 +5288,8 @@ class WhereReceipt:
       ``("eq", pointer, value)``, ``("in", pointer, values)``,
       ``("lt" | "le" | "gt" | "ge",
       pointer, threshold)``, ``("prefix", pointer, text)``,
-      ``("exists", pointer)`` and ``("type", pointer, kind)`` leaves
+      ``("exists", pointer)``, ``("type", pointer, kind)`` and
+      ``("contains", pointer, value)`` leaves
       combined by ``("and", children)``,
       ``("or", children)`` and ``("not", child)`` nodes,
     - ``start`` / ``stop``: the resolved half-open query range within
@@ -16139,8 +16217,8 @@ def encode_where_receipt(receipt: Any) -> bytes:
     (always 1), the ``bundle`` blob (the complete canonical output of
     :func:`encode_signed_json_multi_index`), the ``expression`` tree —
     per node a u64 operator tag, then for ``eq`` / ``lt`` / ``le`` /
-    ``gt`` / ``ge`` / ``prefix`` leaves the pointer UTF-8 blob and the
-    scalar value
+    ``gt`` / ``ge`` / ``prefix`` / ``contains`` leaves the pointer UTF-8
+    blob and the scalar value
     (its kind tag plus its canonical value blob, preserving strings,
     arbitrary-precision integers, floats, booleans and null exactly),
     for ``in`` the pointer UTF-8 blob, the candidate count and every
@@ -16308,9 +16386,11 @@ def decode_where_receipt(data: Any) -> WhereReceipt:
                     raise ValueError(
                         'a "prefix" text must be a string'
                     )
-            elif tag != _WHERE_TAG_EQ and value_tag not in (
-                _JSON_TAG_INTEGER,
-                _JSON_TAG_FLOAT,
+            elif tag not in (_WHERE_TAG_EQ, _WHERE_TAG_CONTAINS) and (
+                value_tag not in (
+                    _JSON_TAG_INTEGER,
+                    _JSON_TAG_FLOAT,
+                )
             ):
                 raise ValueError(
                     f'a "{operator}" threshold must be an integer or a float'
